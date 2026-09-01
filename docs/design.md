@@ -286,11 +286,27 @@ The restart hole (kernel state outliving every process, leaving hardware reachab
 agent whose lease is gone) closes by construction: at startup nothing is mounted,
 because each component just removed it.
 
-*Grace, and why it isn't zero:* a two-second blip shouldn't destroy everyone's work.
-Executors release after `G` seconds without the coordinator. On reconnect inside `G`
-they declare what they still hold and the coordinator confirms or denies each lease — a
-restarted coordinator denies everything, being stateless, so one mechanism covers blip
-and restart with no incarnation ids or restart-detection.
+*Losing the coordinator releases immediately, with no grace window.* An earlier draft
+specified one: executors would hold for `G` seconds and, on reconnect inside `G`,
+declare what they still held for the coordinator to confirm or deny. That was designed
+and then not built, and on reflection it should not be — a documented guarantee nothing
+implements is worse than an honest limitation.
+
+It buys nothing here. The coordinator is stateless (below), so a restart denies every
+lease anyway; the protocol would only help when the coordinator *process* survives but
+the connection drops, which needs two machines. And both ends already agree without it:
+an executor releases on disconnect, and the coordinator drops the sessions or benches
+behind a disconnected peer. They converge on the same answer, so there is no window in
+which one believes a lease is live and the other does not.
+
+Revisit when hosts routinely run on other machines and a flaky link starts destroying
+work that a few seconds of patience would have saved. Until then the reconnect-and-
+reconfirm handshake is unwritten code carrying an unenforced promise.
+
+*Liveness is measured by silence, not by sockets.* A TCP connection can outlive the
+process behind it — a wedged host, a sleeping machine, a half-open connection. A host
+that has not been heard from for `host_timeout_seconds` has its bench withdrawn from
+matching and its leases ended, whether or not its socket is still open.
 
 *Accepted:* coordinator availability is lab availability. Run it on the box that's
 already always on.
@@ -718,6 +734,9 @@ more than the individual bugs.
 | Medium | `tick` advanced one state per call, so an overdue lease survived a late tick | Warning and teardown were mutually exclusive branches |
 | Medium | Host leaked a usbip binding when export failed after binding | Teardown list excluded the busid being worked on |
 | Medium | `force_release` could extend a lease past its own expiry | Grace added to `now` without capping at `expires_at` |
+| Medium | Relay keys were derived from `(lease, epoch, bench, resource)` — all small, sequential or discoverable — so a third party could guess a live key and be spliced in place of the real device | Convenience of independent derivation was preferred to unguessability |
+| Medium | The client never fenced on epoch at all | Only the host implemented D7; the client relied on TCP ordering |
+| Medium | No liveness tracking: a wedged host with a live socket kept its bench matchable | Heartbeats were accepted and discarded |
 
 **The cause was uniform: every test exercised the happy path.** None asked what
 happens when a step fails. `tests/failure_paths.rs` exists to keep that from

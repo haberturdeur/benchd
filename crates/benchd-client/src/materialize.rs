@@ -35,6 +35,11 @@ use tokio_util::codec::{FramedWrite, LinesCodec};
 pub struct Materializer {
     root: PathBuf,
     coordinator: String,
+    /// Highest epoch seen per lease. The client is an executor too, and a
+    /// delayed instruction for a superseded lease must be dropped rather than
+    /// obeyed — obeying it would expose hardware whose lease is gone (D7).
+    /// Until now only the host fenced, and the client relied on TCP ordering.
+    seen: BTreeMap<LeaseId, benchd_core::lease::Epoch>,
     active: BTreeMap<LeaseId, PathBuf>,
     /// vhci ports this lease imported, needing an explicit detach.
     imported: BTreeMap<LeaseId, Vec<u32>>,
@@ -45,6 +50,7 @@ impl Materializer {
         Materializer {
             root: root.into(),
             coordinator,
+            seen: BTreeMap::new(),
             active: BTreeMap::new(),
             imported: BTreeMap::new(),
         }
@@ -138,12 +144,28 @@ impl Materializer {
         }
     }
 
+    /// Accept an instruction only if it is at least as new as anything we have
+    /// already seen for this lease.
+    fn fence(&mut self, lease: LeaseId, epoch: benchd_core::lease::Epoch) -> Result<(), Outcome> {
+        let seen = self.seen.entry(lease).or_insert(benchd_core::lease::Epoch(0));
+        if epoch < *seen {
+            tracing::warn!(%lease, ?epoch, ?seen, "dropping a stale instruction");
+            return Err(Outcome::Stale { seen: *seen });
+        }
+        *seen = epoch;
+        Ok(())
+    }
+
     pub async fn materialize(
         &mut self,
         lease: LeaseId,
+        epoch: benchd_core::lease::Epoch,
         owner: &str,
         slots: &BTreeMap<String, BTreeMap<String, ResourceHandle>>,
     ) -> Outcome {
+        if let Err(stale) = self.fence(lease, epoch) {
+            return stale;
+        }
         let dir = self.lease_dir(owner, lease);
 
         // Resolve everything before mounting anything: a half-materialised
@@ -223,7 +245,21 @@ impl Materializer {
         Outcome::Ok
     }
 
-    pub async fn unmaterialize(&mut self, lease: LeaseId, owner: &str) -> Outcome {
+    pub async fn unmaterialize(
+        &mut self,
+        lease: LeaseId,
+        epoch: benchd_core::lease::Epoch,
+        owner: &str,
+    ) -> Outcome {
+        if let Err(stale) = self.fence(lease, epoch) {
+            return stale;
+        }
+        self.unmaterialize_now(lease, owner).await
+    }
+
+    /// Teardown without fencing, for paths that already know the lease is dead
+    /// (a failed setup, or clearing state at startup).
+    pub async fn unmaterialize_now(&mut self, lease: LeaseId, owner: &str) -> Outcome {
         // Idempotent: the reaper races voluntary releases, and neither path may
         // fail. Fall back to the computed path so a restarted daemon can still
         // clean up a lease it does not remember.

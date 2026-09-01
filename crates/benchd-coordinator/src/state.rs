@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use benchd_core::lease::{Effect, Epoch, LeaseId, LeaseManager, SessionId};
 use benchd_core::model::{Bench, Inventory};
 use benchd_core::wire::{
-    BenchSpec, RequestId, ResourceHandle, SessionToken, ToClient, ToHost,
+    BenchSpec, ChannelKey, RequestId, ResourceHandle, SessionToken, ToClient, ToHost,
 };
 use benchd_core::Limits;
 
@@ -25,6 +25,11 @@ use crate::conn::Outbox;
 pub struct HostConn {
     pub bench: String,
     pub out: Outbox,
+    /// When we last heard anything from this host. A TCP connection can stay
+    /// open long after the peer stops functioning — a wedged process, a
+    /// half-open connection after a machine sleeps — so silence, not a socket
+    /// close, is what marks a bench unavailable (D19).
+    pub last_seen: u64,
     /// Address the host dialled from. Used to decide whether a client is
     /// co-located with it, which is what selects bind-mount versus USB/IP.
     pub peer_ip: std::net::IpAddr,
@@ -33,6 +38,7 @@ pub struct HostConn {
 /// A connected client daemon (one per agent machine).
 pub struct ClientConn {
     pub out: Outbox,
+    pub last_seen: u64,
     pub peer_ip: std::net::IpAddr,
 }
 
@@ -51,6 +57,11 @@ pub struct State {
     /// Without this a failed export produces a lease the agent believes is
     /// good, and a failed materialisation parks a bench for its whole TTL.
     pub pending: BTreeMap<RequestId, LeaseId>,
+    /// Rendezvous keys in flight, so the host's `Export` and the client's
+    /// `Materialize` name the same channel. Generated once here because the
+    /// keys are random (unguessable) rather than derived, and dropped when the
+    /// lease ends.
+    channels: BTreeMap<(LeaseId, String, String), ChannelKey>,
     next_request: u64,
     next_conn: u64,
     /// Treat every bench as remote. Exercises the USB/IP path on one machine.
@@ -70,10 +81,36 @@ impl State {
             tokens: BTreeMap::new(),
             session_conn: BTreeMap::new(),
             pending: BTreeMap::new(),
+            channels: BTreeMap::new(),
             next_request: 1,
             next_conn: 1,
             force_relay: false,
         }
+    }
+
+    /// Note that a peer is alive.
+    pub fn touch_host(&mut self, bench: &str, now: u64) {
+        if let Some(host) = self.hosts.get_mut(bench) {
+            host.last_seen = now;
+        }
+    }
+
+    pub fn touch_client(&mut self, conn_id: u64, now: u64) {
+        if let Some(client) = self.clients.get_mut(&conn_id) {
+            client.last_seen = now;
+        }
+    }
+
+    /// Benches whose host has stopped answering.
+    ///
+    /// Returned rather than acted on, so the caller can drop the benches and
+    /// their leases with the usual effect ordering.
+    pub fn silent_hosts(&self, now: u64, timeout: u64) -> Vec<String> {
+        self.hosts
+            .values()
+            .filter(|h| now.saturating_sub(h.last_seen) > timeout)
+            .map(|h| h.bench.clone())
+            .collect()
     }
 
     pub fn next_request(&mut self) -> RequestId {
@@ -149,15 +186,33 @@ impl State {
                         tracing::warn!(%bench, "export for a bench whose host has gone");
                         continue;
                     };
-                    let relay = self.needs_relay(&bench, session);
+                    // Mint one key per resource now; the client is handed the
+                    // same keys when its Materialize is built below.
+                    let mut channels = BTreeMap::new();
+                    if self.needs_relay(&bench, session) {
+                        let names: Vec<String> = self
+                            .leases
+                            .inventory()
+                            .benches
+                            .get(&bench)
+                            .map(|b| b.resource_names().iter().map(|s| s.to_string()).collect())
+                            .unwrap_or_default();
+                        for name in names {
+                            let key = ChannelKey::generate();
+                            self.channels
+                                .insert((lease, bench.clone(), name.clone()), key.clone());
+                            channels.insert(name, key);
+                        }
+                    }
                     let request = self.next_request();
                     self.pending.insert(request, lease);
                     out.push(Outgoing::Host {
                         out: host_out,
-                        msg: ToHost::Export { request, lease, epoch, session, relay },
+                        msg: ToHost::Export { request, lease, epoch, session, channels },
                     });
                 }
                 Effect::Unexport { bench, lease, epoch } => {
+                    self.channels.retain(|(l, b, _), _| !(*l == lease && *b == bench));
                     let Some(host_out) = self.hosts.get(&bench).map(|h| h.out.clone()) else {
                         continue;
                     };
@@ -169,20 +224,28 @@ impl State {
                 }
                 Effect::Materialize { lease, session, slots } => {
                     let Some(conn) = self.client_for(session) else { continue };
+                    let epoch = self.lease_epoch(lease);
                     let handles = self.handles_for(&slots, session, lease);
                     let request = self.next_request();
                     self.pending.insert(request, lease);
                     out.push(Outgoing::Client {
                         out: conn,
-                        msg: ToClient::Materialize { request, lease, session, slots: handles },
+                        msg: ToClient::Materialize {
+                            request,
+                            lease,
+                            epoch,
+                            session,
+                            slots: handles,
+                        },
                     });
                 }
                 Effect::Unmaterialize { lease, session } => {
                     let Some(conn) = self.client_for(session) else { continue };
+                    let epoch = self.lease_epoch(lease);
                     let request = self.next_request();
                     out.push(Outgoing::Client {
                         out: conn,
-                        msg: ToClient::Unmaterialize { request, lease, session },
+                        msg: ToClient::Unmaterialize { request, lease, epoch, session },
                     });
                 }
                 Effect::Notify { session, event } => {
@@ -219,6 +282,32 @@ impl State {
         host.peer_ip != client.peer_ip
     }
 
+    /// One epoch for a whole lease, for the client to fence on.
+    ///
+    /// The client holds a lease, not a bench, so it needs a single number. The
+    /// highest of the lease's per-bench epochs is monotonic per lease, which is
+    /// all fencing requires.
+    fn lease_epoch(&self, lease: LeaseId) -> Epoch {
+        self.leases
+            .lease(lease)
+            .and_then(|l| l.epochs.values().copied().max())
+            .unwrap_or(Epoch(0))
+    }
+
+    /// The key minted for this resource when the host was told to export it.
+    fn channel_for(&self, lease: LeaseId, bench: &str, resource: &str) -> ChannelKey {
+        self.channels
+            .get(&(lease, bench.to_string(), resource.to_string()))
+            .cloned()
+            .unwrap_or_else(|| {
+                // Cannot happen: Export is dispatched before Materialize. If it
+                // ever does, an unmatchable key fails the rendezvous loudly
+                // rather than pairing with something unintended.
+                tracing::error!(%lease, %bench, %resource, "no channel key for a relayed resource");
+                ChannelKey::generate()
+            })
+    }
+
     /// The epoch this lease was granted for one specific bench.
     ///
     /// Per bench, never shared: every bench has its own counter, so a two-slot
@@ -242,10 +331,13 @@ impl State {
                 continue;
             };
             let relay = self.needs_relay(bench_id, session);
-            let Some(epoch) = self.epoch_for(lease, bench_id) else {
-                tracing::error!(%lease, %bench_id, "no epoch for a bench in its own lease");
+            // Keys are no longer derived from the epoch, but this still checks
+            // that the lease really holds this bench before handing out a path
+            // to it.
+            if self.epoch_for(lease, bench_id).is_none() {
+                tracing::error!(%lease, %bench_id, "materialising a bench this lease does not hold");
                 continue;
-            };
+            }
             let mut resources = BTreeMap::new();
             for (name, resource) in &bench.resources {
                 let handle = match resource {
@@ -257,11 +349,11 @@ impl State {
                     // needs to name what it is asking for, and the host answers
                     // with whatever busid it exported under.
                     benchd_core::model::Resource::Serial { .. } => ResourceHandle::UsbIp {
-                        channel: benchd_core::wire::channel_key(lease, epoch, bench_id, name),
+                        channel: self.channel_for(lease, bench_id, name),
                         busid: String::new(),
                     },
                     benchd_core::model::Resource::Usb { busid } => ResourceHandle::UsbIp {
-                        channel: benchd_core::wire::channel_key(lease, epoch, bench_id, name),
+                        channel: self.channel_for(lease, bench_id, name),
                         busid: busid.clone(),
                     },
                 };

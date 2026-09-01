@@ -250,11 +250,11 @@ fn dispatch(shared: &Arc<Shared>, msg: ToClient) {
 async fn handle(shared: &Arc<Shared>, msg: ToClient) {
     match msg {
         // Instructions we execute.
-        ToClient::Materialize { request, lease, session, slots } => {
+        ToClient::Materialize { request, lease, epoch, session, slots } => {
             let owner = shared.agents.owner_for(session).await;
             let outcome = {
                 let mut m = shared.materializer.lock().await;
-                m.materialize(lease, &owner, &slots).await
+                m.materialize(lease, epoch, &owner, &slots).await
             };
             if let benchd_core::wire::Outcome::Ok = outcome {
                 let paths = paths_for(&shared.root, &owner, lease, &slots);
@@ -264,11 +264,11 @@ async fn handle(shared: &Arc<Shared>, msg: ToClient) {
             }
             shared.send(&ClientMsg::Done { request, result: outcome }).await;
         }
-        ToClient::Unmaterialize { request, lease, session } => {
+        ToClient::Unmaterialize { request, lease, epoch, session } => {
             let owner = shared.agents.owner_for(session).await;
             let outcome = {
                 let mut m = shared.materializer.lock().await;
-                m.unmaterialize(lease, &owner).await
+                m.unmaterialize(lease, epoch, &owner).await
             };
             shared.send(&ClientMsg::Done { request, result: outcome }).await;
         }
@@ -286,7 +286,7 @@ async fn handle(shared: &Arc<Shared>, msg: ToClient) {
             // the same lease so it cannot undo work that has not happened yet.
             let owner = shared.agents.owner_for(lease_session(shared, lease).await).await;
             let mut m = shared.materializer.lock().await;
-            m.unmaterialize(lease, &owner).await;
+            m.unmaterialize_now(lease, &owner).await;
         }
 
         // Replies to agent requests.

@@ -92,7 +92,7 @@ impl Exports {
         lease: LeaseId,
         epoch: Epoch,
         session: SessionId,
-        relay: bool,
+        channels: BTreeMap<String, ChannelKey>,
     ) -> Outcome {
         if let Err(stale) = self.fence(epoch) {
             return stale;
@@ -101,7 +101,7 @@ impl Exports {
             return Outcome::Ok; // idempotent: a retry is not an error
         }
 
-        if !relay {
+        if channels.is_empty() {
             tracing::info!(bench = %self.spec.id, %lease, ?epoch, "exported (co-located)");
             self.active.insert(lease, Active { epoch, session, exported: Vec::new() });
             return Outcome::Ok;
@@ -120,9 +120,15 @@ impl Exports {
 
         let mut exported = Vec::new();
         for (resource, busid) in &busids {
-            // Both ends derive the same channel key from facts they already
-            // have, so nothing has to be threaded between two messages.
-            let key = benchd_core::wire::channel_key(lease, epoch, &self.spec.id, resource);
+            // The coordinator minted this key and gave the same one to the
+            // client; it is random rather than derived, so nobody else can
+            // guess it and race us to the rendezvous.
+            let Some(key) = channels.get(resource).cloned() else {
+                self.tear_down(&exported).await;
+                return Outcome::Failed {
+                    detail: format!("no channel key was issued for resource {resource:?}"),
+                };
+            };
 
             if let Err(err) = sysfs::bind(busid).await {
                 self.tear_down(&exported).await;

@@ -98,7 +98,7 @@ Then point an agent at it:
 ## Build
 
 ```sh
-cargo test           # 66 tests, incl. a property test over random inventories
+cargo test           # 68 tests, incl. a property test over random inventories
 cargo clippy --all-targets
 ```
 

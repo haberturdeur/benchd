@@ -206,8 +206,8 @@ async fn run(args: &Args, spec: &BenchSpec, exports: &mut Exports) -> Result<()>
                         tracing::error!(%reason, "registration refused");
                         break Err(anyhow::anyhow!("registration refused: {reason}"));
                     }
-                    ToHost::Export { request, lease, epoch, session, relay } => {
-                        let result = exports.export(lease, epoch, session, relay).await;
+                    ToHost::Export { request, lease, epoch, session, channels } => {
+                        let result = exports.export(lease, epoch, session, channels).await;
                         reply(&tx, request, result);
                     }
                     ToHost::Unexport { request, lease, epoch } => {

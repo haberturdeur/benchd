@@ -93,7 +93,12 @@ async fn serve_host(
                 state.leases.inventory_mut().benches.insert(bench_id.clone(), bench);
                 state.hosts.insert(
                     bench_id.clone(),
-                    HostConn { bench: bench_id.clone(), out: out.clone(), peer_ip: peer.ip() },
+                    HostConn {
+                        bench: bench_id.clone(),
+                        out: out.clone(),
+                        peer_ip: peer.ip(),
+                        last_seen: now(),
+                    },
                 );
                 out.send(&ToHost::Registered);
                 tracing::info!(bench = %bench_id, %peer, "host registered");
@@ -117,6 +122,9 @@ async fn serve_host(
                 continue;
             }
         };
+        // Any message proves liveness, not just an explicit heartbeat.
+        shared.state.lock().await.touch_host(&bench_id, now());
+
         match msg {
             HostMsg::Heartbeat | HostMsg::Register { .. } => {}
             HostMsg::Done { request, result } => {
@@ -275,7 +283,10 @@ async fn serve_client(
     let conn_id = {
         let mut state = shared.state.lock().await;
         let id = state.next_conn();
-        state.clients.insert(id, ClientConn { out: out.clone(), peer_ip: peer.ip() });
+        state.clients.insert(
+            id,
+            ClientConn { out: out.clone(), peer_ip: peer.ip(), last_seen: now() },
+        );
         id
     };
     tracing::info!(%peer, conn_id, "client connected");
@@ -346,6 +357,7 @@ async fn handle_client(
     msg: ClientMsg,
 ) -> Vec<crate::state::Outgoing> {
     let mut state = shared.state.lock().await;
+    state.touch_client(conn_id, now());
 
     match msg {
         ClientMsg::Heartbeat => Vec::new(),

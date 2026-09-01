@@ -80,16 +80,17 @@ pub enum ToHost {
     Rejected { reason: String },
     /// Make this bench's resources reachable by `session`.
     ///
-    /// `relay` is false when the host and client share a machine: there is
-    /// nothing to export, and the client bind-mounts the real inode instead.
-    /// When true, the host derives a [`channel_key`] per resource and dials out.
+    /// `channels` is empty when the host and client share a machine: there is
+    /// nothing to export and the client bind-mounts the real inode instead.
+    /// Otherwise it maps each resource name to the rendezvous key the host must
+    /// present when it dials out.
     Export {
         request: RequestId,
         lease: LeaseId,
         epoch: Epoch,
         session: SessionId,
         #[serde(default)]
-        relay: bool,
+        channels: BTreeMap<String, ChannelKey>,
     },
     Unexport { request: RequestId, lease: LeaseId, epoch: Epoch },
 }
@@ -176,11 +177,12 @@ pub enum ToClient {
     Materialize {
         request: RequestId,
         lease: LeaseId,
+        epoch: Epoch,
         session: SessionId,
         /// slot -> resources to expose
         slots: BTreeMap<String, BTreeMap<String, ResourceHandle>>,
     },
-    Unmaterialize { request: RequestId, lease: LeaseId, session: SessionId },
+    Unmaterialize { request: RequestId, lease: LeaseId, epoch: Epoch, session: SessionId },
 
     /// Unsolicited: the grace window has started. Park the board or renew.
     Revoking { lease: LeaseId, reason: String, teardown_at: Secs },
@@ -208,22 +210,22 @@ pub enum ResourceHandle {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ChannelKey(pub String);
 
-/// The key for one resource's data channel.
-///
-/// **Deterministic on purpose.** Both ends must arrive at the same key, and the
-/// host is told to export before the client is told to materialise — so a random
-/// key would have to be threaded through two messages and kept in sync. Deriving
-/// it from facts both sides already know removes that coupling entirely.
-///
-/// The epoch is included so a retry after a superseded lease cannot collide with
-/// a channel still being torn down.
-pub fn channel_key(
-    lease: LeaseId,
-    epoch: Epoch,
-    bench: &str,
-    resource: &str,
-) -> ChannelKey {
-    ChannelKey(format!("{}-{}-{}-{}", lease.0, epoch.0, bench, resource))
+impl ChannelKey {
+    /// A fresh, unguessable rendezvous key.
+    ///
+    /// **Deliberately random, not derived.** An earlier version built the key
+    /// from `(lease, epoch, bench, resource)` so both ends could compute it
+    /// independently — convenient, but every one of those values is either
+    /// small, sequential, or discoverable from `lease_status`, so a third party
+    /// on the LAN could guess a live key, win the rendezvous, and be spliced to
+    /// someone else's device in place of the real one. The relay cannot tell
+    /// the difference: presenting the key *is* the claim to the channel.
+    ///
+    /// The coordinator generates the key once and sends it to both sides, which
+    /// costs one field in `ToHost::Export` and buys 122 bits of entropy.
+    pub fn generate() -> Self {
+        ChannelKey(uuid::Uuid::new_v4().to_string())
+    }
 }
 
 /// First line on a data connection, before it becomes an opaque byte stream.

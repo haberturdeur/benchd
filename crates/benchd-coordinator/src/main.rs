@@ -42,6 +42,11 @@ struct Args {
     /// host and client share a machine. Exercises the remote path on one box.
     #[arg(long)]
     force_relay: bool,
+
+    /// How long a host may go silent before its bench stops being matched.
+    /// Should be a few times the executors' heartbeat interval.
+    #[arg(long, default_value_t = 45)]
+    host_timeout_seconds: u64,
 }
 
 pub struct Shared {
@@ -109,13 +114,35 @@ async fn main() -> Result<()> {
     {
         let shared = Arc::clone(&shared);
         let period = std::time::Duration::from_secs(args.tick_seconds.max(1));
+        let timeout = args.host_timeout_seconds;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(period);
             loop {
                 ticker.tick().await;
                 let outgoing = {
                     let mut state = shared.state.lock().await;
-                    let effects = state.leases.tick(now());
+                    let mut effects = state.leases.tick(now());
+
+                    // A host that has stopped answering cannot be trusted to
+                    // still own its hardware, so its bench stops being matched
+                    // and its leases end. A live TCP socket is not evidence:
+                    // the process may be wedged, or the machine asleep.
+                    let silent = state.silent_hosts(now(), timeout);
+                    tracing::debug!(hosts = state.hosts.len(), silent = silent.len(), timeout, "liveness check");
+                    for bench in silent {
+                        tracing::warn!(%bench, "host has gone silent; withdrawing its bench");
+                        state.hosts.remove(&bench);
+                        state.leases.inventory_mut().benches.remove(&bench);
+                        let doomed: Vec<_> = state
+                            .leases
+                            .leases()
+                            .filter(|l| l.benches().any(|b| b == &bench))
+                            .map(|l| l.id)
+                            .collect();
+                        for lease in doomed {
+                            effects.extend(state.leases.drop_lease(lease));
+                        }
+                    }
                     state.dispatch(effects)
                 };
                 for msg in outgoing {

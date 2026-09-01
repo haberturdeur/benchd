@@ -230,3 +230,55 @@ fn repeated_renewal_cannot_exceed_the_total_hold_budget() {
         limits.max_total_hold
     );
 }
+
+// --- fencing ---------------------------------------------------------------
+
+#[test]
+fn epochs_are_per_bench_not_per_lease() {
+    // A multi-slot claim can hold a well-used bench and a fresh one at the same
+    // time. Collapsing their epochs into one made the two ends of a relayed
+    // claim derive different channel keys, so the relay could never pair them.
+    let mut m = manager(Limits { max_benches: 4, ..Default::default() });
+    let s = m.register("agent");
+
+    // Use up esp32s3-a a few times so its counter runs ahead.
+    for _ in 0..3 {
+        let g = m.claim(s, &claim_named("dut", &["psram=octal"], 60), 0).unwrap();
+        m.release(s, g.lease, 1).unwrap();
+    }
+
+    let request = ClaimRequest {
+        slots: [
+            ("dut".to_string(), Requirement::parse(["psram=octal"]).unwrap()),
+            ("peer".to_string(), Requirement::parse(["usb=cp2102n"]).unwrap()),
+        ]
+        .into_iter()
+        .collect(),
+        distinct: Distinct::All,
+        ttl_seconds: 60,
+        reason: "mesh".into(),
+    };
+    let g = m.claim(s, &request, 2).unwrap();
+    let lease = m.lease(g.lease).unwrap();
+
+    let epochs: Vec<u64> = lease.epochs.values().map(|e| e.0).collect();
+    assert_eq!(epochs.len(), 2, "one epoch per bench");
+    assert_ne!(
+        epochs[0], epochs[1],
+        "these benches have different histories, so their epochs must differ: {epochs:?}"
+    );
+}
+
+#[test]
+fn an_epoch_never_goes_backwards_for_a_bench() {
+    let mut m = manager(Limits::default());
+    let s = m.register("agent");
+    let mut last = 0;
+    for _ in 0..5 {
+        let g = m.claim(s, &claim_named("dut", &["psram=octal"], 60), 0).unwrap();
+        let epoch = m.lease(g.lease).unwrap().epochs.values().next().unwrap().0;
+        assert!(epoch > last, "epoch went {last} -> {epoch}");
+        last = epoch;
+        m.release(s, g.lease, 1).unwrap();
+    }
+}
