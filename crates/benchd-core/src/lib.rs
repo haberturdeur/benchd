@@ -8,11 +8,20 @@
 //! - [`model`] - benches, resources, claim requests, inventory loading
 //! - [`matcher`] - superset matching, best-fit scoring, atomic multi-slot
 //!   allocation, and unsatisfiable-vs-contended diagnosis
+//! - [`limits`] - how long a lease may be held, and how many
+//! - [`lease`] - the lease lifecycle state machine (pure; time is a parameter)
 
+pub mod lease;
+pub mod limits;
 pub mod matcher;
 pub mod model;
 pub mod tags;
 
+pub use lease::{
+    ClaimError, Effect, EndReason, Epoch, Granted, Lease, LeaseError, LeaseEvent, LeaseId,
+    LeaseManager, LeaseState, RevokeReason, SessionId,
+};
+pub use limits::{GrantedTtl, LimitError, Limits, Secs};
 pub use matcher::{allocate, fit_cost, Allocation, BusyInfo, Failure, NoMatch, SlotDiagnosis};
 pub use model::{
     Bench, ClaimRequest, Distinct, Inventory, InventoryError, Requirement, Resource,

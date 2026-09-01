@@ -1,0 +1,19 @@
+[package]
+name = "benchd-core"
+description = "Pure domain logic for benchd: tags, benches, matching, limits, leases"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+strsim = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

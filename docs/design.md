@@ -255,10 +255,10 @@ socket survives the daemon that created it — exactly why an explicit teardown 
 required rather than optional.
 
 *Costs of the relay itself, accepted:* the coordinator sits in the data path, adding
-bandwidth load and one RTT per URB round trip. Irrelevant for 115200 serial (~11 KB/s);
-**unproven for OpenOCD or high-rate logging** — measure before relying on it (Q10).
-Coordinator death already kills the lab (D6), so this costs no availability that was
-not already gone.
+bandwidth load and one RTT per URB round trip. Irrelevant for the serial consoles this
+is built for (~11 KB/s). JTAG and other latency-sensitive transports are out of scope
+(Q10). Coordinator death already kills the lab (D6), so this costs no availability that
+was not already gone.
 
 *Deliberately not done:* having the host dial the client directly when the client is
 reachable. It would cut the coordinator out of the data path, but it is a second code
@@ -640,7 +640,7 @@ None blocking.
 
 | # | Question | State |
 |---|---|---|
-| Q10 | Does the relay's extra RTT matter for OpenOCD/JTAG? Serial is certainly fine. | open — **measure**, don't guess; only bites when remote benches land |
+| Q10 | Relay latency for JTAG/high-rate transports | **Out of scope.** Serial only for now (~11 KB/s), where the extra RTT is noise. Revisit if a JTAG bench ever exists. |
 | Q11 | Can `usbipd` bind loopback-only? | **Moot — we don't run it.** It binds wildcard with no auth, so instead both ends dial out and hand the kernel the resulting fd (D5). No listening socket to confine. |
 | Q12 | Are the `OP_REQ_IMPORT`/`OP_REP_IMPORT` structs implemented byte-correctly? | open — differential-test against stock `usbip`/`usbipd` in both directions |
 
@@ -661,10 +661,11 @@ revisit-with-evidence, not now.
 | Bench/resource model, TOML config | done, tested (schema splits per D9) |
 | Matcher | done — 21 tests + property test |
 | Multi-resource benches | done, tested |
-| Policy engine | Python prototype only |
-| Workspace split (4 crates) | not started |
+| Limits (one global set) | done, tested |
+| Lease lifecycle + reaper logic | done — 14 tests |
+| Workspace split | done (`crates/benchd-core`) |
 | Wire messages + JSON line protocol | not started |
-| Coordinator / host / client | specified |
+| Coordinator / host / client daemons | specified |
 | USB/IP handshake + sysfs fd handoff | specified, not started |
 | Skill | not started |
 

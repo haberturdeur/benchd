@@ -6,12 +6,12 @@
 
 use std::collections::BTreeMap;
 
-use benchd::matcher::{BusyInfo, Failure};
-use benchd::model::{Bench, ClaimRequest, Distinct, Inventory, Requirement};
-use benchd::tags::{parse_tags, Tag, TagError};
-use benchd::{allocate_in, format_tags};
+use benchd_core::matcher::{BusyInfo, Failure};
+use benchd_core::model::{Bench, ClaimRequest, Distinct, Inventory, Requirement};
+use benchd_core::tags::{parse_tags, Tag, TagError};
+use benchd_core::{allocate_in, format_tags};
 
-const INVENTORY: &str = include_str!("../examples/inventory.toml");
+const INVENTORY: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/inventory.toml"));
 
 fn inventory() -> Inventory {
     Inventory::from_toml_str(INVENTORY).expect("example inventory should load")
@@ -359,8 +359,8 @@ fn a_disabled_bench_is_invisible_to_the_matcher() {
 
 mod properties {
     use super::*;
-    use benchd::matcher::allocate;
-    use benchd::tags::TagSet;
+    use benchd_core::matcher::allocate;
+    use benchd_core::tags::TagSet;
     use proptest::prelude::*;
 
     /// Build a bench directly, bypassing config parsing.
@@ -426,7 +426,7 @@ mod properties {
                     continue;
                 }
                 used.push(b.id.clone());
-                let c = benchd::fit_cost(b, req, counts, weights);
+                let c = benchd_core::fit_cost(b, req, counts, weights);
                 go(i + 1, slots, request, free, used, counts, weights, acc + c, best);
                 used.pop();
             }

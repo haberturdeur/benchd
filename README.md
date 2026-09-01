@@ -21,8 +21,9 @@ Early. The matcher is implemented and tested; the daemon is not built yet.
 | Tags, vocabulary, implication closure | done, tested |
 | Inventory + TOML config | done, tested |
 | Matcher (superset match, best-fit, multi-slot, diagnosis) | done — 21 tests + property test |
+| Limits (single global set, no roles) | done, tested |
+| Lease lifecycle (claim/renew/release/revoke/expire) | done — 14 tests |
 | Multi-board benches | done, tested |
-| Limits (single global set, no roles) | specified |
 | Coordinator (leases, reaper) | specified |
 | Host (one per bench) | specified |
 | Client daemon + per-agent MCP shim | specified |
@@ -55,21 +56,26 @@ boundary belongs to the network, not the application.
 ## Layout
 
 ```
-docs/design.md          the design, 18 decisions, and open questions
-src/tags.rs             key=value vocabulary, validation, implication closure
-src/model.rs            benches, resources, claim requests, TOML config
-src/matcher.rs          matching, best-fit scoring, allocation, diagnosis
-tests/matcher.rs        behavioural spec + property test vs a brute-force oracle
-examples/inventory.toml example inventory
+docs/design.md                    the design, 19 decisions, and open questions
+crates/benchd-core/
+  src/tags.rs                     key=value vocabulary, implication closure
+  src/model.rs                    benches, resources, claim requests, TOML config
+  src/matcher.rs                  matching, best-fit scoring, allocation, diagnosis
+  src/limits.rs                   how long a lease may be held, and how many
+  src/lease.rs                    lease lifecycle state machine (pure)
+  tests/matcher.rs                behavioural spec + property test vs a brute-force oracle
+  tests/lease.rs                  lease lifecycle spec
+examples/inventory.toml           example inventory
 ```
 
-The crate will split into a workspace (`benchd-core`, `-coordinator`, `-host`,
-`-client`) when the daemons land; today's code is all pure core.
+`benchd-core` is pure: no I/O, no clock, no sockets. Time is a parameter and decisions
+come out as `Effect`s, so the whole lifecycle is testable without daemons or hardware.
+The `-coordinator`, `-host` and `-client` crates join the workspace as they land.
 
 ## Build
 
 ```sh
-cargo test           # 19 tests, incl. a property test over random inventories
+cargo test           # 40 tests, incl. a property test over random inventories
 cargo clippy --all-targets
 ```
 
