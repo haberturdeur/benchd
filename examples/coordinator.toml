@@ -1,0 +1,82 @@
+# benchd coordinator config.
+#
+# Benches are NOT listed here: each host declares its own (D9). What lives here is
+# the VOCABULARY, which must stay central - if hosts defined their own tags, the
+# closed vocabulary would stop being closed and rot per-machine.
+#
+# Note the ordering: bare keys must precede the first [table], or TOML folds them
+# into it.
+
+open_keys = ["name"]
+
+[limits]
+max_ttl        = 900     # longest single grant, seconds
+max_total_hold = 7200    # sum across renewals
+max_benches    = 2       # concurrent benches per session
+grace          = 30      # warning window before teardown
+
+[tags.soc]
+description = "System-on-chip on the board"
+# weight 0: identity, not a contended capability. Being the only board with a
+# given SoC should not make the matcher hoard it.
+weight = 0
+[tags.soc.values.esp32]
+description = "Original ESP32, Xtensa dual-core"
+implies = ["family=esp32", "arch=xtensa", "net=wifi", "net=bt"]
+[tags.soc.values.esp32s3]
+description = "ESP32-S3, Xtensa dual-core with native USB"
+implies = ["family=esp32", "arch=xtensa", "net=wifi", "net=bt", "jtag=builtin", "usb=native"]
+[tags.soc.values.esp32c3]
+description = "ESP32-C3, RISC-V single core with native USB"
+implies = ["family=esp32", "arch=riscv", "net=wifi", "net=bt", "jtag=builtin", "usb=native"]
+
+[tags.family]
+description = "SoC family (implied by soc=, rarely set directly)"
+weight = 0
+[tags.family.values.esp32]
+description = "Espressif ESP32 family"
+
+[tags.arch]
+description = "CPU architecture (implied by soc=)"
+weight = 0
+[tags.arch.values.xtensa]
+description = "Tensilica Xtensa"
+[tags.arch.values.riscv]
+description = "RISC-V"
+
+[tags.usb]
+description = "How the board attaches to USB"
+weight = 0
+[tags.usb.values.native]
+description = "SoC's own USB peripheral"
+[tags.usb.values.cp2102n]
+description = "Silicon Labs CP2102N USB-UART bridge"
+
+[tags.net]
+description = "Radios available on the board"
+[tags.net.values.wifi]
+description = "2.4GHz Wi-Fi"
+[tags.net.values.bt]
+description = "Bluetooth / BLE"
+
+[tags.jtag]
+description = "Debug interface"
+[tags.jtag.values.builtin]
+description = "USB-JTAG built into the SoC, no external probe needed"
+[tags.jtag.values.external]
+description = "External JTAG probe wired to the bench"
+
+[tags.psram]
+description = "External PSRAM fitted"
+[tags.psram.values.none]
+description = "No PSRAM"
+[tags.psram.values.octal]
+description = "Octal-SPI PSRAM"
+
+[tags.flash]
+description = "Flash size"
+[tags.flash.values."4mb"]
+description = "4 MiB"
+[tags.flash.values."8mb"]
+description = "8 MiB"
+

@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 /// A `key=value` pair.
@@ -20,6 +21,22 @@ use thiserror::Error;
 pub struct Tag {
     pub key: String,
     pub value: String,
+}
+
+// Tags cross the wire and appear in config as `"soc=esp32s3"`, not as a struct
+// with two fields. Serialising through the same parser the rest of the system
+// uses means a malformed tag is rejected identically wherever it arrives.
+impl Serialize for Tag {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Tag {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        Tag::parse(&text).map_err(serde::de::Error::custom)
+    }
 }
 
 impl Tag {

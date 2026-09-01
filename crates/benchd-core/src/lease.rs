@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::limits::{GrantedTtl, LimitError, Limits, Secs};
@@ -20,7 +21,12 @@ use crate::model::{ClaimRequest, Inventory};
 
 macro_rules! id_type {
     ($name:ident, $prefix:literal) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        // Transparent on the wire: a bare integer, so protocol lines stay
+        // readable (D5) rather than nesting `{"0": 4}`.
+        #[derive(
+            Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
         pub struct $name(pub u64);
 
         impl std::fmt::Display for $name {
@@ -37,7 +43,10 @@ id_type!(LeaseId, "l");
 /// Monotonically increasing per bench. An executor records the highest it has
 /// seen and rejects anything lower, so a delayed instruction for a dead lease
 /// cannot hand out live hardware (D7).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(transparent)]
 pub struct Epoch(pub u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +196,30 @@ impl LeaseManager {
 
     pub fn inventory(&self) -> &Inventory {
         &self.inventory
+    }
+
+    /// Benches arrive by host registration and leave when a host disconnects
+    /// (D9), so the inventory is mutable at runtime rather than loaded once.
+    pub fn inventory_mut(&mut self) -> &mut Inventory {
+        &mut self.inventory
+    }
+
+    /// Terminate a lease without asking its holder: the hardware is gone, so
+    /// there is nothing to grace. Used when a host disconnects or reports a
+    /// lost device.
+    pub fn drop_lease(&mut self, lease: LeaseId) -> Vec<Effect> {
+        let Some(l) = self.leases.remove(&lease) else {
+            return Vec::new();
+        };
+        if let Some(s) = self.sessions.get_mut(&l.session) {
+            s.leases.remove(&lease);
+        }
+        let mut effects = teardown_effects(&l);
+        effects.push(Effect::Notify {
+            session: l.session,
+            event: LeaseEvent::Ended { lease, reason: EndReason::Forced },
+        });
+        effects
     }
 
     pub fn lease(&self, id: LeaseId) -> Option<&Lease> {

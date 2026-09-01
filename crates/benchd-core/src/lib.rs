@@ -10,12 +10,14 @@
 //!   allocation, and unsatisfiable-vs-contended diagnosis
 //! - [`limits`] - how long a lease may be held, and how many
 //! - [`lease`] - the lease lifecycle state machine (pure; time is a parameter)
+//! - [`wire`] - the JSON-lines protocol shared by all three binaries
 
 pub mod lease;
 pub mod limits;
 pub mod matcher;
 pub mod model;
 pub mod tags;
+pub mod wire;
 
 pub use lease::{
     ClaimError, Effect, EndReason, Epoch, Granted, Lease, LeaseError, LeaseEvent, LeaseId,

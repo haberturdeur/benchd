@@ -662,10 +662,11 @@ revisit-with-evidence, not now.
 | Matcher | done — 21 tests + property test |
 | Multi-resource benches | done, tested |
 | Limits (one global set) | done, tested |
-| Lease lifecycle + reaper logic | done — 14 tests |
+| Lease lifecycle + reaper logic | done — 15 tests |
 | Workspace split | done (`crates/benchd-core`) |
-| Wire messages + JSON line protocol | not started |
-| Coordinator / host / client daemons | specified |
+| Wire messages + JSON line protocol | done, tested |
+| Coordinator daemon | working end-to-end |
+| Host / client daemons | specified |
 | USB/IP handshake + sysfs fd handoff | specified, not started |
 | Skill | not started |
 

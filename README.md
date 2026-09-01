@@ -22,7 +22,9 @@ Early. The matcher is implemented and tested; the daemon is not built yet.
 | Inventory + TOML config | done, tested |
 | Matcher (superset match, best-fit, multi-slot, diagnosis) | done — 21 tests + property test |
 | Limits (single global set, no roles) | done, tested |
-| Lease lifecycle (claim/renew/release/revoke/expire) | done — 14 tests |
+| Lease lifecycle (claim/renew/release/revoke/expire) | done — 15 tests |
+| Wire protocol (JSON lines) | done, tested |
+| Coordinator daemon | working end-to-end |
 | Multi-board benches | done, tested |
 | Coordinator (leases, reaper) | specified |
 | Host (one per bench) | specified |
@@ -75,7 +77,7 @@ The `-coordinator`, `-host` and `-client` crates join the workspace as they land
 ## Build
 
 ```sh
-cargo test           # 40 tests, incl. a property test over random inventories
+cargo test           # 45 tests, incl. a property test over random inventories
 cargo clippy --all-targets
 ```
 

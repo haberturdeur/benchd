@@ -298,3 +298,19 @@ fn busy_reports_the_holders_name_and_time_remaining() {
     assert_eq!(info.expires_in, Some(300.0));
     assert_eq!(info.reason, "test");
 }
+
+// --- regressions -----------------------------------------------------------
+
+#[test]
+fn a_bench_can_leave_the_inventory_and_its_lease_goes_with_it() {
+    // A host disconnecting or losing a device is not repaired in place: the
+    // bench leaves and the matcher routes around it.
+    let mut m = manager(Limits::default());
+    let s = m.register("agent-1");
+    let g = m.claim(s, &claim(&["name=esp32s3-a"], 600), 0).unwrap();
+
+    let effects = m.drop_lease(g.lease);
+    assert!(m.lease(g.lease).is_none());
+    assert!(matches!(effects[0], Effect::Unmaterialize { .. }));
+    assert!(m.busy(1).is_empty(), "the bench is free for whoever is left");
+}

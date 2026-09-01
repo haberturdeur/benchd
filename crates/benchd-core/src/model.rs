@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::tags::{parse_tags, Tag, TagDef, TagError, TagSet, Vocabulary};
@@ -26,27 +26,25 @@ pub enum InventoryError {
 }
 
 /// Something that gets materialised into a lease directory.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Resource {
     /// A USB serial device, identified by its stable `/dev/serial/by-id` path.
     ///
     /// We key on by-id rather than `ttyUSB0` because kernel indices renumber on
     /// replug, and an agent handed the wrong board mid-session is the exact
     /// failure this system exists to prevent.
-    Serial { name: String, by_id: PathBuf },
+    Serial { by_id: PathBuf },
     /// A whole USB device, for USB/IP export to a remote client. Carries the
     /// bus id (`1-2.3`) that `usbip bind` needs. Not handled by the local
     /// bind-mount backend.
-    Usb { name: String, busid: String },
+    Usb { busid: String },
 }
 
-impl Resource {
-    pub fn name(&self) -> &str {
-        match self {
-            Resource::Serial { name, .. } | Resource::Usb { name, .. } => name,
-        }
-    }
+// A resource has no `name` field: it is always stored in a map keyed by its
+// name, and carrying the name in both places invites them to disagree.
 
+impl Resource {
     pub fn kind(&self) -> &'static str {
         match self {
             Resource::Serial { .. } => "serial",
@@ -303,14 +301,12 @@ impl RawInventory {
             for (res_name, res) in body.resources {
                 let resource = match res.kind.as_str() {
                     "serial" => Resource::Serial {
-                        name: res_name.clone(),
                         by_id: res.by_id.ok_or_else(|| InventoryError::Bench {
                             bench: id.clone(),
                             reason: format!("serial resource {res_name:?} needs 'by_id'"),
                         })?,
                     },
                     "usb" => Resource::Usb {
-                        name: res_name.clone(),
                         busid: res.busid.ok_or_else(|| InventoryError::Bench {
                             bench: id.clone(),
                             reason: format!("usb resource {res_name:?} needs 'busid'"),
