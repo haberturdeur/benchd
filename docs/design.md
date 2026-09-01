@@ -74,12 +74,16 @@ If separating them would be *physically meaningless*, it's one bench.
       │ MCP over stdio
       ▼
  ┌──────────────────────────┐        ┌───────────────────────────────┐
- │ CLIENT  (agent machine)  │        │ COORDINATOR   (only listener) │
- │  · MCP server            │───────▶│  · inventory + matcher        │
- │  · sandbox materialiser  │  gRPC  │  · policy + lease state       │
- │  · runs as root          │  mTLS  │  · reaper                     │
+ │ benchd-mcp   (per agent) │        │ COORDINATOR   (only listener) │
+ │  · thin, unprivileged    │        │  · inventory + matcher        │
+ └──────────┬───────────────┘        │  · limits + lease state       │
+            │ local socket           │  · reaper                     │
+ ┌──────────▼───────────────┐  JSON  │                               │
+ │ benchd-clientd (machine) │───────▶│                               │
+ │  · sandbox materialiser  │  lines │                               │
+ │  · runs as root          │  / TCP │                               │
  └──────────┬───────────────┘        └───────────────▲───────────────┘
-            │ bind mount                             │ gRPC (mTLS)
+            │ bind mount                             │ JSON lines / TCP
             ▼                                        │
  /run/benchd/<owner>/<lease>/<slot>/<res>    ┌───────┴──────────┐
                                              │ HOST (one bench) │ ×N
@@ -91,7 +95,8 @@ If separating them would be *physically meaningless*, it's one bench.
 ```
 
 Arrows show who dials: **both executors dial in, the coordinator never dials out**
-(D5).
+(D5). Remote USB/IP is the one exception and goes host→client directly, not through
+the coordinator.
 
 **One host process per bench.** Blast radius of a wedged host is one bench; each
 restarts independently; device ownership is unambiguous. Deployed as
@@ -165,52 +170,49 @@ executors that can act on stale instructions, needing fencing (D7) and a failure
 *What stays a trait:* the materialiser, because the delivery mechanism genuinely varies
 — bind mount when co-located, USB/IP when not.
 
-### D5. Only the coordinator is reachable; newline-delimited JSON over a held-open connection
+### D5. Only the coordinator listens; newline-delimited JSON over plain TCP
 
-The coordinator is the sole listener. Hosts and clients always dial in and hold the
-connection open; instructions travel back down it. Messages are `serde` enums in a
-shared crate, serialised one JSON object per line.
+The coordinator is the sole listener. Hosts and clients dial in and hold the connection
+open; instructions travel back down it. Messages are `serde` enums in a shared crate,
+one JSON object per line, over **plain TCP everywhere** — no unix-socket special case
+for co-located components, no TLS.
 
 *Why coordinator-only:* hosts live wherever the hardware is — lab VLAN, bench laptop,
 behind NAT. Requiring each to be addressable makes adding a bench an infrastructure
-task instead of a `systemctl start`, which is the tax that makes people give up and
-plug everything into one box.
+task instead of a `systemctl start`.
 
 *Why a held-open connection:* the coordinator must reach executors it cannot dial, so
 pushing down an inbound connection is the only delivery mechanism available — not a
 convenience. The same connection carries heartbeats up and `revoking` down.
 
-*Why not gRPC/protobuf:* considered and rejected. Its advantages here were schema-
-driven codegen and cross-version compatibility, and **multi-version operation is an
-explicit non-goal** — all three binaries build from one workspace. Sharing the same
-Rust types directly is stronger sync than generating them from a `.proto`, and costs
-no schema language, no `build.rs`, no `prost`/`tonic`. What we hand-roll instead is
-small and dull:
+*Why no TLS:* **benchd does no cryptography.** The PoC assumes a trusted LAN (§9).
+Rolling a PKI is a notorious time sink, and the half that would matter — issuing
+*client* certs so hosts can be identified — is the half nothing automates. If this ever
+needs a boundary it goes underneath as WireGuard, whose peer public keys are already
+mutual authentication, rather than into the application.
 
-| Need | Cost |
-|---|---|
-| framing | newline-delimited; `tokio_util::codec::LinesCodec` |
-| correlation | a `request_id: u64` field |
-| liveness | heartbeat every `H`; miss `K` ⇒ dead |
-| reconnect | loop with backoff |
+*Rejected — a TLS-terminating proxy such as Caddy:* raw TCP would need `caddy-l4`, an
+experimental non-official plugin requiring an `xcaddy` custom build — and worse, **raw
+TCP through a terminating proxy loses the client identity**. HTTP can carry the
+verified subject in a header; a byte stream cannot (PROXY protocol carries the source
+address, not TLS identity). Using Caddy for auth would mean speaking HTTP/WebSocket and
+putting a proxy in the hot path, to solve a problem better solved one layer down.
 
-*Bonus, and it matters for a PoC:* the wire is human-readable. You can `socat` into
-the coordinator, watch a lease being granted, and paste it into a bug report.
+*Rejected — gRPC/protobuf:* its advantages were schema codegen and cross-version
+compatibility, and multi-version operation is an explicit non-goal. All binaries build
+from one workspace, so sharing Rust types directly is stronger sync than generating
+them, at no cost in `build.rs`, `prost` or a second language. What we hand-roll instead
+is small and dull: newline framing (`LinesCodec`), a `request_id` for correlation, a
+heartbeat for liveness, a reconnect loop.
 
-*Transport:* a unix socket while everything is co-located — `SO_PEERCRED` gives
-identity for free — and TCP later behind the same message layer, so D4's "local is not
-a special case" still holds.
+*Bonus, and it matters for a PoC:* the wire is human-readable. `socat` is a debugger.
 
-**The USB/IP relay does not use this path.** Per the kernel README the machine *with*
-the device listens on 3240 and the client dials in — exactly the reachability this
-decision refuses — so remote device traffic is relayed through the coordinator on a
-**separate raw byte stream**, not as JSON. Base64-ing URB traffic through a
-line-oriented control channel would be absurd. That relay was previously unacceptable
-because it put the data path through a component whose failure was meant to be
-survivable; under D6 coordinator death is already fatal, so the objection is gone.
-Costs: an extra hop on a latency-sensitive path (fine for 115200 serial, unproven for
-OpenOCD), and the coordinator as a bandwidth bottleneck. Co-located benches are
-unaffected — bind mount, no network.
+**USB/IP needs no relay on a LAN.** Per the kernel README the machine *with* the device
+listens on 3240 and the client dials in — the opposite direction from our control
+plane. On a flat trusted LAN that is simply fine: the client attaches directly. A relay
+through the coordinator is only needed once hosts stop being reachable, and the better
+answer then is WireGuard — kernel IP forwarding rather than an application-level byte
+pump we would have to write, frame and flow-control.
 
 ### D6. The coordinator is a SPOF; any restart releases leases
 
@@ -256,16 +258,54 @@ silently.
 `unmaterialize` of an unknown lease is a no-op — the reaper races voluntary releases and
 neither path may fail.
 
-### D8. The client is a privileged daemon, not a library
+### D8. A privileged daemon per machine, a thin MCP shim per agent
 
-One root daemon per agent machine, serving MCP *and* materialising.
+`benchd-clientd` is one root daemon per agent machine, holding the coordinator
+connection and doing all materialisation. `benchd-mcp` is a tiny unprivileged MCP
+server, spawned per agent by its harness, talking to the daemon over a local socket.
 
-*Why privileged:* the node must appear on the agent's machine (Goal 2). Bind-mounting
-needs `CAP_SYS_ADMIN`; `usbip attach` needs root. The agent stays unprivileged, so
-something local holds privilege for it.
+*Why the daemon is privileged:* the device node must appear on the agent's machine
+(Goal 2). Bind-mounting needs `CAP_SYS_ADMIN`; `usbip attach` needs root. The agent
+stays unprivileged, so something local holds privilege for it.
 
-*Why one daemon:* an unprivileged shim plus a privileged helper needs its own IPC and
-authorisation, guarding against an attacker already out of scope (§9).
+*Why the split is not optional:* **MCP over stdio is one process per client** — stdio
+is a pipe pair, so the harness spawns the server. A single daemon cannot serve stdio
+MCP to several agents. (An earlier draft of this decision said "one daemon, no shim";
+that was simply wrong about how stdio works.) The shim stays thin and unprivileged;
+privilege lives in the daemon.
+
+*Rejected:* serving MCP over local HTTP so one daemon handles every agent. It works
+(`rmcp` supports it) but pushes per-agent identity into a header the harness must set,
+which is more fragile than a process boundary that already exists.
+
+### D19. Identity is a session token; the name is only a label
+
+At startup `benchd-mcp` registers with the coordinator, declaring a name from
+`$BENCHD_IDENTITY` in its sandbox, and receives a **session token** (UUID) carried on
+every later call. **There is no authentication** — registration is a request for a
+token and the coordinator always grants one.
+
+*The name is diagnostic, not authoritative.* With no roles (D15) it grants nothing; it
+exists so `lease_status` and contention reports can say *"held by agent-3, expires in
+240s"* instead of quoting a UUID at you. Nothing branches on it.
+
+*Why nothing is stored:* the token is issued at boot, lives in memory, and dies with
+the process. No file under `/run`, no state to reconcile, no stale identity to clean
+up. This falls out of D6: if a restart releases leases, identity that outlives a
+restart has nothing left to be useful for.
+
+*What the session buys:* it is the natural owner of a lease and the natural unit of
+liveness. When the MCP process exits its socket closes, the daemon tells the
+coordinator, and that session's leases are released **immediately** rather than waiting
+out their TTL. TTL becomes the backstop for a wedged-but-alive agent rather than the
+only reclaim path.
+
+*Accounting is per session:* a restarted agent gets a fresh session and a fresh
+`max_benches` budget. Under §9's no-malice assumption that is fine.
+
+*The seam is deliberate:* `Register { name } -> SessionToken` becomes
+`Register { name, credential } -> SessionToken` if authentication is ever wanted — one
+function, not an architecture.
 
 ### D9. Central vocabulary, host-declared benches
 
@@ -345,33 +385,58 @@ slot 'dut': no bench exists matching {psram=octal soc=esp32c3}
   drop soc=esp32c3 -> matches {psram=octal}
 ```
 
-### D15. Mandatory explicit TTL; renewal is an explicit call
+### D15. Mandatory explicit TTL; renewal is an explicit call; one set of limits
 
-No default duration. `max_ttl` bounds one grant, `max_total_hold` bounds the sum across
-renewals, `max_benches` bounds concurrency.
+No default duration. One global limit set applies to every session — there are **no
+user classes and no roles**.
 
-*Why explicit:* naming a duration forces the agent to scope the work, and gives
-requested-vs-used telemetry to tune limits from data.
+```toml
+[limits]
+max_ttl        = "15m"   # longest single grant
+max_total_hold = "2h"     # sum across renewals, so nobody renews forever
+max_benches    = 2        # concurrent benches per session
+```
+
+*Why explicit TTL:* naming a duration forces the agent to scope the work, and gives
+requested-vs-used telemetry to tune the limits from data rather than guesswork.
 
 *Why not auto-keepalive:* it recreates the never-expiring hold we're eliminating. An
 explicit renew is a liveness proof — alive *and* still working.
 
-### D16. Human preemption; agents never preempt
+*Why no classes:* an earlier draft had agent/human/ci tiers with different ceilings and
+rights. That is a permission system, and a permission system needs identity to mean
+something — which §9 says it does not. One set of numbers is honest about what we can
+actually enforce, and the operator escape hatch (D16) covers what the `human` tier was
+really for.
 
-*Why:* this is the real payoff of the human/agent split, not longer timeouts. When
-you're at the bench and an agent holds the board, you take it back.
+*Over-long requests are clamped with a message*, not rejected — an agent asking for 4h
+and getting 15m can get on with its work. Other limits are hard errors that say what
+to do instead.
 
-*Grace:* preemption and expiry both mark the lease `revoking` and wait ~30s before
-teardown. Yanking a device mid-flash can leave a board in bootloader.
+### D16. No preemption between sessions; the operator has a CLI
+
+No session can take a bench from another. The operator can, with
+`benchd release --bench <id> --force`, which talks to the coordinator directly.
+
+*Why:* "you're at the bench and an agent is holding the board" is a real need, but it
+is an *administrative action*, not a role in a permission model. Making it a CLI
+command keeps the need met and deletes the tier system that existed to express it.
+
+*Grace:* forced release and ordinary expiry both mark the lease `revoking` and wait
+~30s before teardown. Yanking a device mid-flash can leave a board in bootloader.
 
 ### D17. Minimal agent tool surface
 
 `tag_list`, `claim`, `renew`, `release`, `lease_status`. Nothing else.
 
-*Why:* tool surface *is* policy. A console-read tool means agents use it instead of
-`idf.py monitor`, giving two access paths and split logs. Claim-by-name means an agent
-hardcodes a bench into a script, reintroducing the contention this removes. Both stay in
-the human CLI.
+*Why:* tool surface *is* policy — and with roles gone it is the *only* policy lever
+left, which makes it more load-bearing, not less. A console-read tool means agents use
+it instead of `idf.py monitor`, giving two access paths and split logs. Claim-by-name
+means an agent hardcodes a bench into a script, reintroducing the contention this
+removes.
+
+*The distinction is the surface, not the caller:* both live in the operator CLI, which
+is a different program — not a privileged mode of the same one.
 
 ### D18. Rust, TOML, workspace
 
@@ -392,12 +457,15 @@ matching the installed toolchain.
 benchd-core         tags, model, matcher, policy, wire messages   pure, no I/O
 benchd-coordinator  matching, policy, lease state, reaper   (stateless)
 benchd-host         owns one bench; export/teardown; power/mux
-benchd-client       MCP server + sandbox materialiser (root)
+benchd-clientd      privileged: coordinator link + sandbox materialiser
+benchd-mcp          thin per-agent stdio MCP shim (unprivileged)
+benchd              operator CLI
 ```
 
-Four crates, not five: with no `.proto` (D5) the wire messages are just `serde` types
-and live in core, which already depends on serde for config. Core stays free of tokio
-and rustls so its property test stays millisecond-scale.
+With no `.proto` (D5) the wire messages are just `serde` types and live in core, which
+already depends on serde for config. Core stays free of tokio so its property test stays
+millisecond-scale. `benchd-mcp` and `benchd` are small enough to be binaries in the
+client and coordinator crates rather than crates of their own.
 
 ---
 
@@ -417,9 +485,11 @@ Registers its bench upward; `export` / `unexport`; heartbeats; owns power/mux fo
 and teardown only. Unexports everything at startup. On device loss it releases, reports,
 and exits for a clean systemd restart.
 
-**Client** — one privileged daemon per agent machine. Serves MCP with per-agent identity
-per request; materialises and revokes; renews only on explicit agent call. Removes every
-materialisation under its root at startup.
+**Client** — `benchd-clientd`, one privileged daemon per agent machine, holding the
+coordinator connection. Materialises and revokes; renews only on explicit agent call;
+removes every materialisation under its root at startup. `benchd-mcp` is the thin
+unprivileged stdio shim spawned per agent (D8), which registers a session and forwards
+calls over a local socket.
 
 > **Sandbox mechanism: bubblewrap.** `/run/benchd/<owner>` is bind-mounted into the
 > agent's sandbox at start. Because it's a *directory* mount, entries appear and
@@ -430,20 +500,24 @@ materialisation under its root at startup.
 Invariants pinned by property test: succeeds ⟺ a valid assignment exists; returned cost
 is optimal; returned assignment is valid.
 
-**Policy** *(specified)* — identity → class → limits. Unknown identities fall back to
-the *most restricted* class, so a typo can never grant human privileges. Over-long TTL
-is **clamped with a message**, not rejected; other limits are hard errors that say what
-to do instead.
+**Policy** *(specified)* — one global limit set, applied to every session; no classes,
+no roles (D15). Over-long TTL is **clamped with a message**, not rejected; other limits
+are hard errors that say what to do instead.
 
-```
-agent:  ttl≤15m   total≤2h    benches≤2   renewable
-human:  ttl≤8h    total ∞     benches ∞   renewable, may preempt, may claim by name
-ci:     ttl≤45m   total≤45m   benches≤4   NOT renewable (fail fast)
+```toml
+[limits]
+max_ttl        = "15m"
+max_total_hold = "2h"
+max_benches    = 2
 ```
 
-**Lease lifecycle** — `HELD ⇄ renew`; `HELD → REVOKING` on grace or preempt;
-`REVOKING → EXPIRED | RELEASED`. Every tool response carries `expires_at` and
-`remaining`; agents plan terribly against invisible deadlines.
+**Operator CLI** — `benchd` talks to the coordinator directly and is not subject to the
+limits: list benches by name, inspect leases, `release --force` (D16). Deliberately a
+separate program from the agent surface, not a privileged mode of it.
+
+**Lease lifecycle** — `HELD ⇄ renew`; `HELD → REVOKING` on grace, forced release, or
+session loss; `REVOKING → EXPIRED | RELEASED`. Every tool response carries `expires_at`
+and `remaining`; agents plan terribly against invisible deadlines.
 
 ---
 
@@ -458,6 +532,7 @@ A contract; the skill must state it.
 | All busy | `Contended` + holders + ETA | wait, retry |
 | Over TTL limit | clamped, with a message | proceed with the shorter lease |
 | Lease expired mid-use | `ENOENT` / `EIO` on the device | **your lease ended** — reclaim; do *not* power-cycle |
+| Operator forced a release | lease `revoking`, then gone | stop, park the board, re-claim later |
 | A component restarted | lease gone, `lease_released` on next call | re-claim; work since last checkpoint is lost |
 | Bench hardware failed | lease released, bench leaves `tag_list` | re-claim; the matcher routes around it |
 
@@ -469,39 +544,49 @@ not an error to escalate.
 
 ## 9. Security posture
 
-**Client identity is self-asserted — policy, not security.** An agent claiming to be
-`tom` gets human limits. This stops honest mistakes and runaway agents, nothing that is
-trying. If it ever must be a boundary, it goes in the transport, not the broker.
+**There is none, and that is deliberate.** The PoC assumes a trusted LAN with no
+malicious hosts or clients. Anyone who can reach the coordinator's port can register a
+session, claim hardware, and register a bench.
 
-**Host identity matters more than client identity.** A rogue host can advertise benches
-that don't exist, absorb claims, and mislead an agent about which board it's driving. A
-lying client harms only itself; a lying host harms everyone. **Not solved in the PoC:**
-while everything is co-located the coordinator listens on a unix socket and takes
-`SO_PEERCRED` as identity, which is sufficient and free. Host authentication (mTLS with
-pinned certs, unknown hosts refused) is required *before* a host runs on a different
-machine — that is the moment this becomes a real hole, not a theoretical one.
+What this buys: no PKI, no cert distribution or rotation, no auth code in the hot path,
+and no security theatre implying a boundary that isn't there. What it costs: benchd
+**must not** be run on a network you don't control.
 
-**USB/IP is never exposed** — cleartext, unauthenticated, and it hands the client kernel
-a USB device. It is relayed through the coordinator (D5), never reachable directly.
+There are no roles (D15), so identity grants nothing — the session name is a label for
+diagnostics, not an authorisation input (D19). Limits are global and apply to everyone
+equally; they exist to stop a runaway agent hoarding boards, not to stop an attacker.
+
+If this ever needs a real boundary, the seams are deliberate and in this order:
+
+1. **WireGuard underneath** — peer public keys are already mutual authentication, and
+   benchd still does no cryptography.
+2. **`Register { name, credential }`** — the registration call already has the shape
+   (D19); adding a check is one function.
+3. **Host authentication** matters more than client authentication — a lying client
+   harms only itself, a lying host can advertise benches that don't exist and mislead
+   an agent about which board it is driving.
 
 Hosts and clients run as root but only execute epoch-qualified instructions from the
 coordinator, never agent-supplied strings, and build paths only from validated
-identifiers.
+identifiers. That is defence against *bugs*, which remains worthwhile regardless.
 
 ---
 
 ## 10. Open questions
 
-| # | Question | State |
+None blocking. Both former questions are closed by scope rather than by design:
+
+| # | Question | Resolution |
 |---|---|---|
-| Q10 | Relay implementation for remote USB/IP: framing, flow control, backpressure — and does OpenOCD tolerate the extra hop? | open; only bites when remote benches land |
-| Q11 | Host auth (mTLS) and TCP transport | deliberately deferred; required before the first off-machine host (§9) |
+| Q10 | USB/IP relay through the coordinator | **Not needed.** On a trusted LAN the client attaches to the host directly (D5). If hosts ever become unreachable, WireGuard — not an application-level relay. |
+| Q11 | Host auth (mTLS), certificates | **Not doing it.** benchd does no cryptography; the trust boundary is the network (§9). |
 
 **Deferred ideas.** *Idle release* — TTL catches crashes, not an agent that claims a
 board then reads source for 12 minutes; detect via no open fd for N minutes. *Sticky
 reclaim* — a short soft-reservation after release so flash→test→tweak stays on one
-board. *Bench affinity* — for two benches sharing an RF chamber. All revisit-with-
-evidence, not now.
+board. *Bench affinity* — for two benches sharing an RF chamber. *Roles and
+authentication* — see §9 for the order the seams should be taken in. All
+revisit-with-evidence, not now.
 
 ---
 
@@ -517,7 +602,7 @@ evidence, not now.
 | Workspace split (4 crates) | not started |
 | Wire messages + JSON line protocol | not started |
 | Coordinator / host / client | specified |
-| USB/IP relay | specified, not started |
+| USB/IP direct attach | specified, not started |
 | Skill | not started |
 
 No persistence layer appears here, and that is the point of D6. No schema language

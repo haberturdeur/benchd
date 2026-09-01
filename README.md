@@ -22,31 +22,35 @@ Early. The matcher is implemented and tested; the daemon is not built yet.
 | Inventory + TOML config | done, tested |
 | Matcher (superset match, best-fit, multi-slot, diagnosis) | done — 21 tests + property test |
 | Multi-board benches | done, tested |
-| Policy engine | specified |
-| Coordinator (leases, reaper, reconcile) | specified |
+| Limits (single global set, no roles) | specified |
+| Coordinator (leases, reaper) | specified |
 | Host (one per bench) | specified |
-| Client (MCP + sandbox materialiser) | specified |
+| Client daemon + per-agent MCP shim | specified |
 | Wire messages (serde enums, JSON lines) | specified |
 
 **Read [`docs/design.md`](docs/design.md) first.** It is authoritative: when the code
-and the design doc disagree, the doc wins. It records 18 numbered decisions with the
+and the design doc disagree, the doc wins. It records 19 numbered decisions with the
 alternatives that were rejected and why.
 
 ## Design in one paragraph
 
 Three components. A **host** owns the hardware of exactly one **bench** (a fixed
-physical grouping — possibly several boards on one carrier — that is always claimed
-together). The **coordinator** is the single authority: inventory, matching, policy,
-lease state, reaper. The **client** is a privileged daemon on each agent machine that
-serves MCP and materialises device nodes into agent sandboxes. Benches carry
-`key=value` capability tags from a closed vocabulary, expanded through an implication
-graph (`soc=esp32s3` implies `family=esp32`, `jtag=builtin`, …). A **claim** names one
-or more **slots**, satisfied atomically or not at all, possibly from benches on
-different hosts; among adequate benches the matcher picks the *least capable* one,
-scored by the scarcity it would waste. A granted claim is a **lease** with a mandatory
-explicit TTL, renewable only by explicit call. Executors fence on a per-bench epoch,
-so a stale instruction can never hand out live hardware; and because every lease has a
-deadline, a network partition drains the lab rather than corrupting it.
+physical grouping — possibly several boards on one carrier — always claimed together).
+The **coordinator** is the single authority for inventory, matching, limits and lease
+state, and the only component that listens. The **client** is a privileged daemon on
+each agent machine that materialises device nodes into agent sandboxes, fronted by a
+thin per-agent MCP shim. Benches carry `key=value` capability tags from a closed
+vocabulary, expanded through an implication graph (`soc=esp32s3` implies
+`family=esp32`, `jtag=builtin`, …). A **claim** names one or more **slots**, satisfied
+atomically or not at all, possibly from benches on different hosts; among adequate
+benches the matcher picks the *least capable* one, scored by the scarcity it would
+waste. A granted claim is a **lease** with a mandatory explicit TTL, renewable only by
+explicit call, released the moment its session dies. Executors fence on a per-bench
+epoch, so a stale instruction can never hand out live hardware.
+
+Everything talks newline-delimited JSON over plain TCP, with no schema language and no
+cryptography: benchd assumes a trusted LAN (see §9 of the design doc), and the trust
+boundary belongs to the network, not the application.
 
 ## Layout
 
@@ -76,15 +80,3 @@ Requires Rust 1.88+ (MSRV is pinned by `rmcp`, used once the MCP server lands).
 `tests/matcher.rs` is written to be read as the specification — test names and
 assertions state what the matcher promises. Start there, then `src/matcher.rs` for
 the only module with real algorithmic content.
-
-## Design in one paragraph
-
-A **bench** is the unit of exclusion: a named set of resources held together. Benches
-carry `key=value` capability tags from a closed vocabulary, expanded through an
-implication graph (`soc=esp32s3` implies `family=esp32`, `jtag=builtin`, …). A
-**claim** names one or more **slots** and is satisfied atomically or not at all;
-among adequate benches the matcher picks the *least capable* one, scored by the
-scarcity it would waste. A granted claim is a **lease** with a mandatory explicit
-TTL, renewable by explicit call, reaped in-process. The lease materialises real
-device inodes via bind mount into a per-lease directory, and revocation removes
-them — so the lease is enforced by the kernel rather than by convention.
