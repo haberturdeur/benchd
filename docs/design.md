@@ -474,9 +474,9 @@ minutes. Biggest utilisation win once there are more than a couple of agents. v2
 flash→test→tweak→reflash loop stays on one board. Best-effort, falls back to normal
 matching. v2.
 
-**Q6 — Repo layout.** The Python prototype (`src/*.py`) is superseded; its
-oracle role was replaced by the in-test brute-force reference. Delete or move to
-`prototype/`, and promote `rust/` to the repo root.
+**Q6 — Repo layout.** *Resolved 2026-09.* The Rust tree is the repository root and
+the Python prototype has been removed; it survives in git history at commit
+`08d6bf8` if a design decision ever needs archaeology.
 
 ---
 
