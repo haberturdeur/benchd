@@ -81,7 +81,7 @@ description = "ESP32-S3 devkit, native USB-JTAG"
 tags = ["soc=esp32s3", "psram=octal", "flash=8mb"]
 [benches."esp32s3-a".resources.console]
 kind = "serial"
-by_id = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_F4:12:FA:86:69:94-if00"
+by_id = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_30:ED:A0:EC:ED:41-if00"
 
 [benches."esp32s3-b"]
 description = "ESP32-S3 devkit, native USB-JTAG"

@@ -1,0 +1,14 @@
+# One bench, one host process. Deployed as benchd-host@esp32s3-a.service.
+#
+# This file lives next to the hardware it describes (D9): adding a board is a
+# single-machine operation, with no central file to keep in sync. The tags must
+# exist in the coordinator's vocabulary, which is the one thing that stays
+# central - otherwise the closed vocabulary would rot per-machine.
+
+id          = "esp32s3-a"
+description = "ESP32-S3 devkit, native USB-JTAG"
+tags        = ["soc=esp32s3", "psram=octal", "flash=8mb"]
+
+[resources.console]
+kind  = "serial"
+by_id = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_30:ED:A0:EC:ED:41-if00"

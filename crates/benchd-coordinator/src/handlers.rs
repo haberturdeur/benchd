@@ -56,7 +56,7 @@ async fn serve_host(
 
     {
         let mut state = shared.state.lock().await;
-        match state.register_bench(&spec, &shared.vocabulary) {
+        match state.register_bench(&spec) {
             Ok(bench) => {
                 state.leases.inventory_mut().benches.insert(bench_id.clone(), bench);
                 state.hosts.insert(
@@ -223,7 +223,7 @@ async fn handle_client(
             let token = state.mint_token(id);
             state.session_conn.insert(id, conn_id);
             tracing::info!(%name, session = %id, "session opened");
-            out.send(&ToClient::SessionOpened { request, session: token });
+            out.send(&ToClient::SessionOpened { request, session: token, id });
             Vec::new()
         }
 
@@ -244,7 +244,7 @@ async fn handle_client(
                 out.send(&unknown_session(request));
                 return Vec::new();
             };
-            let req = match to_claim_request(&claim, &shared.vocabulary) {
+            let req = match to_claim_request(&claim, &state.leases.inventory().vocabulary) {
                 Ok(req) => req,
                 Err(error) => {
                     // A malformed tag is the agent's mistake and is fixable in

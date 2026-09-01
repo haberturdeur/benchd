@@ -140,7 +140,11 @@ fn default_true() -> bool {
 #[serde(tag = "msg", rename_all = "snake_case")]
 pub enum ToClient {
     /// Reply to `OpenSession`.
-    SessionOpened { request: RequestId, session: SessionToken },
+    ///
+    /// Carries the internal id as well as the token: the client daemon needs it
+    /// to tie a later `Materialize` back to an owner directory, and it is not
+    /// secret — the token is what authorises, the id merely identifies.
+    SessionOpened { request: RequestId, session: SessionToken, id: SessionId },
     /// Reply to a request that succeeded but returns nothing.
     Ok { request: RequestId },
     /// Reply to any request that failed. `retryable` is the machine-readable
@@ -249,6 +253,20 @@ pub struct TagInfo {
     pub free: usize,
 }
 
+/// The environment variable an agent should read for a materialised resource:
+/// `dut` + `console` becomes `LAB_DUT_CONSOLE`.
+///
+/// Agents are reliably good at using `$LAB_DUT_CONSOLE` and reliably bad at
+/// remembering which of two identical-looking device nodes was theirs.
+pub fn env_var(slot: &str, resource: &str) -> String {
+    let clean = |s: &str| {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+            .collect::<String>()
+    };
+    format!("LAB_{}_{}", clean(slot), clean(resource))
+}
+
 // ---------------------------------------------------------------------------
 // Framing
 // ---------------------------------------------------------------------------
@@ -306,6 +324,12 @@ mod tests {
             line,
             r#"{"msg":"renew","request":3,"session":"2f8a","lease":4,"extra":300}"#
         );
+    }
+
+    #[test]
+    fn env_vars_are_shouty_and_safe() {
+        assert_eq!(env_var("dut", "console"), "LAB_DUT_CONSOLE");
+        assert_eq!(env_var("node-a", "usb.0"), "LAB_NODE_A_USB_0");
     }
 
     #[test]

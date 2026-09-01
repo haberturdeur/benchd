@@ -51,12 +51,13 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(limits: Limits) -> Self {
+    /// The vocabulary is central and known at startup; benches are not. They
+    /// arrive by host registration (D9), so an unreachable host simply has no
+    /// allocatable bench rather than a bench that fails at claim time.
+    pub fn new(limits: Limits, vocabulary: benchd_core::tags::Vocabulary) -> Self {
+        let inventory = Inventory { benches: Default::default(), vocabulary };
         State {
-            // The inventory starts empty: benches arrive by host registration
-            // (D9), so an unreachable host simply has no allocatable bench
-            // rather than a bench that fails at claim time.
-            leases: LeaseManager::new(Inventory::default(), limits),
+            leases: LeaseManager::new(inventory, limits),
             hosts: BTreeMap::new(),
             clients: BTreeMap::new(),
             tokens: BTreeMap::new(),
@@ -91,14 +92,11 @@ impl State {
     /// Register a bench declared by a host. The coordinator owns the
     /// vocabulary, so unknown tags are refused here rather than silently
     /// producing a bench that matches nothing (D9).
-    pub fn register_bench(
-        &mut self,
-        spec: &BenchSpec,
-        vocabulary: &benchd_core::tags::Vocabulary,
-    ) -> Result<Bench, String> {
+    pub fn register_bench(&mut self, spec: &BenchSpec) -> Result<Bench, String> {
         if self.hosts.contains_key(&spec.id) {
             return Err(format!("bench {:?} is already registered", spec.id));
         }
+        let vocabulary = &self.leases.inventory().vocabulary;
         let declared: benchd_core::tags::TagSet = spec.tags.iter().cloned().collect();
         vocabulary.check(&declared).map_err(|e| e.to_string())?;
 

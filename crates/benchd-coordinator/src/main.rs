@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use benchd_core::tags::Vocabulary;
 use benchd_core::wire::DEFAULT_PORT;
 use benchd_core::Limits;
 use clap::Parser;
@@ -41,7 +40,6 @@ struct Args {
 
 pub struct Shared {
     pub state: Mutex<State>,
-    pub vocabulary: Vocabulary,
 }
 
 /// Coarse wall-clock seconds. The lease machine takes time as a parameter, so
@@ -88,7 +86,7 @@ async fn main() -> Result<()> {
         "limits"
     );
 
-    let shared = Arc::new(Shared { state: Mutex::new(State::new(limits)), vocabulary });
+    let shared = Arc::new(Shared { state: Mutex::new(State::new(limits, vocabulary)) });
 
     // The reaper. Effects are collected under the lock and dispatched after it
     // is released, so a slow peer can never stall expiry.

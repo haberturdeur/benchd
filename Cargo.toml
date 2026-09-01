@@ -13,14 +13,16 @@ benchd-core = { path = "crates/benchd-core" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "process", "fs"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
+rmcp = { version = "3.2", features = ["server", "transport-io"] }
+schemars = "1"
 toml = "0.8"
 thiserror = "2"
 strsim = "0.11"

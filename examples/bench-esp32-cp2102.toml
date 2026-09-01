@@ -1,0 +1,7 @@
+id          = "esp32-cp2102"
+description = "Classic ESP32 devkit behind a CP2102N bridge"
+tags        = ["soc=esp32", "usb=cp2102n", "psram=none", "flash=4mb"]
+
+[resources.console]
+kind  = "serial"
+by_id = "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_8642368df26cef11bddfc5a7c169b110-if00-port0"
