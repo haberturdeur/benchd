@@ -95,8 +95,8 @@ If separating them would be *physically meaningless*, it's one bench.
 ```
 
 Arrows show who dials: **both executors dial in, the coordinator never dials out**
-(D5). Remote USB/IP is the one exception and goes host→client directly, not through
-the coordinator.
+(D5) — including for remote USB/IP, which is relayed rather than direct, so a NAT'd
+host works with no inbound reachability at all.
 
 **One host process per bench.** Blast radius of a wedged host is one bench; each
 restarts independently; device ownership is unambiguous. Deployed as
@@ -207,12 +207,48 @@ heartbeat for liveness, a reconnect loop.
 
 *Bonus, and it matters for a PoC:* the wire is human-readable. `socat` is a debugger.
 
-**USB/IP needs no relay on a LAN.** Per the kernel README the machine *with* the device
-listens on 3240 and the client dials in — the opposite direction from our control
-plane. On a flat trusted LAN that is simply fine: the client attaches directly. A relay
-through the coordinator is only needed once hosts stop being reachable, and the better
-answer then is WireGuard — kernel IP forwarding rather than an application-level byte
-pump we would have to write, frame and flow-control.
+**USB/IP runs the wrong way, so it is relayed.** Per the kernel README the machine
+*with* the device listens on 3240 and the client dials in — the opposite direction from
+our control plane, and impossible when the host is behind NAT. So a remote attachment
+is brokered by the coordinator, with **both ends dialling out**:
+
+```
+1.  coord → host    Export{lease,epoch}          host: usbip bind, usbipd on 127.0.0.1:3240
+2.  coord → host    OpenChannel{lease,epoch,K}   host dials OUT to coord, sends hello{K},
+                                                 splices that socket to 127.0.0.1:3240
+3.  coord → client  Materialize{lease,epoch,K}   client dials OUT to coord, sends hello{K},
+                                                 opens 127.0.0.1:P spliced to that socket
+4.  client          usbip --tcp-port P attach --remote 127.0.0.1 --busid …
+5.  client          bind-mount the resulting node into the agent's lease directory
+```
+
+The coordinator matches the two `hello{K}` sockets and runs `copy_bidirectional`
+between them. Neither host nor client ever accepts an inbound connection, so D5 holds
+for the data plane too.
+
+*Why this is small:* each data channel is its **own TCP connection**, not a stream
+multiplexed over the JSON control channel. That means no framing, no channel ids on the
+wire after the hello, and no backpressure logic — TCP already provides flow control end
+to end. The coordinator's half is a channel registry plus a byte splice.
+
+*`usbip --tcp-port` is what makes step 4 work* (verified in `tools/usb/usbip/src/usbip.c`)
+— the client picks a free loopback port per attachment, so several remote hosts can be
+attached on one client machine without colliding on 3240.
+
+*Costs, accepted:* the coordinator sits in the data path, adding bandwidth load and one
+RTT per URB round trip. Irrelevant for 115200 serial (~11 KB/s); **unproven for OpenOCD
+or high-rate logging**, which are latency-sensitive — measure before relying on it
+(Q10). Coordinator death already kills the lab (D6), so putting data through it costs
+no availability that was not already gone.
+
+*Deliberately not done:* having the host dial the client directly when the client
+happens to be reachable. Only one end needs reachability for that shortcut, and it
+would cut the coordinator out of the data path — but it is a second code path for a
+topology we cannot rely on. Revisit if the relay measures badly.
+
+*Not used locally.* Co-located benches never touch USB/IP: the daemon bind-mounts the
+real inode. The control protocol is identical either way; only the `Materializer`
+implementation differs, which is what the trait is for (D4).
 
 ### D6. The coordinator is a SPOF; any restart releases leases
 
@@ -574,12 +610,12 @@ identifiers. That is defence against *bugs*, which remains worthwhile regardless
 
 ## 10. Open questions
 
-None blocking. Both former questions are closed by scope rather than by design:
+None blocking.
 
-| # | Question | Resolution |
+| # | Question | State |
 |---|---|---|
-| Q10 | USB/IP relay through the coordinator | **Not needed.** On a trusted LAN the client attaches to the host directly (D5). If hosts ever become unreachable, WireGuard — not an application-level relay. |
-| Q11 | Host auth (mTLS), certificates | **Not doing it.** benchd does no cryptography; the trust boundary is the network (§9). |
+| Q10 | Does the relay's extra RTT matter for OpenOCD/JTAG? Serial is certainly fine. | open — **measure**, don't guess; only bites when remote benches land |
+| Q11 | Does `usbipd` support binding to loopback only? | open — if not, firewall 3240 or run it in a netns, so the relay stays the only path in |
 
 **Deferred ideas.** *Idle release* — TTL catches crashes, not an agent that claims a
 board then reads source for 12 minutes; detect via no open fd for N minutes. *Sticky
@@ -602,7 +638,7 @@ revisit-with-evidence, not now.
 | Workspace split (4 crates) | not started |
 | Wire messages + JSON line protocol | not started |
 | Coordinator / host / client | specified |
-| USB/IP direct attach | specified, not started |
+| USB/IP relay (dial-back rendezvous) | specified, not started |
 | Skill | not started |
 
 No persistence layer appears here, and that is the point of D6. No schema language
