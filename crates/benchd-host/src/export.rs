@@ -123,21 +123,34 @@ impl Exports {
             // Both ends derive the same channel key from facts they already
             // have, so nothing has to be threaded between two messages.
             let key = benchd_core::wire::channel_key(lease, epoch, &self.spec.id, resource);
+
             if let Err(err) = sysfs::bind(busid).await {
                 self.tear_down(&exported).await;
+                // `bind` can fail after detaching the device from its normal
+                // driver, so the busid it was working on has to be cleaned up
+                // too — otherwise the board vanishes from the machine until the
+                // host process restarts.
+                sysfs::unbind(busid).await;
                 return Outcome::Failed { detail: format!("usbip bind {busid}: {err}") };
             }
+
+            // From here the device IS bound, so every failure path below must
+            // include this busid in the teardown, not just the ones that
+            // already succeeded.
+            let mut bound = exported.clone();
+            bound.push(busid.clone());
+
             let device = match describe(busid).await {
                 Ok(device) => device,
                 Err(err) => {
-                    self.tear_down(&exported).await;
+                    self.tear_down(&bound).await;
                     return Outcome::Failed { detail: format!("reading {busid}: {err}") };
                 }
             };
             match self.serve_channel(&key, device).await {
                 Ok(()) => exported.push(busid.clone()),
                 Err(err) => {
-                    self.tear_down(&exported).await;
+                    self.tear_down(&bound).await;
                     return Outcome::Failed { detail: format!("exporting {busid}: {err}") };
                 }
             }
@@ -206,12 +219,21 @@ impl Exports {
     }
 
     /// The coordinator is gone, so every lease it granted is void (D6).
+    ///
+    /// **Also resets the epoch high-water mark.** Epochs are the coordinator's
+    /// counters and it is stateless across restarts, so a fresh coordinator
+    /// starts again at 1. A host that kept its old watermark would reject every
+    /// instruction from the new coordinator as stale — permanently, since the
+    /// counter never catches up. Fencing only has to order instructions from
+    /// *one* coordinator incarnation, and losing the connection ends that
+    /// incarnation as far as we can tell.
     pub async fn release_all(&mut self) {
         let leases: Vec<LeaseId> = self.active.keys().copied().collect();
         for lease in leases {
             let epoch = self.seen;
             self.unexport(lease, epoch).await;
         }
+        self.seen = Epoch(0);
     }
 }
 

@@ -697,7 +697,33 @@ Kept because D3 rests on them.
   plain library later.
 - Sizes: 25.7k LOC total — `driver/` 9.6k, `remote/` 6.5k, `resource/` 3.0k.
 
-## Appendix B — corrections made during design
+## Appendix B — findings from the adversarial review
+
+An adversarial review after the first working build found that most guarantees
+this document asserts were **not enforced by the code**. The mechanisms existed —
+epochs, `Outcome`, name sanitisation, grace windows — but were unwired, applied
+to the wrong variable, or ordered wrongly. Recorded because the pattern matters
+more than the individual bugs.
+
+| Severity | Bug | Root cause |
+|---|---|---|
+| Critical | Agent-chosen slot names were path components in a root daemon: `mount --bind` at any location | Sanitised the *owner* name and tested it, then passed `slot` and `resource` through untouched |
+| Critical | A normal agent exit left the mount live while the bench was marked free — two agents, one board | `session_conn` deleted before `dispatch`, which resolves the client through it |
+| High | `Outcome::Failed`/`Stale` logged at debug and discarded: a failed claim held the bench for its whole TTL | Protocol carried failures nothing acted on |
+| High | Epoch fencing died permanently after a coordinator restart | Host kept its high-water mark across reconnects; a stateless coordinator restarts at 1 |
+| High | `epoch_for` stamped one bench's epoch on every bench in a claim | Epochs are per bench; a multi-slot relayed claim could never rendezvous |
+| High | A one-second coordinator blip wedged every agent on a machine | Sessions invalidated with no path to re-register |
+| High | Agents could claim by name, contradicting D17 | `name=` left in the open vocabulary |
+| Medium | A slow materialisation blocked *all* coordinator messages for every agent | Messages handled serially in the read loop |
+| Medium | `tick` advanced one state per call, so an overdue lease survived a late tick | Warning and teardown were mutually exclusive branches |
+| Medium | Host leaked a usbip binding when export failed after binding | Teardown list excluded the busid being worked on |
+| Medium | `force_release` could extend a lease past its own expiry | Grace added to `now` without capping at `expires_at` |
+
+**The cause was uniform: every test exercised the happy path.** None asked what
+happens when a step fails. `tests/failure_paths.rs` exists to keep that from
+recurring, and immediately found the `tick` bug.
+
+## Appendix C — corrections made during design
 
 Both were caught by checking, not by thinking harder.
 

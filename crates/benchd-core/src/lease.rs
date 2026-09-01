@@ -125,6 +125,10 @@ pub enum Effect {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseEvent {
     Granted { lease: LeaseId, expires_at: Secs },
+    /// The lease could not be set up and has been withdrawn. Distinct from
+    /// `Ended`: the holder never got working hardware, so it should be told why
+    /// rather than left to discover a device that never appears.
+    Failed { lease: LeaseId, detail: String },
     Revoking { lease: LeaseId, reason: RevokeReason, teardown_at: Secs },
     Ended { lease: LeaseId, reason: EndReason },
 }
@@ -419,7 +423,9 @@ impl LeaseManager {
         let Some(l) = self.leases.get_mut(&lease) else {
             return Vec::new();
         };
-        let teardown_at = now + grace;
+        // Never later than the lease would have ended anyway: taking a bench
+        // back must not hand the holder extra time.
+        let teardown_at = (now + grace).min(l.expires_at.max(now));
         l.state = LeaseState::Revoking { reason: RevokeReason::Forced, teardown_at };
         vec![Effect::Notify {
             session: l.session,
@@ -444,28 +450,38 @@ impl LeaseManager {
         let mut expired = Vec::new();
 
         for lease in self.leases.values_mut() {
-            match lease.state {
-                LeaseState::Held => {
-                    let warn_at = lease.expires_at.saturating_sub(grace).max(lease.created);
-                    if now >= warn_at {
-                        lease.state = LeaseState::Revoking {
+            // Bring each lease fully up to date with `now`, not forward by one
+            // state. A tick can arrive arbitrarily late - a busy coordinator, a
+            // suspended laptop, a clock jump - and a lease whose teardown is
+            // overdue must end on this tick rather than surviving until the
+            // next one.
+            if let LeaseState::Held = lease.state {
+                // The warning lands inside the requested TTL, so an agent that
+                // asked for 600s gets 600s. Clamped to half the lease's own
+                // length, or a lease shorter than the grace window would spend
+                // its whole life in Revoking.
+                let span = lease.expires_at.saturating_sub(lease.created);
+                let warn_at = lease.expires_at.saturating_sub(grace.min(span / 2));
+                if now >= warn_at {
+                    lease.state = LeaseState::Revoking {
+                        reason: RevokeReason::Expired,
+                        teardown_at: lease.expires_at,
+                    };
+                    effects.push(Effect::Notify {
+                        session: lease.session,
+                        event: LeaseEvent::Revoking {
+                            lease: lease.id,
                             reason: RevokeReason::Expired,
                             teardown_at: lease.expires_at,
-                        };
-                        effects.push(Effect::Notify {
-                            session: lease.session,
-                            event: LeaseEvent::Revoking {
-                                lease: lease.id,
-                                reason: RevokeReason::Expired,
-                                teardown_at: lease.expires_at,
-                            },
-                        });
-                    }
+                        },
+                    });
                 }
-                LeaseState::Revoking { teardown_at, .. } if now >= teardown_at => {
+            }
+
+            if let LeaseState::Revoking { teardown_at, .. } = lease.state {
+                if now >= teardown_at {
                     expired.push(lease.id);
                 }
-                LeaseState::Revoking { .. } => {}
             }
         }
 

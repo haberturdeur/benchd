@@ -153,6 +153,23 @@ impl Materializer {
         let mut ports: Vec<u32> = Vec::new();
         for (slot, resources) in slots {
             for (name, handle) in resources {
+                // This process is root and about to call mount(2) on a path
+                // built from these names. They arrive from the coordinator,
+                // which validates them — but a privileged daemon that trusts
+                // its input has no business being privileged, so check again.
+                if !benchd_core::model::valid_component(slot)
+                    || !benchd_core::model::valid_component(name)
+                {
+                    for port in &ports {
+                        sysfs::vhci_detach(*port).await;
+                    }
+                    return Outcome::Failed {
+                        detail: format!(
+                            "refusing to materialise {slot:?}/{name:?}: \
+                             not a plain path component"
+                        ),
+                    };
+                }
                 match handle {
                     ResourceHandle::Local { path } => {
                         let source = match tokio::fs::canonicalize(path).await {
@@ -188,7 +205,7 @@ impl Materializer {
         }
 
         for (source, dest) in &plan {
-            if let Err(detail) = bind_mount(source, dest).await {
+            if let Err(detail) = bind_mount(&self.root, source, dest).await {
                 // Roll back, so a failure never leaves a partial lease behind.
                 unmount_tree(&dir).await;
                 for port in &ports {
@@ -222,7 +239,17 @@ impl Materializer {
     }
 }
 
-async fn bind_mount(source: &Path, dest: &Path) -> Result<(), String> {
+async fn bind_mount(root: &Path, source: &Path, dest: &Path) -> Result<(), String> {
+    // Belt and braces. Name validation should already make this impossible; if
+    // it ever does not, the failure is a root-privileged mount at an arbitrary
+    // location, so it is worth one comparison.
+    if !dest.starts_with(root) {
+        return Err(format!(
+            "refusing to mount outside {}: {}",
+            root.display(),
+            dest.display()
+        ));
+    }
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent)
             .await

@@ -48,6 +48,9 @@ struct Args {
 }
 
 pub struct Shared {
+    /// One lock per lease, so operations on a single lease stay ordered while
+    /// different leases proceed independently.
+    pub lease_locks: Mutex<BTreeMap<benchd_core::lease::LeaseId, Arc<Mutex<()>>>>,
     pub materializer: Mutex<Materializer>,
     pub agents: Agents,
     /// Outbound queue to the coordinator. Unbounded and non-blocking, so a
@@ -57,7 +60,12 @@ pub struct Shared {
 }
 
 impl Shared {
-    pub fn send(&self, msg: &ClientMsg) {
+    async fn lease_queue(&self, lease: benchd_core::lease::LeaseId) -> Arc<Mutex<()>> {
+        let mut locks = self.lease_locks.lock().await;
+        Arc::clone(locks.entry(lease).or_insert_with(|| Arc::new(Mutex::new(()))))
+    }
+
+    pub async fn send(&self, msg: &ClientMsg) {
         let line = match serde_json::to_string(msg) {
             Ok(line) => line,
             Err(err) => {
@@ -65,15 +73,17 @@ impl Shared {
                 return;
             }
         };
-        // `try_lock` deliberately: this is called from request paths that must
-        // not block, and a contended send is better dropped than deadlocked.
-        if let Ok(guard) = self.to_coordinator.try_lock() {
-            if let Some(tx) = guard.as_ref() {
+        // The sender is cloned out under a short lock and the channel itself is
+        // unbounded, so sending never blocks. An earlier version used try_lock
+        // and dropped the message when merely contended, reporting it as "link
+        // is down" — which was both a silent loss and a misleading log line.
+        let tx = self.to_coordinator.lock().await.clone();
+        match tx {
+            Some(tx) => {
                 let _ = tx.send(line);
-                return;
             }
+            None => tracing::warn!("coordinator link is down; message dropped"),
         }
-        tracing::warn!("coordinator link is down; message dropped");
     }
 }
 
@@ -97,6 +107,7 @@ async fn main() -> Result<()> {
     materializer.clear_stale().await;
 
     let shared = Arc::new(Shared {
+        lease_locks: Mutex::new(BTreeMap::new()),
         materializer: Mutex::new(materializer),
         agents: Agents::default(),
         to_coordinator: Mutex::new(None),
@@ -145,6 +156,11 @@ async fn run(args: &Args, shared: Arc<Shared>) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     *shared.to_coordinator.lock().await = Some(tx.clone());
 
+    // Agents that were connected across the outage get fresh sessions without
+    // having to notice anything: their stdio shims are still running and their
+    // unix sockets never closed.
+    shared.agents.reregister_all(&shared).await;
+
     let heartbeat = {
         let tx = tx.clone();
         let period = Duration::from_secs(args.heartbeat_seconds.max(1));
@@ -177,13 +193,58 @@ async fn run(args: &Args, shared: Arc<Shared>) -> Result<()> {
                         continue;
                     }
                 };
-                handle(&shared, msg).await;
+                // Dispatched, not awaited: materialisation can take tens of
+                // seconds (a USB/IP import waits for the kernel to enumerate),
+                // and awaiting it here blocks the read loop for every other
+                // lease and every other agent on this machine. A revocation
+                // notice that arrives 30s late is a device yanked without
+                // warning.
+                dispatch(&shared, msg);
             }
         }
     };
 
     heartbeat.abort();
     result
+}
+
+/// Route one coordinator message.
+///
+/// Per-lease work is queued so operations on one lease stay in order — an
+/// `Unmaterialize` must never overtake the `Materialize` it undoes — while work
+/// on different leases proceeds in parallel and cheap notifications are never
+/// stuck behind either.
+fn dispatch(shared: &Arc<Shared>, msg: ToClient) {
+    let lease = match &msg {
+        ToClient::Materialize { lease, .. }
+        | ToClient::Unmaterialize { lease, .. }
+        | ToClient::Failed { lease, .. } => Some(*lease),
+        _ => None,
+    };
+
+    // A failed claim is told to the agent *immediately*, ahead of any queued
+    // work for that lease. The teardown below still has to wait its turn behind
+    // the materialisation it undoes, but the agent must not: waiting would mean
+    // it learns the real reason only after its own 30s timeout has already
+    // reported something vaguer.
+    if let ToClient::Failed { lease, detail } = &msg {
+        let (shared, lease, detail) = (Arc::clone(shared), *lease, detail.clone());
+        tokio::spawn(async move { shared.agents.notify_failed(lease, &detail).await });
+    }
+
+    let Some(lease) = lease else {
+        // Cheap and order-independent: handle inline.
+        let shared = Arc::clone(shared);
+        tokio::spawn(async move { handle(&shared, msg).await });
+        return;
+    };
+
+    let shared = Arc::clone(shared);
+    tokio::spawn(async move {
+        let queue = shared.lease_queue(lease).await;
+        let _guard = queue.lock().await;
+        handle(&shared, msg).await;
+    });
 }
 
 async fn handle(shared: &Arc<Shared>, msg: ToClient) {
@@ -201,7 +262,7 @@ async fn handle(shared: &Arc<Shared>, msg: ToClient) {
             } else {
                 tracing::error!(%lease, ?outcome, "materialisation failed");
             }
-            shared.send(&ClientMsg::Done { request, result: outcome });
+            shared.send(&ClientMsg::Done { request, result: outcome }).await;
         }
         ToClient::Unmaterialize { request, lease, session } => {
             let owner = shared.agents.owner_for(session).await;
@@ -209,7 +270,7 @@ async fn handle(shared: &Arc<Shared>, msg: ToClient) {
                 let mut m = shared.materializer.lock().await;
                 m.unmaterialize(lease, &owner).await
             };
-            shared.send(&ClientMsg::Done { request, result: outcome });
+            shared.send(&ClientMsg::Done { request, result: outcome }).await;
         }
 
         // Unsolicited lease events: forward to whichever agent holds it.
@@ -219,10 +280,26 @@ async fn handle(shared: &Arc<Shared>, msg: ToClient) {
         ToClient::Ended { lease, reason } => {
             shared.agents.notify_ended(lease, &reason).await;
         }
+        ToClient::Failed { lease, detail: _ } => {
+            // The agent has already been told (see `dispatch`); this is the
+            // teardown, which had to wait for any in-flight materialisation of
+            // the same lease so it cannot undo work that has not happened yet.
+            let owner = shared.agents.owner_for(lease_session(shared, lease).await).await;
+            let mut m = shared.materializer.lock().await;
+            m.unmaterialize(lease, &owner).await;
+        }
 
         // Replies to agent requests.
         other => shared.agents.deliver_reply(other).await,
     }
+}
+
+/// Which session a lease belongs to, as far as this daemon knows.
+async fn lease_session(
+    shared: &Arc<Shared>,
+    lease: benchd_core::lease::LeaseId,
+) -> benchd_core::lease::SessionId {
+    shared.agents.session_for_lease(lease).await
 }
 
 fn paths_for(

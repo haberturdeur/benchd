@@ -71,7 +71,10 @@ impl Daemon {
     async fn dispatch(&self, value: Value) {
         let kind = value.get("msg").and_then(Value::as_str).unwrap_or("");
 
-        if kind == "paths" {
+        // `paths` completes a claim; `failed` aborts one. Both resolve the same
+        // waiter, so a claim that cannot be set up returns a reason immediately
+        // instead of stalling until the timeout.
+        if kind == "paths" || kind == "failed" {
             if let Some(lease) = value.get("lease").and_then(Value::as_u64) {
                 if let Some(tx) = self.paths.lock().await.remove(&lease) {
                     let _ = tx.send(value);
@@ -87,9 +90,10 @@ impl Daemon {
             }
         }
 
-        // Unsolicited: revoking, ended, disconnected. Nothing to correlate, but
-        // worth logging — an agent that sees its device vanish should be able to
-        // find out why from the shim's stderr.
+        // Unsolicited: revoking, ended, disconnected, or a session_opened from
+        // the daemon re-registering us after a coordinator restart. Nothing to
+        // correlate; log it so an agent whose device vanished can find out why
+        // from the shim's stderr.
         tracing::info!(%value, "event");
     }
 
@@ -145,6 +149,14 @@ impl Daemon {
             .await
             .map_err(|_| anyhow!("the devices were granted but never appeared"))?
             .map_err(|_| anyhow!("the benchd client daemon closed the connection"))?;
+
+        if paths.get("msg").and_then(Value::as_str) == Some("failed") {
+            let detail = paths.get("detail").and_then(Value::as_str).unwrap_or("unknown");
+            return Err(anyhow!(
+                "the claim could not be set up and has been released: {detail}\n\n\
+                 (nothing is held; the bench is free for another attempt)"
+            ));
+        }
 
         let mut out = granted;
         if let Some(slots) = paths.get("slots") {

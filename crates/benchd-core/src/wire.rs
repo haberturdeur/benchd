@@ -186,6 +186,10 @@ pub enum ToClient {
     Revoking { lease: LeaseId, reason: String, teardown_at: Secs },
     /// Unsolicited: the lease is gone.
     Ended { lease: LeaseId, reason: String },
+    /// Unsolicited: the lease was withdrawn before it ever worked. The holder
+    /// is waiting for device paths that will now never arrive, so this is what
+    /// stops it waiting.
+    Failed { lease: LeaseId, detail: String },
 }
 
 /// Where a resource actually is, from the client's point of view.

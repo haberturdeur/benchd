@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use benchd_core::lease::{ClaimError, LeaseError, SessionId};
-use benchd_core::model::{ClaimRequest, Distinct, Requirement};
+use benchd_core::model::{ClaimRequest, Distinct, Requirement, NAME_KEY};
 use benchd_core::wire::{
-    BenchView, ChannelHello, ClaimSpec, ClientMsg, HostMsg, LeaseStatus, LeaseView, OperatorMsg, RequestId,
-    TagInfo, ToClient, ToHost, ToOperator,
+    BenchView, ChannelHello, ClaimSpec, ClientMsg, HostMsg, LeaseStatus, LeaseView, OperatorMsg,
+    Outcome, RequestId, TagInfo, ToClient, ToHost, ToOperator,
 };
 use futures::StreamExt;
 use tokio::net::TcpStream;
@@ -120,7 +120,13 @@ async fn serve_host(
         match msg {
             HostMsg::Heartbeat | HostMsg::Register { .. } => {}
             HostMsg::Done { request, result } => {
-                tracing::debug!(bench = %bench_id, ?request, ?result, "host completed");
+                let outgoing = {
+                    let mut state = shared.state.lock().await;
+                    fail_lease_if_needed(&mut state, request, result, "host", &bench_id)
+                };
+                for msg in outgoing {
+                    msg.send();
+                }
             }
             HostMsg::DeviceLost { resource, detail } => {
                 // Not repaired in place: the bench leaves the inventory and its
@@ -312,12 +318,20 @@ async fn serve_client(
             .map(|(s, _)| *s)
             .collect();
         let mut effects = Vec::new();
+        for session in &sessions {
+            effects.extend(state.leases.end_session(*session, now()));
+        }
+        // Same ordering rule as CloseSession: dispatch first, forget after.
+        // Here the client's connection is already gone so the Unmaterialize
+        // cannot be delivered anyway — but the Unexport to the host must still
+        // go out, and keeping one order for both paths means there is only one
+        // rule to remember.
+        let outgoing = state.dispatch(effects);
         for session in sessions {
             state.session_conn.remove(&session);
             state.tokens.retain(|_, id| *id != session);
-            effects.extend(state.leases.end_session(session, now()));
         }
-        state.dispatch(effects)
+        outgoing
     };
     for msg in outgoing {
         msg.send();
@@ -336,8 +350,7 @@ async fn handle_client(
     match msg {
         ClientMsg::Heartbeat => Vec::new(),
         ClientMsg::Done { request, result } => {
-            tracing::debug!(?request, ?result, "client completed");
-            Vec::new()
+            fail_lease_if_needed(&mut state, request, result, "client", "")
         }
 
         ClientMsg::OpenSession { request, name } => {
@@ -354,11 +367,16 @@ async fn handle_client(
                 out.send(&unknown_session(request));
                 return Vec::new();
             };
+            // Dispatch BEFORE forgetting how to reach this session: dispatch
+            // resolves the client outbox through session_conn, so removing it
+            // first silently discards the Unmaterialize and leaves the device
+            // node live while the coordinator marks the bench free.
+            let effects = state.leases.end_session(id, now());
+            let outgoing = state.dispatch(effects);
             state.session_conn.remove(&id);
             state.tokens.remove(&session);
-            let effects = state.leases.end_session(id, now());
             out.send(&ToClient::Ok { request });
-            state.dispatch(effects)
+            outgoing
         }
 
         ClientMsg::Claim { request, session, claim } => {
@@ -504,6 +522,57 @@ async fn handle_client(
     }
 }
 
+/// An executor reported on an instruction. Success is bookkeeping; failure
+/// means the lease is a lie and must be undone.
+///
+/// This exists because the protocol has always carried `Outcome::Failed` and
+/// `Outcome::Stale` and the coordinator used to log them at debug and continue
+/// — so a claim whose hardware was never exported still looked granted, and a
+/// failed materialisation parked the bench for its full TTL.
+fn fail_lease_if_needed(
+    state: &mut crate::state::State,
+    request: RequestId,
+    result: Outcome,
+    who: &str,
+    bench: &str,
+) -> Vec<crate::state::Outgoing> {
+    let lease = state.pending.remove(&request);
+    let detail = match result {
+        Outcome::Ok => return Vec::new(),
+        Outcome::Stale { seen } => format!(
+            "{who} rejected the instruction as stale (it has seen epoch {}); \
+             the executor and coordinator disagree about which grant is current",
+            seen.0
+        ),
+        Outcome::Failed { detail } => format!("{who} could not carry it out: {detail}"),
+    };
+
+    let Some(lease) = lease else {
+        tracing::warn!(%who, %bench, %detail, "failure for an unknown instruction");
+        return Vec::new();
+    };
+
+    tracing::error!(%who, %bench, %lease, %detail, "releasing a lease that could not be set up");
+
+    // Tell the holder before tearing down, so the agent gets a reason rather
+    // than a device that silently never appears.
+    let session = state.leases.lease(lease).map(|l| l.session);
+    let mut effects = state.leases.drop_lease(lease);
+    if let Some(session) = session {
+        effects.insert(
+            0,
+            benchd_core::lease::Effect::Notify {
+                session,
+                event: benchd_core::lease::LeaseEvent::Failed {
+                    lease,
+                    detail: detail.clone(),
+                },
+            },
+        );
+    }
+    state.dispatch(effects)
+}
+
 fn unknown_session(request: RequestId) -> ToClient {
     ToClient::Error {
         request,
@@ -520,19 +589,31 @@ fn to_claim_request(
     for (name, tags) in &spec.slots {
         let requirement = Requirement::parse(tags.iter().map(String::as_str))
             .map_err(|e| e.to_string())?;
+        // Claiming by name is the operator CLI's job, not an agent's (D17).
+        // Left open, an agent hardcodes a bench into a test script and the
+        // capability matching this whole system rests on stops being used.
+        if let Some(tag) = requirement.tags.iter().find(|t| t.key == NAME_KEY) {
+            return Err(format!(
+                "claiming a bench by name is not allowed ({tag}); describe what the \
+                 hardware must be able to do instead, e.g. soc=esp32s3. \
+                 Use `tag_list` to see what exists."
+            ));
+        }
         // Check against the vocabulary *before* matching, so `soc=esp32s4`
         // comes back as "did you mean soc=esp32s3?" rather than the far less
         // useful "no bench matches" (D10). A typo is then fixable in one turn.
         vocabulary.check(&requirement.tags).map_err(|e| e.to_string())?;
         slots.insert(name.clone(), requirement);
     }
-    if slots.is_empty() {
-        return Err("a claim must request at least one slot".into());
-    }
-    Ok(ClaimRequest {
+    let request = ClaimRequest {
         slots,
         distinct: if spec.distinct { Distinct::All } else { Distinct::None },
         ttl_seconds: spec.ttl,
         reason: spec.reason.clone(),
-    })
+    };
+    // Slot names become path components inside a root daemon (see
+    // ClaimRequest::validate), so this is a privilege check, not validation
+    // for tidiness.
+    request.validate()?;
+    Ok(request)
 }

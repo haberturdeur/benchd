@@ -131,6 +131,29 @@ impl Agents {
         .await;
     }
 
+    /// A lease was withdrawn before it ever worked. Unlike `ended`, the agent
+    /// is probably still blocked waiting for device paths, so this must reach it.
+    pub async fn notify_failed(&self, lease: LeaseId, detail: &str) {
+        // Deliberately does NOT forget the lease owner: the teardown for this
+        // lease runs afterwards and still needs it to find the right directory.
+        // It is cleaned up by notify_ended, or when the agent disconnects.
+        self.notify(lease, serde_json::json!({
+            "msg": "failed", "lease": lease, "detail": detail
+        }))
+        .await;
+    }
+
+    /// The internal session id that owns a lease, for path construction.
+    pub async fn session_for_lease(&self, lease: LeaseId) -> SessionId {
+        let inner = self.inner.lock().await;
+        inner
+            .lease_owner
+            .get(&lease)
+            .and_then(|agent| inner.agents.get(agent))
+            .and_then(|a| a.internal)
+            .unwrap_or(SessionId(0))
+    }
+
     pub async fn notify_ended(&self, lease: LeaseId, reason: &str) {
         self.notify(lease, serde_json::json!({
             "msg": "ended", "lease": lease, "reason": reason
@@ -147,7 +170,12 @@ impl Agents {
     }
 
     /// The coordinator link dropped, so every session token we hold is void.
-    /// Tell the agents rather than letting them discover it by failure.
+    ///
+    /// The agents' unix sockets are still open — only the upstream link broke —
+    /// so they are re-registered automatically when it comes back. An earlier
+    /// version cleared the session and left the shim to notice, but a shim only
+    /// registers once at startup and its socket never closed, so a one-second
+    /// coordinator restart wedged every agent on the machine permanently.
     pub async fn invalidate_all(&self) {
         let mut inner = self.inner.lock().await;
         inner.pending.clear();
@@ -157,9 +185,31 @@ impl Agents {
             agent.internal = None;
             let msg = serde_json::json!({
                 "msg": "disconnected",
-                "detail": "the coordinator link dropped; all leases are void, re-register"
+                "detail": "the coordinator restarted; all leases are void. \
+                           Your session is being re-registered; re-claim anything you need."
             });
             let _ = agent.out.send(msg.to_string());
+        }
+    }
+
+    /// Re-register every connected agent after the link is restored.
+    ///
+    /// Names are remembered per agent precisely so this can happen without the
+    /// shim doing anything.
+    pub async fn reregister_all(&self, shared: &Shared) {
+        let agents: Vec<(u64, String)> = {
+            let inner = self.inner.lock().await;
+            inner
+                .agents
+                .iter()
+                .filter(|(_, a)| a.session.is_none() && !a.name.is_empty())
+                .map(|(id, a)| (*id, a.name.clone()))
+                .collect()
+        };
+        for (agent_id, name) in agents {
+            let request = self.track(agent_id, RequestId(0)).await;
+            tracing::info!(agent_id, %name, "re-registering after reconnect");
+            shared.send(&ClientMsg::OpenSession { request, name }).await;
         }
     }
 }
@@ -245,7 +295,7 @@ async fn serve_agent(shared: Arc<Shared>, socket: tokio::net::UnixStream) -> Res
     };
     if let Some(session) = session {
         let request = shared.agents.track(agent_id, RequestId(0)).await;
-        shared.send(&ClientMsg::CloseSession { request, session });
+        shared.send(&ClientMsg::CloseSession { request, session }).await;
     }
     tracing::info!(agent_id, "agent disconnected");
     Ok(())
@@ -296,7 +346,7 @@ async fn forward(shared: &Arc<Shared>, agent_id: u64, msg: ClientMsg) {
         }
     };
 
-    shared.send(&out);
+    shared.send(&out).await;
 }
 
 fn request_of(msg: &ClientMsg) -> RequestId {

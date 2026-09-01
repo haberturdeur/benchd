@@ -68,6 +68,7 @@ skill/benchd/SKILL.md             the agent-facing skill
 crates/benchd-core/               pure: tags, model, matcher, limits, lease, wire
   tests/matcher.rs                behavioural spec + property test vs a brute-force oracle
   tests/lease.rs                  lease lifecycle spec
+  tests/failure_paths.rs          what happens when things go wrong
 crates/benchd-coordinator/        the only listener; matching, limits, lease state
 crates/benchd-host/               one process per bench; owns the hardware
 crates/benchd-client/             privileged: materialises device nodes
@@ -97,7 +98,7 @@ Then point an agent at it:
 ## Build
 
 ```sh
-cargo test           # 56 tests, incl. a property test over random inventories
+cargo test           # 66 tests, incl. a property test over random inventories
 cargo clippy --all-targets
 ```
 

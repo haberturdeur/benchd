@@ -84,6 +84,14 @@ impl Bench {
     }
 }
 
+/// The tag key that carries a bench's own id.
+///
+/// Injected per bench so that human and operator selection rides the same
+/// matching path as everything else — but agents must never use it (D17), or
+/// one will hardcode a bench into a test script and reintroduce exactly the
+/// contention this system removes.
+pub const NAME_KEY: &str = "name";
+
 /// Tags a single slot must satisfy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Requirement {
@@ -108,6 +116,27 @@ impl Requirement {
     pub fn matches(&self, bench: &Bench) -> bool {
         self.tags.is_subset(&bench.tags)
     }
+}
+
+/// Names that become directory components on a privileged daemon.
+///
+/// Slot names come from an agent's claim and resource names from a host's
+/// config, and both end up in `<root>/<owner>/<lease>/<slot>/<resource>` inside
+/// a process running as root. `Path::join` does not normalise `..`, and an
+/// absolute component *replaces* everything before it — so an unvalidated name
+/// is an arbitrary-location `mount --bind` with root privileges.
+///
+/// This is the first of two defences; the materialiser also refuses to mount
+/// outside its root. Neither is sufficient alone, because this one runs in the
+/// coordinator and the materialiser must not trust the coordinator either.
+pub fn valid_component(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 /// Which slots must land on *different* benches.
@@ -141,6 +170,27 @@ pub struct ClaimRequest {
     /// it to scope the work, and gives us requested-vs-used telemetry.
     pub ttl_seconds: u64,
     pub reason: String,
+}
+
+impl ClaimRequest {
+    /// Reject anything that could escape a directory once materialised.
+    ///
+    /// Slot names are chosen by the agent and become path components inside a
+    /// root daemon, so this is a privilege boundary, not tidiness.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.slots.is_empty() {
+            return Err("a claim must request at least one slot".into());
+        }
+        for slot in self.slots.keys() {
+            if !valid_component(slot) {
+                return Err(format!(
+                    "invalid slot name {slot:?}: use a short plain name such as \"dut\" \
+                     (letters, digits, dash, underscore, dot)"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The set of known benches plus the vocabulary describing them.

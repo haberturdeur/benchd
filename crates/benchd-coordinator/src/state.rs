@@ -46,6 +46,11 @@ pub struct State {
     pub tokens: BTreeMap<SessionToken, SessionId>,
     /// internal id -> which client connection owns it
     pub session_conn: BTreeMap<SessionId, u64>,
+    /// Which lease each outstanding instruction belongs to, so an executor
+    /// reporting failure can be traced back to the lease that must be undone.
+    /// Without this a failed export produces a lease the agent believes is
+    /// good, and a failed materialisation parks a bench for its whole TTL.
+    pub pending: BTreeMap<RequestId, LeaseId>,
     next_request: u64,
     next_conn: u64,
     /// Treat every bench as remote. Exercises the USB/IP path on one machine.
@@ -64,6 +69,7 @@ impl State {
             clients: BTreeMap::new(),
             tokens: BTreeMap::new(),
             session_conn: BTreeMap::new(),
+            pending: BTreeMap::new(),
             next_request: 1,
             next_conn: 1,
             force_relay: false,
@@ -99,6 +105,18 @@ impl State {
         if self.hosts.contains_key(&spec.id) {
             return Err(format!("bench {:?} is already registered", spec.id));
         }
+        for name in spec.resources.keys() {
+            // Resource names are also path components on the client daemon.
+            if !benchd_core::model::valid_component(name) {
+                return Err(format!(
+                    "invalid resource name {name:?}: must be a plain path component"
+                ));
+            }
+        }
+        if !benchd_core::model::valid_component(&spec.id) {
+            return Err(format!("invalid bench id {:?}", spec.id));
+        }
+
         let vocabulary = &self.leases.inventory().vocabulary;
         let declared: benchd_core::tags::TagSet = spec.tags.iter().cloned().collect();
         vocabulary.check(&declared).map_err(|e| e.to_string())?;
@@ -133,6 +151,7 @@ impl State {
                     };
                     let relay = self.needs_relay(&bench, session);
                     let request = self.next_request();
+                    self.pending.insert(request, lease);
                     out.push(Outgoing::Host {
                         out: host_out,
                         msg: ToHost::Export { request, lease, epoch, session, relay },
@@ -150,9 +169,9 @@ impl State {
                 }
                 Effect::Materialize { lease, session, slots } => {
                     let Some(conn) = self.client_for(session) else { continue };
-                    let epoch = self.epoch_for(&slots);
-                    let handles = self.handles_for(&slots, session, lease, epoch);
+                    let handles = self.handles_for(&slots, session, lease);
                     let request = self.next_request();
+                    self.pending.insert(request, lease);
                     out.push(Outgoing::Client {
                         out: conn,
                         msg: ToClient::Materialize { request, lease, session, slots: handles },
@@ -200,17 +219,15 @@ impl State {
         host.peer_ip != client.peer_ip
     }
 
-    /// The epoch granted for these benches. They are all part of one lease and
-    /// therefore share a grant, so any of them answers.
-    fn epoch_for(&self, slots: &BTreeMap<String, String>) -> Epoch {
-        slots
-            .values()
-            .find_map(|bench| {
-                self.leases
-                    .leases()
-                    .find_map(|l| l.epochs.get(bench).copied())
-            })
-            .unwrap_or(Epoch(0))
+    /// The epoch this lease was granted for one specific bench.
+    ///
+    /// Per bench, never shared: every bench has its own counter, so a two-slot
+    /// claim can hold epoch 4 of one bench and epoch 1 of another. An earlier
+    /// version took the first epoch it found and stamped it on every bench,
+    /// which made the client and the host derive different channel keys for the
+    /// same resource — the relay could then never pair them.
+    fn epoch_for(&self, lease: LeaseId, bench: &str) -> Option<Epoch> {
+        self.leases.lease(lease)?.epochs.get(bench).copied()
     }
 
     pub fn handles_for(
@@ -218,7 +235,6 @@ impl State {
         slots: &BTreeMap<String, String>,
         session: SessionId,
         lease: LeaseId,
-        epoch: Epoch,
     ) -> BTreeMap<String, BTreeMap<String, ResourceHandle>> {
         let mut out = BTreeMap::new();
         for (slot, bench_id) in slots {
@@ -226,6 +242,10 @@ impl State {
                 continue;
             };
             let relay = self.needs_relay(bench_id, session);
+            let Some(epoch) = self.epoch_for(lease, bench_id) else {
+                tracing::error!(%lease, %bench_id, "no epoch for a bench in its own lease");
+                continue;
+            };
             let mut resources = BTreeMap::new();
             for (name, resource) in &bench.resources {
                 let handle = match resource {
@@ -276,6 +296,7 @@ fn notify_to_wire(event: benchd_core::lease::LeaseEvent) -> Option<ToClient> {
     use benchd_core::lease::{EndReason, LeaseEvent, RevokeReason};
     Some(match event {
         LeaseEvent::Granted { .. } => return None,
+        LeaseEvent::Failed { lease, detail } => ToClient::Failed { lease, detail },
         LeaseEvent::Revoking { lease, reason, teardown_at } => ToClient::Revoking {
             lease,
             reason: match reason {
