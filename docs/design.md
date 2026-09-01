@@ -235,6 +235,12 @@ to end. The coordinator's half is a channel registry plus a byte splice.
 — the client picks a free loopback port per attachment, so several remote hosts can be
 attached on one client machine without colliding on 3240.
 
+*`usbipd` cannot be confined to loopback* (verified in `usbipd.c`: `do_getaddrinfo(NULL,
+family)` with `AI_PASSIVE` binds wildcard, and there is no bind-address option — `-4`/
+`-6` pick the address family only). Since the protocol has no authentication either —
+`recv_request_import` matches a busid and exports — **the host unit must firewall the
+usbip port to loopback**; see §9.
+
 *Costs, accepted:* the coordinator sits in the data path, adding bandwidth load and one
 RTT per URB round trip. Irrelevant for 115200 serial (~11 KB/s); **unproven for OpenOCD
 or high-rate logging**, which are latency-sensitive — measure before relying on it
@@ -606,6 +612,27 @@ Hosts and clients run as root but only execute epoch-qualified instructions from
 coordinator, never agent-supplied strings, and build paths only from validated
 identifiers. That is defence against *bugs*, which remains worthwhile regardless.
 
+**One concrete exposure needs an actual mitigation.** `usbipd` always binds wildcard
+(verified in source; no bind-address option) and its protocol has no authentication, so
+anything that can reach the usbip port can import a bound device. That is a hole even
+under the trusted-LAN assumption, because it bypasses benchd entirely — a lease would
+say one thing while the hardware answered to someone else. The host unit therefore
+ships a firewall rule:
+
+```
+nft add rule inet filter input tcp dport 3240 iif != "lo" drop
+```
+
+Two things reduce the window but do not replace that rule: benchd only `usbip bind`s a
+device for the duration of a lease and unbinds at teardown, so between leases nothing is
+exportable at all; and `usbipd` excludes already-exported devices from its device list
+and refuses a second import (`ST_NA`), so a live lease cannot be stolen mid-flight.
+
+*Airtight alternative, not for the PoC:* run `usbipd` in a network namespace containing
+only `lo`, with the host daemon entering that namespace to reach it. More moving parts
+than this needs. *Not available:* `usbipd`'s optional TCP-wrappers hook — Arch's build
+has no libwrap.
+
 ---
 
 ## 10. Open questions
@@ -615,7 +642,7 @@ None blocking.
 | # | Question | State |
 |---|---|---|
 | Q10 | Does the relay's extra RTT matter for OpenOCD/JTAG? Serial is certainly fine. | open — **measure**, don't guess; only bites when remote benches land |
-| Q11 | Does `usbipd` support binding to loopback only? | open — if not, firewall 3240 or run it in a netns, so the relay stays the only path in |
+| Q11 | Can `usbipd` bind loopback-only? | **No.** It binds wildcard and has no auth, so the host unit firewalls the port (§9). Resolved. |
 
 **Deferred ideas.** *Idle release* — TTL catches crashes, not an agent that claims a
 board then reads source for 12 minutes; detect via no open fd for N minutes. *Sticky
