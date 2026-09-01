@@ -8,6 +8,7 @@
 
 mod conn;
 mod handlers;
+mod relay;
 mod state;
 
 use std::sync::Arc;
@@ -36,10 +37,17 @@ struct Args {
     /// How often to check for expiring leases.
     #[arg(long, default_value_t = 1)]
     tick_seconds: u64,
+
+    /// Treat every bench as remote, forwarding devices over USB/IP even when the
+    /// host and client share a machine. Exercises the remote path on one box.
+    #[arg(long)]
+    force_relay: bool,
 }
 
 pub struct Shared {
     pub state: Mutex<State>,
+    /// Half-open USB/IP data channels waiting to be paired (D5).
+    pub relay: Arc<crate::relay::Relay>,
 }
 
 /// Coarse wall-clock seconds. The lease machine takes time as a parameter, so
@@ -86,7 +94,15 @@ async fn main() -> Result<()> {
         "limits"
     );
 
-    let shared = Arc::new(Shared { state: Mutex::new(State::new(limits, vocabulary)) });
+    let mut state = State::new(limits, vocabulary);
+    state.force_relay = args.force_relay;
+    if args.force_relay {
+        tracing::warn!("--force-relay: every bench will be forwarded over USB/IP");
+    }
+    let shared = Arc::new(Shared {
+        state: Mutex::new(state),
+        relay: Arc::new(crate::relay::Relay::default()),
+    });
 
     // The reaper. Effects are collected under the lock and dispatched after it
     // is released, so a slow peer can never stall expiry.

@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&root)
         .with_context(|| format!("failed to create {}", root.display()))?;
 
-    let mut materializer = Materializer::new(root.clone());
+    let mut materializer = Materializer::new(root.clone(), args.coordinator.clone());
     // Nothing we mounted survives us in any meaningful sense: the coordinator
     // holds all lease state and has forgotten everything (D6).
     materializer.clear_stale().await;

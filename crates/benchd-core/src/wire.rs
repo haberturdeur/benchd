@@ -80,15 +80,16 @@ pub enum ToHost {
     Rejected { reason: String },
     /// Make this bench's resources reachable by `session`.
     ///
-    /// `endpoint` is `None` when the host and client share a machine: there is
+    /// `relay` is false when the host and client share a machine: there is
     /// nothing to export, and the client bind-mounts the real inode instead.
+    /// When true, the host derives a [`channel_key`] per resource and dials out.
     Export {
         request: RequestId,
         lease: LeaseId,
         epoch: Epoch,
         session: SessionId,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        channel: Option<ChannelKey>,
+        #[serde(default)]
+        relay: bool,
     },
     Unexport { request: RequestId, lease: LeaseId, epoch: Epoch },
 }
@@ -203,6 +204,24 @@ pub enum ResourceHandle {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ChannelKey(pub String);
 
+/// The key for one resource's data channel.
+///
+/// **Deterministic on purpose.** Both ends must arrive at the same key, and the
+/// host is told to export before the client is told to materialise — so a random
+/// key would have to be threaded through two messages and kept in sync. Deriving
+/// it from facts both sides already know removes that coupling entirely.
+///
+/// The epoch is included so a retry after a superseded lease cannot collide with
+/// a channel still being torn down.
+pub fn channel_key(
+    lease: LeaseId,
+    epoch: Epoch,
+    bench: &str,
+    resource: &str,
+) -> ChannelKey {
+    ChannelKey(format!("{}-{}-{}-{}", lease.0, epoch.0, bench, resource))
+}
+
 /// First line on a data connection, before it becomes an opaque byte stream.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChannelHello {
@@ -215,6 +234,50 @@ pub struct ChannelHello {
 pub enum ChannelSide {
     Host,
     Client,
+}
+
+// ---------------------------------------------------------------------------
+// Operator ↔ coordinator
+//
+// A separate surface from the agent one, not a privileged mode of it (D17).
+// This is where naming a bench and taking it back live; agents can do neither.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "msg", rename_all = "snake_case")]
+pub enum OperatorMsg {
+    /// Everything: benches, who holds what, and why.
+    Inspect,
+    /// Take a bench back. `immediate` skips the grace window.
+    ForceRelease { bench: String, immediate: bool },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "msg", rename_all = "snake_case")]
+pub enum ToOperator {
+    State { benches: Vec<BenchView>, leases: Vec<LeaseView> },
+    Released { count: usize },
+    Error { error: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BenchView {
+    pub id: String,
+    pub description: String,
+    /// Rendered `key=value`, already sorted.
+    pub tags: Vec<String>,
+    pub resources: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LeaseView {
+    pub id: u64,
+    /// The holder's declared name. Diagnostic only (D19).
+    pub owner: String,
+    pub slots: BTreeMap<String, String>,
+    pub expires_at: Secs,
+    pub state: String,
+    pub reason: String,
 }
 
 // ---------------------------------------------------------------------------

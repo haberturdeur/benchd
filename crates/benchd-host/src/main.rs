@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     // reference to a handed-over socket, so teardown is mandatory rather than
     // optional. Clear anything a previous incarnation left behind before we
     // accept work (D6).
-    let mut exports = Exports::new(spec.clone());
+    let mut exports = Exports::new(spec.clone(), args.coordinator.clone());
     exports.clear_stale().await;
 
     loop {
@@ -206,8 +206,8 @@ async fn run(args: &Args, spec: &BenchSpec, exports: &mut Exports) -> Result<()>
                         tracing::error!(%reason, "registration refused");
                         break Err(anyhow::anyhow!("registration refused: {reason}"));
                     }
-                    ToHost::Export { request, lease, epoch, session, channel } => {
-                        let result = exports.export(lease, epoch, session, channel).await;
+                    ToHost::Export { request, lease, epoch, session, relay } => {
+                        let result = exports.export(lease, epoch, session, relay).await;
                         reply(&tx, request, result);
                     }
                     ToHost::Unexport { request, lease, epoch } => {

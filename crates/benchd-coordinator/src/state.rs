@@ -12,10 +12,10 @@
 
 use std::collections::BTreeMap;
 
-use benchd_core::lease::{Effect, LeaseManager, SessionId};
+use benchd_core::lease::{Effect, Epoch, LeaseId, LeaseManager, SessionId};
 use benchd_core::model::{Bench, Inventory};
 use benchd_core::wire::{
-    BenchSpec, ChannelKey, RequestId, ResourceHandle, SessionToken, ToClient, ToHost,
+    BenchSpec, RequestId, ResourceHandle, SessionToken, ToClient, ToHost,
 };
 use benchd_core::Limits;
 
@@ -48,6 +48,8 @@ pub struct State {
     pub session_conn: BTreeMap<SessionId, u64>,
     next_request: u64,
     next_conn: u64,
+    /// Treat every bench as remote. Exercises the USB/IP path on one machine.
+    pub force_relay: bool,
 }
 
 impl State {
@@ -64,6 +66,7 @@ impl State {
             session_conn: BTreeMap::new(),
             next_request: 1,
             next_conn: 1,
+            force_relay: false,
         }
     }
 
@@ -128,11 +131,11 @@ impl State {
                         tracing::warn!(%bench, "export for a bench whose host has gone");
                         continue;
                     };
-                    let channel = self.channel_for(&bench, session);
+                    let relay = self.needs_relay(&bench, session);
                     let request = self.next_request();
                     out.push(Outgoing::Host {
                         out: host_out,
-                        msg: ToHost::Export { request, lease, epoch, session, channel },
+                        msg: ToHost::Export { request, lease, epoch, session, relay },
                     });
                 }
                 Effect::Unexport { bench, lease, epoch } => {
@@ -147,7 +150,8 @@ impl State {
                 }
                 Effect::Materialize { lease, session, slots } => {
                     let Some(conn) = self.client_for(session) else { continue };
-                    let handles = self.handles_for(&slots, session);
+                    let epoch = self.epoch_for(&slots);
+                    let handles = self.handles_for(&slots, session, lease, epoch);
                     let request = self.next_request();
                     out.push(Outgoing::Client {
                         out: conn,
@@ -181,43 +185,63 @@ impl State {
         self.clients.get(conn_id).map(|c| c.out.clone())
     }
 
-    /// A relay channel is needed only when the host and client are on different
-    /// machines; co-located, the client bind-mounts the real inode (D5).
-    fn channel_for(&self, bench: &str, session: SessionId) -> Option<ChannelKey> {
-        let host = self.hosts.get(bench)?;
-        let conn_id = self.session_conn.get(&session)?;
-        let client = self.clients.get(conn_id)?;
-        (host.peer_ip != client.peer_ip)
-            .then(|| ChannelKey(uuid::Uuid::new_v4().to_string()))
+    /// True when the host and client are on different machines, so the device
+    /// must be forwarded rather than bind-mounted (D5).
+    ///
+    /// `force_relay` makes every bench take the remote path regardless, which is
+    /// how the USB/IP code is exercised on a single machine.
+    fn needs_relay(&self, bench: &str, session: SessionId) -> bool {
+        if self.force_relay {
+            return true;
+        }
+        let Some(host) = self.hosts.get(bench) else { return false };
+        let Some(conn_id) = self.session_conn.get(&session) else { return false };
+        let Some(client) = self.clients.get(conn_id) else { return false };
+        host.peer_ip != client.peer_ip
+    }
+
+    /// The epoch granted for these benches. They are all part of one lease and
+    /// therefore share a grant, so any of them answers.
+    fn epoch_for(&self, slots: &BTreeMap<String, String>) -> Epoch {
+        slots
+            .values()
+            .find_map(|bench| {
+                self.leases
+                    .leases()
+                    .find_map(|l| l.epochs.get(bench).copied())
+            })
+            .unwrap_or(Epoch(0))
     }
 
     pub fn handles_for(
         &self,
         slots: &BTreeMap<String, String>,
         session: SessionId,
+        lease: LeaseId,
+        epoch: Epoch,
     ) -> BTreeMap<String, BTreeMap<String, ResourceHandle>> {
         let mut out = BTreeMap::new();
         for (slot, bench_id) in slots {
             let Some(bench) = self.leases.inventory().benches.get(bench_id) else {
                 continue;
             };
-            let colocated = self.channel_for(bench_id, session).is_none();
+            let relay = self.needs_relay(bench_id, session);
             let mut resources = BTreeMap::new();
             for (name, resource) in &bench.resources {
                 let handle = match resource {
-                    benchd_core::model::Resource::Serial { by_id } if colocated => {
+                    benchd_core::model::Resource::Serial { by_id } if !relay => {
                         ResourceHandle::Local { path: by_id.display().to_string() }
                     }
-                    benchd_core::model::Resource::Serial { by_id } => {
-                        // Remote serial still needs the USB device forwarded;
-                        // the host resolves by-id to a busid at export time.
-                        ResourceHandle::UsbIp {
-                            channel: ChannelKey(uuid::Uuid::new_v4().to_string()),
-                            busid: by_id.display().to_string(),
-                        }
-                    }
+                    // Remote: the busid is resolved by the host, which is the
+                    // machine that can actually see the device. The client only
+                    // needs to name what it is asking for, and the host answers
+                    // with whatever busid it exported under.
+                    benchd_core::model::Resource::Serial { .. } => ResourceHandle::UsbIp {
+                        channel: benchd_core::wire::channel_key(lease, epoch, bench_id, name),
+                        busid: String::new(),
+                    },
                     benchd_core::model::Resource::Usb { busid } => ResourceHandle::UsbIp {
-                        channel: ChannelKey(uuid::Uuid::new_v4().to_string()),
+                        channel: benchd_core::wire::channel_key(lease, epoch, bench_id, name),
                         busid: busid.clone(),
                     },
                 };

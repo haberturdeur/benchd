@@ -11,12 +11,18 @@
 //! - [`limits`] - how long a lease may be held, and how many
 //! - [`lease`] - the lease lifecycle state machine (pure; time is a parameter)
 //! - [`wire`] - the JSON-lines protocol shared by all three binaries
+//! - [`usbip`] - the USB/IP handshake, behind the `usbip` feature
+//! - [`sysfs`] - handing a connected socket to the kernel's USB/IP drivers
 
 pub mod lease;
 pub mod limits;
 pub mod matcher;
 pub mod model;
 pub mod tags;
+#[cfg(feature = "usbip")]
+pub mod sysfs;
+#[cfg(feature = "usbip")]
+pub mod usbip;
 pub mod wire;
 
 pub use lease::{

@@ -131,6 +131,7 @@ dependencies = [
  "serde_json",
  "strsim",
  "thiserror",
+ "tokio",
  "toml",
 ]
 

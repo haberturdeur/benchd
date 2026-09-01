@@ -13,8 +13,17 @@ thiserror = { workspace = true }
 strsim = { workspace = true }
 serde_json = { workspace = true }
 
+[dependencies.tokio]
+workspace = true
+optional = true
+
+[features]
+# The USB/IP protocol needs async I/O; the rest of core is pure and stays so.
+usbip = ["dep:tokio", "tokio/fs", "tokio/net", "tokio/io-util", "tokio/time"]
+
 [dev-dependencies]
 proptest = "1"
+tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

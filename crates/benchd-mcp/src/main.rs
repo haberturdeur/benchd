@@ -34,9 +34,27 @@ struct Args {
 
     /// This agent's name. A diagnostic label, not an authorisation input: it
     /// exists so contention reports can say "held by agent-3" rather than
-    /// quoting a UUID (D19).
-    #[arg(long, env = "BENCHD_IDENTITY", default_value = "agent")]
-    identity: String,
+    /// quoting a UUID (D19). Derived from the harness if unset.
+    #[arg(long, env = "BENCHD_IDENTITY")]
+    identity: Option<String>,
+}
+
+/// A short, human-meaningful name for whoever is running us.
+///
+/// Harnesses expose a session id but it is usually a full UUID, which makes
+/// contention messages unreadable — "held by 01a05c2e-52e0-7ba3-…" tells you
+/// nothing at 2am. Take a short prefix instead, and fall back to the pid so two
+/// agents are never confusable.
+fn derive_identity() -> String {
+    for (var, prefix) in [("PI_SESSION_ID", "pi"), ("CLAUDE_SESSION_ID", "claude")] {
+        if let Ok(id) = std::env::var(var) {
+            let short: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+            if !short.is_empty() {
+                return format!("{prefix}-{short}");
+            }
+        }
+    }
+    format!("agent-{}", std::process::id())
 }
 
 #[derive(Clone)]
@@ -243,8 +261,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let daemon = Daemon::connect(&args.socket, &args.identity).await?;
-    tracing::info!(identity = %args.identity, "registered");
+    let identity = args.identity.clone().unwrap_or_else(derive_identity);
+    let daemon = Daemon::connect(&args.socket, &identity).await?;
+    tracing::info!(%identity, "registered");
 
     let service = Benchd { daemon, tool_router: Benchd::tool_router() }
         .serve(rmcp::transport::stdio())

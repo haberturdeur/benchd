@@ -26,16 +26,87 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use benchd_core::lease::{LeaseId, SessionId};
-use benchd_core::wire::{Outcome, ResourceHandle};
+use benchd_core::sysfs;
+use benchd_core::usbip;
+use benchd_core::wire::{ChannelHello, ChannelSide, Outcome, ResourceHandle};
+use futures::SinkExt;
+use tokio_util::codec::{FramedWrite, LinesCodec};
 
 pub struct Materializer {
     root: PathBuf,
+    coordinator: String,
     active: BTreeMap<LeaseId, PathBuf>,
+    /// vhci ports this lease imported, needing an explicit detach.
+    imported: BTreeMap<LeaseId, Vec<u32>>,
 }
 
 impl Materializer {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Materializer { root: root.into(), active: BTreeMap::new() }
+    pub fn new(root: impl Into<PathBuf>, coordinator: String) -> Self {
+        Materializer {
+            root: root.into(),
+            coordinator,
+            active: BTreeMap::new(),
+            imported: BTreeMap::new(),
+        }
+    }
+
+    /// Import a remote device and return the device node it produced.
+    ///
+    /// Dial out, complete the import handshake over the relayed connection, hand
+    /// the socket to vhci, then wait for the kernel to enumerate — `attach`
+    /// returns before the tty exists.
+    async fn import(
+        &self,
+        channel: &benchd_core::wire::ChannelKey,
+        busid: &str,
+    ) -> Result<(u32, PathBuf), String> {
+        let stream = tokio::net::TcpStream::connect(&self.coordinator)
+            .await
+            .map_err(|e| format!("dialling the coordinator for a data channel: {e}"))?;
+        stream.set_nodelay(true).ok();
+        let (read, write) = stream.into_split();
+
+        let mut sink = FramedWrite::new(write, LinesCodec::new());
+        let hello = ChannelHello { channel: channel.clone(), side: ChannelSide::Client };
+        sink.send(serde_json::to_string(&hello).map_err(|e| e.to_string())?)
+            .await
+            .map_err(|e| format!("sending the channel hello: {e}"))?;
+        let mut stream = read
+            .reunite(sink.into_inner())
+            .map_err(|e| format!("reuniting the socket: {e}"))?;
+
+        tracing::info!(channel = %channel.0, "data channel open; requesting import");
+        let device = usbip::request_import(&mut stream, busid)
+            .await
+            .map_err(|e| format!("usbip import: {e}"))?;
+        tracing::info!(
+            channel = %channel.0, busid = %device.busid,
+            vid = format!("{:04x}", device.id_vendor),
+            pid = format!("{:04x}", device.id_product),
+            "importing"
+        );
+
+        let port = sysfs::free_vhci_port().await.map_err(|e| e.to_string())?;
+
+        sysfs::vhci_attach(port, stream, device.devid(), device.speed)
+            .await
+            .map_err(|e| format!("vhci attach on port {port}: {e}"))?;
+        tracing::info!(port, devid = device.devid(), "attached; waiting for enumeration");
+
+        // Located by vhci port rather than by diffing /dev/serial/by-id: a
+        // forwarded device reproduces the *same* by-id name as the one that
+        // just vanished locally, so a diff would see nothing at all.
+        match sysfs::wait_for_vhci_tty(port, device.speed, std::time::Duration::from_secs(10))
+            .await
+        {
+            Some(path) => Ok((port, path)),
+            None => {
+                sysfs::vhci_detach(port).await;
+                Err(format!(
+                    "{busid} was imported on port {port} but no serial device appeared;                      is the right usb-serial driver available on this machine?"
+                ))
+            }
+        }
     }
 
     fn lease_dir(&self, owner: &str, lease: LeaseId) -> PathBuf {
@@ -48,6 +119,11 @@ impl Materializer {
     /// without this a restart would leave hardware reachable by an agent whose
     /// lease is gone (D6).
     pub async fn clear_stale(&mut self) {
+        // Imported devices are kernel state too, and outlive us just as mounts do.
+        for port in sysfs::attached_ports().await {
+            tracing::warn!(port, "detaching a stale imported device from a previous run");
+            sysfs::vhci_detach(port).await;
+        }
         let Ok(mut owners) = tokio::fs::read_dir(&self.root).await else {
             return;
         };
@@ -74,6 +150,7 @@ impl Materializer {
         // lease is worse than a failed one, because the agent would find some
         // of its devices and reasonably assume it had them all.
         let mut plan: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut ports: Vec<u32> = Vec::new();
         for (slot, resources) in slots {
             for (name, handle) in resources {
                 match handle {
@@ -90,12 +167,21 @@ impl Materializer {
                         };
                         plan.push((source, dir.join(slot).join(name)));
                     }
-                    ResourceHandle::UsbIp { .. } => {
-                        return Outcome::Failed {
-                            detail: format!(
-                                "{slot}/{name}: remote benches are not implemented yet"
-                            ),
-                        };
+                    ResourceHandle::UsbIp { channel, busid } => {
+                        match self.import(channel, busid).await {
+                            Ok((port, source)) => {
+                                ports.push(port);
+                                plan.push((source, dir.join(slot).join(name)));
+                            }
+                            Err(detail) => {
+                                for port in &ports {
+                                    sysfs::vhci_detach(*port).await;
+                                }
+                                return Outcome::Failed {
+                                    detail: format!("{slot}/{name}: {detail}"),
+                                };
+                            }
+                        }
                     }
                 }
             }
@@ -105,11 +191,17 @@ impl Materializer {
             if let Err(detail) = bind_mount(source, dest).await {
                 // Roll back, so a failure never leaves a partial lease behind.
                 unmount_tree(&dir).await;
+                for port in &ports {
+                    sysfs::vhci_detach(*port).await;
+                }
                 return Outcome::Failed { detail };
             }
         }
 
         self.active.insert(lease, dir.clone());
+        if !ports.is_empty() {
+            self.imported.insert(lease, ports);
+        }
         tracing::info!(%lease, %owner, path = %dir.display(), mounts = plan.len(), "materialized");
         Outcome::Ok
     }
@@ -120,6 +212,11 @@ impl Materializer {
         // clean up a lease it does not remember.
         let dir = self.active.remove(&lease).unwrap_or_else(|| self.lease_dir(owner, lease));
         unmount_tree(&dir).await;
+        // Detach after unmounting: the mount is what the agent holds, and the
+        // vhci port is what the kernel holds.
+        for port in self.imported.remove(&lease).unwrap_or_default() {
+            sysfs::vhci_detach(port).await;
+        }
         tracing::info!(%lease, %owner, "unmaterialized");
         Outcome::Ok
     }
@@ -231,3 +328,4 @@ mod tests {
         assert_eq!(owner_dir(SessionId(7), "!!!"), "s7");
     }
 }
+

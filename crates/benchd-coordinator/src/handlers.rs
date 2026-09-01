@@ -11,7 +11,8 @@ use anyhow::Result;
 use benchd_core::lease::{ClaimError, LeaseError, SessionId};
 use benchd_core::model::{ClaimRequest, Distinct, Requirement};
 use benchd_core::wire::{
-    ClaimSpec, ClientMsg, HostMsg, LeaseStatus, RequestId, TagInfo, ToClient, ToHost,
+    BenchView, ChannelHello, ClaimSpec, ClientMsg, HostMsg, LeaseStatus, LeaseView, OperatorMsg, RequestId,
+    TagInfo, ToClient, ToHost, ToOperator,
 };
 use futures::StreamExt;
 use tokio::net::TcpStream;
@@ -24,7 +25,8 @@ use crate::{now, Shared};
 pub async fn serve(shared: Arc<Shared>, socket: TcpStream, peer: SocketAddr) -> Result<()> {
     socket.set_nodelay(true).ok();
     let (read, write) = socket.into_split();
-    let out = spawn_writer(write, peer.to_string());
+    // The writer half is kept separate until we know what this connection is: a
+    // data channel needs the raw socket back, not a line-framed sink.
     let mut lines = FramedRead::new(read, LinesCodec::new());
 
     let Some(first) = lines.next().await else {
@@ -32,12 +34,42 @@ pub async fn serve(shared: Arc<Shared>, socket: TcpStream, peer: SocketAddr) -> 
     };
     let first = first?;
 
+    if let Ok(hello) = serde_json::from_str::<ChannelHello>(&first) {
+        let stream = lines
+            .into_inner()
+            .reunite(write)
+            .map_err(|e| anyhow::anyhow!("could not reunite the socket: {e}"))?;
+        Arc::clone(&shared.relay).join(hello, stream).await;
+        return Ok(());
+    }
+
+    let out = spawn_writer(write, peer.to_string());
+
     if let Ok(HostMsg::Register { bench }) = serde_json::from_str::<HostMsg>(&first) {
         return serve_host(shared, lines, out, peer, bench).await;
     }
+    if let Ok(msg) = serde_json::from_str::<OperatorMsg>(&first) {
+        return serve_operator(shared, out, msg).await;
+    }
 
-    // Not a host: replay the first line through the client path so nothing is
-    // lost, then continue reading.
+    // Not a host and not an operator. It must be a client — but if the first
+    // line does not decode as one either, say so and hang up. Falling through
+    // silently leaves the caller waiting for a reply that will never come,
+    // which is how a version mismatch turns into a mysterious hang instead of
+    // an error message.
+    if let Err(err) = serde_json::from_str::<ClientMsg>(&first) {
+        tracing::warn!(%peer, %err, "unrecognised first message; closing");
+        out.send(&ToClient::Error {
+            request: RequestId(0),
+            error: format!(
+                "unrecognised message: {err}. Are the binaries the same build?"
+            ),
+            retryable: false,
+        });
+        return Ok(());
+    }
+
+    // Replay the first line through the client path so nothing is lost.
     serve_client(shared, lines, out, peer, Some(first)).await
 }
 
@@ -131,6 +163,96 @@ fn drop_bench(state: &mut crate::state::State, bench: &str) -> Vec<crate::state:
         effects.extend(state.leases.drop_lease(lease));
     }
     state.dispatch(effects)
+}
+
+// ---------------------------------------------------------------------------
+// Operator
+// ---------------------------------------------------------------------------
+
+async fn serve_operator(shared: Arc<Shared>, out: Outbox, msg: OperatorMsg) -> Result<()> {
+    let mut state = shared.state.lock().await;
+    let t = now();
+
+    let reply = match msg {
+        OperatorMsg::Inspect => {
+            let benches = state
+                .leases
+                .inventory()
+                .benches
+                .values()
+                .map(|b| BenchView {
+                    id: b.id.clone(),
+                    description: b.description.clone(),
+                    tags: b
+                        .tags
+                        .iter()
+                        .filter(|t| t.key != "name")
+                        .map(|t| t.to_string())
+                        .collect(),
+                    resources: b.resource_names().iter().map(|s| s.to_string()).collect(),
+                })
+                .collect();
+            let leases = state.leases.leases().map(|l| lease_view(&state, l, t)).collect();
+            ToOperator::State { benches, leases }
+        }
+        OperatorMsg::ForceRelease { bench, immediate } => {
+            if !state.leases.inventory().benches.contains_key(&bench) {
+                out.send(&ToOperator::Error {
+                    error: format!("no such bench {bench:?}"),
+                });
+                return Ok(());
+            }
+            let doomed: Vec<_> = state
+                .leases
+                .leases()
+                .filter(|l| l.benches().any(|b| b == &bench))
+                .map(|l| l.id)
+                .collect();
+            let count = doomed.len();
+            let mut effects = Vec::new();
+            for lease in doomed {
+                // Graced by default: the holder had no warning and may be
+                // mid-flash. `--now` is for when you know it is safe.
+                effects.extend(if immediate {
+                    state.leases.drop_lease(lease)
+                } else {
+                    state.leases.force_release(lease, t)
+                });
+            }
+            let outgoing = state.dispatch(effects);
+            drop(state);
+            for msg in outgoing {
+                msg.send();
+            }
+            out.send(&ToOperator::Released { count });
+            return Ok(());
+        }
+    };
+
+    out.send(&reply);
+    Ok(())
+}
+
+fn lease_view(
+    state: &crate::state::State,
+    lease: &benchd_core::lease::Lease,
+    _now: u64,
+) -> LeaseView {
+    LeaseView {
+        id: lease.id.0,
+        owner: state
+            .leases
+            .session(lease.session)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| lease.session.to_string()),
+        slots: lease.slots.clone(),
+        expires_at: lease.expires_at,
+        state: match lease.state {
+            benchd_core::lease::LeaseState::Held => "held".into(),
+            benchd_core::lease::LeaseState::Revoking { .. } => "revoking".into(),
+        },
+        reason: lease.reason.clone(),
+    }
 }
 
 // ---------------------------------------------------------------------------

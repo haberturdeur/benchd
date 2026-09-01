@@ -641,6 +641,7 @@ None blocking.
 | # | Question | State |
 |---|---|---|
 | Q10 | Relay latency for JTAG/high-rate transports | **Out of scope.** Serial only for now (~11 KB/s), where the extra RTT is noise. Revisit if a JTAG bench ever exists. |
+| Q12 | Is our USB/IP handshake byte-correct? | **Yes.** Verified against stock `usbipd`/`usbip` and by a live loopback import: DTR/RTS auto-reset works through the relay and the ESP32 ROM banner comes back. |
 | Q11 | Can `usbipd` bind loopback-only? | **Moot — we don't run it.** It binds wildcard with no auth, so instead both ends dial out and hand the kernel the resulting fd (D5). No listening socket to confine. |
 | Q12 | Are the `OP_REQ_IMPORT`/`OP_REP_IMPORT` structs implemented byte-correctly? | open — differential-test against stock `usbip`/`usbipd` in both directions |
 
@@ -667,7 +668,7 @@ revisit-with-evidence, not now.
 | Wire messages + JSON line protocol | done, tested |
 | Coordinator daemon | working end-to-end |
 | Host / client daemons | specified |
-| USB/IP handshake + sysfs fd handoff | specified, not started |
+| USB/IP handshake + sysfs fd handoff | done, verified on hardware |
 | Skill | not started |
 
 No persistence layer appears here, and that is the point of D6. No schema language

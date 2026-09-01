@@ -11,7 +11,7 @@ name = "benchd-host"
 path = "src/main.rs"
 
 [dependencies]
-benchd-core = { workspace = true }
+benchd-core = { workspace = true, features = ["usbip"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

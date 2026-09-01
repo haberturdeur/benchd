@@ -14,8 +14,8 @@ claim { dut: [soc=esp32s3, psram=octal] }  ttl=15m  reason="wifi reconnect regre
 
 ## Status
 
-Working end-to-end on real hardware, installed as systemd units. Remote benches
-(USB/IP) are specified but not implemented; everything else runs.
+Working end-to-end on real hardware, installed as systemd units, including remote
+benches forwarded over USB/IP.
 
 | Component | State |
 |---|---|
@@ -30,7 +30,7 @@ Working end-to-end on real hardware, installed as systemd units. Remote benches
 | Client daemon + bind-mount materialiser | done |
 | MCP shim (5 tools) | done |
 | Skill | done |
-| USB/IP remote benches | specified, not implemented |
+| USB/IP remote benches | done — verified by loopback on real hardware |
 | Multi-board benches | done, tested |
 | Coordinator (leases, reaper) | specified |
 | Wire messages (serde enums, JSON lines) | specified |
@@ -97,7 +97,7 @@ Then point an agent at it:
 ## Build
 
 ```sh
-cargo test           # 48 tests, incl. a property test over random inventories
+cargo test           # 56 tests, incl. a property test over random inventories
 cargo clippy --all-targets
 ```
 

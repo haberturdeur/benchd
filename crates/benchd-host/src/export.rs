@@ -4,10 +4,9 @@
 //!
 //! * **Co-located** — nothing to do. The client bind-mounts the real inode, so
 //!   `export` is bookkeeping only.
-//! * **Remote** — the device is bound to `usbip-host` and its socket handed to
-//!   the kernel. We never run `usbipd`: it binds wildcard with no authentication
-//!   (verified in its source), so we dial out and hand the kernel the resulting
-//!   fd instead. Nothing here ever listens.
+//! * **Remote** — the device is bound to `usbip-host`, we dial the coordinator,
+//!   answer the client's import request over the relayed connection, and hand
+//!   the socket to the kernel. We never run `usbipd` and never listen (D5).
 //!
 //! Everything is **epoch-fenced and idempotent**. A delayed instruction for a
 //! superseded lease must be dropped, not obeyed: obeying it would hand live
@@ -16,11 +15,16 @@
 use std::collections::BTreeMap;
 
 use benchd_core::lease::{Epoch, LeaseId, SessionId};
-use benchd_core::wire::{BenchSpec, ChannelKey, Outcome};
+use benchd_core::model::Resource;
+use benchd_core::sysfs;
+use benchd_core::usbip::{self, UsbDevice};
+use benchd_core::wire::{BenchSpec, ChannelHello, ChannelKey, ChannelSide, Outcome};
+use futures::SinkExt;
+use tokio_util::codec::{FramedWrite, LinesCodec};
 
-/// What this host currently has exported.
 pub struct Exports {
     spec: BenchSpec,
+    coordinator: String,
     /// Highest epoch seen for this bench. Anything lower is stale.
     seen: Epoch,
     active: BTreeMap<LeaseId, Active>,
@@ -32,33 +36,48 @@ struct Active {
     /// under versus which one the coordinator thinks is current.
     epoch: Epoch,
     session: SessionId,
-    channel: Option<ChannelKey>,
+    /// Busids handed to the kernel, needing an explicit teardown.
+    exported: Vec<String>,
 }
 
 impl Exports {
-    pub fn new(spec: BenchSpec) -> Self {
-        Exports { spec, seen: Epoch(0), active: BTreeMap::new() }
+    pub fn new(spec: BenchSpec, coordinator: String) -> Self {
+        Exports { spec, coordinator, seen: Epoch(0), active: BTreeMap::new() }
     }
 
     /// Undo anything a previous incarnation of this process left behind.
     ///
-    /// The kernel takes its own reference to a handed-over socket, so an export
+    /// The kernel keeps its own reference to a handed-over socket, so an export
     /// outlives the process that made it. Without this, a restart would leave
-    /// hardware reachable by an agent whose lease no longer exists — violating
-    /// the whole point of the system by accident (D6).
+    /// hardware reachable by an agent whose lease no longer exists (D6).
     pub async fn clear_stale(&mut self) {
-        for (name, resource) in &self.spec.resources {
-            if let benchd_core::model::Resource::Usb { busid } = resource {
-                if is_bound(busid).await {
-                    tracing::warn!(%name, %busid, "clearing a stale export from a previous run");
-                    unbind(busid).await;
-                }
+        for (_, busid) in self.busids() {
+            if sysfs::is_bound(&busid) {
+                tracing::warn!(%busid, "clearing a stale export from a previous run");
+                sysfs::unbind(&busid).await;
             }
         }
     }
 
-    /// Accept an instruction only if it is at least as new as everything we
-    /// have seen for this bench.
+    /// Every USB busid this bench can export.
+    ///
+    /// A serial resource identified by a by-id path is resolved to its USB
+    /// device here, so a bench does not have to be written twice to work both
+    /// locally and remotely.
+    fn busids(&self) -> Vec<(String, String)> {
+        self.spec
+            .resources
+            .iter()
+            .filter_map(|(name, r)| {
+                let busid = match r {
+                    Resource::Usb { busid } => Some(busid.clone()),
+                    Resource::Serial { by_id } => busid_for_tty(by_id),
+                }?;
+                Some((name.clone(), busid))
+            })
+            .collect()
+    }
+
     fn fence(&mut self, epoch: Epoch) -> Result<(), Outcome> {
         if epoch < self.seen {
             tracing::warn!(?epoch, seen = ?self.seen, "dropping a stale instruction");
@@ -73,7 +92,7 @@ impl Exports {
         lease: LeaseId,
         epoch: Epoch,
         session: SessionId,
-        channel: Option<ChannelKey>,
+        relay: bool,
     ) -> Outcome {
         if let Err(stale) = self.fence(epoch) {
             return stale;
@@ -82,29 +101,90 @@ impl Exports {
             return Outcome::Ok; // idempotent: a retry is not an error
         }
 
-        match &channel {
-            None => {
-                tracing::info!(bench = %self.spec.id, %lease, ?epoch, "exported (co-located)");
+        if !relay {
+            tracing::info!(bench = %self.spec.id, %lease, ?epoch, "exported (co-located)");
+            self.active.insert(lease, Active { epoch, session, exported: Vec::new() });
+            return Outcome::Ok;
+        }
+
+        let busids = self.busids();
+        if busids.is_empty() {
+            return Outcome::Failed {
+                detail: format!(
+                    "bench {} has no USB device to export remotely \
+                     (a serial resource must resolve to a USB device)",
+                    self.spec.id
+                ),
+            };
+        }
+
+        let mut exported = Vec::new();
+        for (resource, busid) in &busids {
+            // Both ends derive the same channel key from facts they already
+            // have, so nothing has to be threaded between two messages.
+            let key = benchd_core::wire::channel_key(lease, epoch, &self.spec.id, resource);
+            if let Err(err) = sysfs::bind(busid).await {
+                self.tear_down(&exported).await;
+                return Outcome::Failed { detail: format!("usbip bind {busid}: {err}") };
             }
-            Some(key) => {
-                // Remote: bind every USB resource so the kernel will accept a
-                // socket for it. The relay connection itself is opened lazily
-                // when the client dials in with this key.
-                for (name, resource) in &self.spec.resources {
-                    if let benchd_core::model::Resource::Usb { busid } = resource {
-                        if !bind(busid).await {
-                            return Outcome::Failed {
-                                detail: format!("failed to bind {name} ({busid})"),
-                            };
-                        }
-                    }
+            let device = match describe(busid).await {
+                Ok(device) => device,
+                Err(err) => {
+                    self.tear_down(&exported).await;
+                    return Outcome::Failed { detail: format!("reading {busid}: {err}") };
                 }
-                tracing::info!(bench = %self.spec.id, %lease, ?epoch, channel = %key.0, "exported (relayed)");
+            };
+            match self.serve_channel(&key, device).await {
+                Ok(()) => exported.push(busid.clone()),
+                Err(err) => {
+                    self.tear_down(&exported).await;
+                    return Outcome::Failed { detail: format!("exporting {busid}: {err}") };
+                }
             }
         }
 
-        self.active.insert(lease, Active { epoch, session, channel });
+        tracing::info!(
+            bench = %self.spec.id, %lease, ?epoch,
+            devices = exported.len(), "exported (relayed)"
+        );
+        self.active.insert(lease, Active { epoch, session, exported });
         Outcome::Ok
+    }
+
+    /// Dial the coordinator, answer the import request, hand over the socket.
+    async fn serve_channel(
+        &self,
+        key: &ChannelKey,
+        device: UsbDevice,
+    ) -> Result<(), std::io::Error> {
+        let stream = tokio::net::TcpStream::connect(&self.coordinator).await?;
+        stream.set_nodelay(true).ok();
+        let (read, write) = stream.into_split();
+
+        // One line of JSON to identify the channel, then the socket is opaque
+        // USB/IP bytes for the rest of its life.
+        let mut sink = FramedWrite::new(write, LinesCodec::new());
+        let hello = ChannelHello { channel: key.clone(), side: ChannelSide::Host };
+        sink.send(serde_json::to_string(&hello)?)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        let mut stream = read
+            .reunite(sink.into_inner())
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        let busid = device.busid.clone();
+        tracing::info!(channel = %key.0, %busid, "data channel open; awaiting import request");
+        usbip::accept_import(&mut stream, &device).await?;
+        sysfs::stub_attach(&busid, stream).await?;
+        tracing::info!(channel = %key.0, %busid, "handed the socket to the kernel");
+        Ok(())
+    }
+
+    async fn tear_down(&self, busids: &[String]) {
+        for busid in busids {
+            sysfs::unbind(busid).await;
+        }
     }
 
     pub async fn unexport(&mut self, lease: LeaseId, epoch: Epoch) -> Outcome {
@@ -116,13 +196,7 @@ impl Exports {
         let Some(active) = self.active.remove(&lease) else {
             return Outcome::Ok;
         };
-        if active.channel.is_some() {
-            for resource in self.spec.resources.values() {
-                if let benchd_core::model::Resource::Usb { busid } = resource {
-                    unbind(busid).await;
-                }
-            }
-        }
+        self.tear_down(&active.exported).await;
         tracing::info!(
             bench = %self.spec.id, %lease,
             exported_at = ?active.epoch, session = %active.session,
@@ -141,38 +215,58 @@ impl Exports {
     }
 }
 
-// ---------------------------------------------------------------------------
-// usbip plumbing
-//
-// Driven through sysfs rather than the `usbip` CLI: the operations we need are
-// two file writes, and shelling out would add a dependency and a parsing step
-// for no benefit.
-// ---------------------------------------------------------------------------
-
-const USBIP_HOST: &str = "/sys/bus/usb/drivers/usbip-host";
-
-async fn is_bound(busid: &str) -> bool {
-    tokio::fs::metadata(format!("{USBIP_HOST}/{busid}")).await.is_ok()
+/// Walk from a `/dev/serial/by-id` symlink up to the USB device that owns it.
+///
+/// `/sys/class/tty/ttyACM0/device` is the *interface* (`1-2:1.0`); the device is
+/// its parent, and the busid is the part before the colon.
+fn busid_for_tty(by_id: &std::path::Path) -> Option<String> {
+    let tty = std::fs::canonicalize(by_id).ok()?;
+    let name = tty.file_name()?.to_str()?;
+    let link = std::fs::read_link(format!("/sys/class/tty/{name}/device")).ok()?;
+    let interface = link.file_name()?.to_str()?;
+    interface.split(':').next().map(str::to_string)
 }
 
-async fn bind(busid: &str) -> bool {
-    if is_bound(busid).await {
-        return true;
+/// Read a bound device's descriptors out of sysfs.
+async fn describe(busid: &str) -> std::io::Result<UsbDevice> {
+    let base = format!("/sys/bus/usb/devices/{busid}");
+    async fn field(base: &str, name: &str) -> std::io::Result<String> {
+        Ok(tokio::fs::read_to_string(format!("{base}/{name}")).await?.trim().to_string())
     }
-    // Detach from whatever driver currently owns the interface, then attach the
-    // stub. Order matters: the stub refuses a device another driver holds.
-    let _ = tokio::fs::write(format!("/sys/bus/usb/devices/{busid}/driver/unbind"), busid).await;
-    match tokio::fs::write(format!("{USBIP_HOST}/bind"), busid).await {
-        Ok(()) => true,
-        Err(err) => {
-            tracing::error!(%busid, ?err, "usbip bind failed");
-            false
-        }
+    fn hex(text: &str) -> u16 {
+        u16::from_str_radix(text.trim(), 16).unwrap_or(0)
     }
-}
+    fn dec<T: std::str::FromStr + Default>(text: &str) -> T {
+        text.trim().parse().unwrap_or_default()
+    }
 
-async fn unbind(busid: &str) {
-    if let Err(err) = tokio::fs::write(format!("{USBIP_HOST}/unbind"), busid).await {
-        tracing::debug!(%busid, ?err, "usbip unbind failed (probably already gone)");
-    }
+    let speed_text = field(&base, "speed").await.unwrap_or_default();
+    Ok(UsbDevice {
+        path: base.clone(),
+        busid: busid.to_string(),
+        busnum: dec(&field(&base, "busnum").await?),
+        devnum: dec(&field(&base, "devnum").await?),
+        // usb_device_speed: 1 = low, 2 = full, 3 = high, 5 = super.
+        speed: match speed_text.as_str() {
+            "1.5" => 1,
+            "12" => 2,
+            "480" => 3,
+            "5000" => 5,
+            "10000" => 6,
+            _ => 3,
+        },
+        id_vendor: hex(&field(&base, "idVendor").await?),
+        id_product: hex(&field(&base, "idProduct").await?),
+        bcd_device: hex(&field(&base, "bcdDevice").await.unwrap_or_default()),
+        b_device_class: dec(&field(&base, "bDeviceClass").await.unwrap_or_default()),
+        b_device_subclass: dec(&field(&base, "bDeviceSubClass").await.unwrap_or_default()),
+        b_device_protocol: dec(&field(&base, "bDeviceProtocol").await.unwrap_or_default()),
+        b_configuration_value: dec(
+            &field(&base, "bConfigurationValue").await.unwrap_or_default(),
+        ),
+        b_num_configurations: dec(
+            &field(&base, "bNumConfigurations").await.unwrap_or_default(),
+        ),
+        b_num_interfaces: dec(&field(&base, "bNumInterfaces").await.unwrap_or_default()),
+    })
 }
