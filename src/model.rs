@@ -78,6 +78,14 @@ pub struct Bench {
     pub enabled: bool,
 }
 
+impl Bench {
+    /// Resource names in stable order. A bench may hold several boards (D16);
+    /// claiming it yields every one of these.
+    pub fn resource_names(&self) -> Vec<&str> {
+        self.resources.keys().map(String::as_str).collect()
+    }
+}
+
 /// Tags a single slot must satisfy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Requirement {

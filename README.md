@@ -20,26 +20,47 @@ Early. The matcher is implemented and tested; the daemon is not built yet.
 |---|---|
 | Tags, vocabulary, implication closure | done, tested |
 | Inventory + TOML config | done, tested |
-| Matcher (superset match, best-fit, multi-slot, diagnosis) | done — 19 tests + property test |
+| Matcher (superset match, best-fit, multi-slot, diagnosis) | done — 21 tests + property test |
+| Multi-board benches | done, tested |
 | Policy engine | specified |
-| Lease manager + reaper | specified |
-| Materializer (bind-mount) | specified, blocked on sandbox question |
-| MCP server, skill | not started |
+| Coordinator (leases, reaper, reconcile) | specified |
+| Host (one per bench) | specified |
+| Client (MCP + sandbox materialiser) | specified |
+| Wire protocol | undecided |
 
 **Read [`docs/design.md`](docs/design.md) first.** It is authoritative: when the code
-and the design doc disagree, the doc wins. It records 15 numbered decisions with the
+and the design doc disagree, the doc wins. It records 20 numbered decisions with the
 alternatives that were rejected and why.
+
+## Design in one paragraph
+
+Three components. A **host** owns the hardware of exactly one **bench** (a fixed
+physical grouping — possibly several boards on one carrier — that is always claimed
+together). The **coordinator** is the single authority: inventory, matching, policy,
+lease state, reaper. The **client** is a privileged daemon on each agent machine that
+serves MCP and materialises device nodes into agent sandboxes. Benches carry
+`key=value` capability tags from a closed vocabulary, expanded through an implication
+graph (`soc=esp32s3` implies `family=esp32`, `jtag=builtin`, …). A **claim** names one
+or more **slots**, satisfied atomically or not at all, possibly from benches on
+different hosts; among adequate benches the matcher picks the *least capable* one,
+scored by the scarcity it would waste. A granted claim is a **lease** with a mandatory
+explicit TTL, renewable only by explicit call. Executors fence on a per-bench epoch,
+so a stale instruction can never hand out live hardware; and because every lease has a
+deadline, a network partition drains the lab rather than corrupting it.
 
 ## Layout
 
 ```
-docs/design.md          the design, decisions, and open questions
+docs/design.md          the design, 20 decisions, and open questions
 src/tags.rs             key=value vocabulary, validation, implication closure
 src/model.rs            benches, resources, claim requests, TOML config
 src/matcher.rs          matching, best-fit scoring, allocation, diagnosis
 tests/matcher.rs        behavioural spec + property test vs a brute-force oracle
 examples/inventory.toml example inventory
 ```
+
+The crate will split into a workspace (`benchd-core`, `-proto`, `-coordinator`,
+`-host`, `-client`) when the daemons land; today's code is all pure core.
 
 ## Build
 

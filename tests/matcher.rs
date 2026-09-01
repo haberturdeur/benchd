@@ -265,6 +265,62 @@ fn single_character_tag_keys_are_allowed() {
 }
 
 #[test]
+fn a_bench_may_hold_several_boards_and_they_are_claimed_together() {
+    // D16: a bench is a *physical grouping*, not a single board. A mesh rig whose
+    // three nodes share a carrier and a power rail is one bench; handing out one
+    // node while another agent drives the other two is meaningless.
+    let toml = r#"
+        [tags.soc]
+        weight = 0
+        [tags.soc.values.esp32c3]
+
+        [tags.topology]
+        [tags.topology.values.mesh]
+
+        [tags.nodes]
+        [tags.nodes.values."3"]
+
+        [benches."mesh-rig"]
+        description = "Three C3s on one carrier, shared power rail"
+        tags = ["soc=esp32c3", "topology=mesh", "nodes=3"]
+        [benches."mesh-rig".resources.node_a]
+        kind = "serial"
+        by_id = "/dev/serial/by-id/fake-a"
+        [benches."mesh-rig".resources.node_b]
+        kind = "serial"
+        by_id = "/dev/serial/by-id/fake-b"
+        [benches."mesh-rig".resources.node_c]
+        kind = "serial"
+        by_id = "/dev/serial/by-id/fake-c"
+    "#;
+
+    let inv = Inventory::from_toml_str(toml).unwrap();
+    let rig = &inv.benches["mesh-rig"];
+    assert_eq!(rig.resource_names(), vec!["node_a", "node_b", "node_c"]);
+
+    // One slot, one bench, three device nodes for the holder.
+    let req = claim(&[("dut", &["topology=mesh"])], Distinct::All);
+    let alloc = allocate_in(&inv, &req, &no_one_is_busy()).unwrap();
+    assert_eq!(alloc.assignment["dut"], "mesh-rig");
+    assert_eq!(inv.benches[&alloc.assignment["dut"]].resources.len(), 3);
+}
+
+#[test]
+fn tags_describe_the_whole_bench_not_individual_boards() {
+    // Corollary of D16: there is no way to ask for "the C3 inside the mesh rig".
+    // If boards within a bench differ in ways an agent must select on, that is
+    // evidence they should have been separate benches.
+    let inv = inventory();
+    for bench in inv.enabled_benches() {
+        let names: Vec<&str> = bench.tags.iter().map(|t| t.key.as_str()).collect();
+        assert!(
+            !names.contains(&"resource"),
+            "tags must not address individual resources"
+        );
+    }
+}
+
+#[test]
 fn implication_cycles_are_rejected_at_load_time() {
     let toml = r#"
         [tags.a]

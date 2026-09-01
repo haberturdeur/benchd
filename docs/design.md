@@ -35,13 +35,15 @@ that custody to be **real** rather than advisory.
 
 ## 3. Non-goals
 
-- **Authentication.** Identity is self-asserted. This is *policy*, not security —
-  see §9.
+- **Authentication of clients.** Client identity is self-asserted. This is *policy*,
+  not security — see §9. (Host identity is a different matter, and *is*
+  authenticated; see D18.)
 - **A test framework.** benchd hands out hardware. What you do with it is your
   business.
 - **Batch job scheduling.** Explicitly rejected; see D1.
-- **Multi-machine, for v1.** Designed for, not built yet; see D6.
-- **Power/USB-mux/SD-mux control, for v1.** Extension point exists; see D5.
+- **Driving the hardware for the agent.** No console, flash, or power tools in the
+  agent-facing surface; see D14. Power/mux control is a *host-side capability* used
+  during setup and teardown, not something agents call.
 
 ---
 
@@ -49,43 +51,91 @@ that custody to be **real** rather than advisory.
 
 | Concept | Definition |
 |---|---|
-| **Resource** | One physical thing: a serial device (by stable `/dev/serial/by-id` path), later a USB device for USB/IP, a relay, a probe. |
-| **Bench** | The unit of exclusion. A named set of resources that must be held together — the board *and* its USB-JTAG interface *and* the relay that power-cycles it. |
+| **Resource** | One physical thing: a serial device (by stable `/dev/serial/by-id` path), a USB device for USB/IP export, a relay, a probe. |
+| **Bench** | The unit of exclusion *and* of ownership. A named set of resources — possibly **several boards** — that are always held together. Lives on exactly one host. |
 | **Tag** | A `key=value` capability fact about a bench. `soc=esp32s3`, `psram=octal`. |
-| **Slot** | A named role within a claim: `dut`, `peer`. Each slot carries a requirement. |
-| **Claim** | A request for one or more slots, satisfied atomically or not at all. |
-| **Lease** | A granted claim: which benches, held by whom, until when. |
+| **Slot** | A named role within a claim: `dut`, `peer`. Each slot carries a requirement and is filled by one whole bench. |
+| **Claim** | A request for one or more slots, satisfied atomically or not at all. Slots may be filled by benches on *different hosts*. |
+| **Lease** | A granted claim: which benches, held by whom, until when. Carries a monotonic **epoch** per bench (D18). |
+| **Host** | A process that owns the hardware of one bench and performs export/teardown on instruction. Many hosts per machine. |
+| **Coordinator** | The single authority for inventory, matching, policy and lease state. |
+| **Client** | A privileged daemon on an agent machine: serves MCP to local agents, and materialises device nodes into their sandboxes. |
 
-A bench is the atom because a board rarely arrives alone. If two boards share an RF
-chamber, they are one bench — or the chamber is its own bench and you use
-anti-affinity.
+### A bench may contain several boards
+
+A bench is a *fixed physical grouping*, not a single board. A mesh test rig with
+three ESP32s wired to one carrier, a shared power rail and one relay is **one
+bench**: claiming it yields all three consoles at once.
+
+```toml
+[benches."mesh-rig"]
+tags = ["soc=esp32c3", "topology=mesh", "nodes=3"]
+[benches."mesh-rig".resources.node_a]
+kind = "serial"
+by_id = "/dev/serial/by-id/...-if00"
+[benches."mesh-rig".resources.node_b]
+# ...node_c, power, sniffer
+```
+
+All resources materialise together under the slot directory, one env var each:
+`$LAB_DUT_NODE_A`, `$LAB_DUT_NODE_B`, `$LAB_DUT_POWER`.
+
+**Bench-with-many-boards vs. multi-slot claim** — these look similar and are not:
+
+| | Use a **multi-resource bench** | Use a **multi-slot claim** |
+|---|---|---|
+| The boards are | physically wired together, or share a rail/chamber/hub | independent |
+| Grouping is decided by | the lab operator, in the inventory | the agent, per claim |
+| Can the parts be handed out separately? | never | yes, they are separate benches |
+| Example | a mesh carrier board; a DUT plus its RF chamber | "any S3 plus any other ESP32 to talk to it" |
+
+Rule of thumb: if separating them would be *physically meaningless*, it is one
+bench. If it is merely inconvenient, it is two benches and a multi-slot claim.
 
 ---
 
 ## 5. Architecture
 
+Three components. The hardware is owned by hosts, the authority is the coordinator,
+and the device node appears on the client.
+
 ```
-    agent (pi / claude / cursor)
-        │  MCP: tag_list, claim, renew, release, lease_status
-        ▼
-  ┌──────────────────────────────────────────┐
-  │ benchd (single process, runs as root)    │
-  │                                          │
-  │  matcher ── policy ── lease manager      │  ← single writer, one lock
-  │                           │              │
-  │                      materializer        │
-  └───────────────────────────┼──────────────┘
-                              ▼
-        /run/benchd/agents/<owner>/<lease-id>/<slot>/<resource>
-                              │  bind mount
-                              ▼
-                        /dev/ttyACM0
+  agent (pi / claude / cursor)
+      │ MCP over stdio
+      ▼
+ ┌──────────────────────────┐        ┌───────────────────────────────┐
+ │ CLIENT  (agent machine)  │        │ COORDINATOR                   │
+ │  · MCP server            │◀──────▶│  · inventory + matcher        │
+ │  · sandbox materialiser  │  gRPC  │  · policy + lease state       │
+ │  · runs as root          │        │  · reaper (single writer)     │
+ └──────────┬───────────────┘        └───────────────┬───────────────┘
+            │                                        │ gRPC (mTLS)
+            │ bind mount / usbip attach              │
+            ▼                                        ▼
+ /run/benchd/<owner>/<lease>/<slot>/<res>    ┌──────────────────┐
+                                             │ HOST (one bench) │ ×N
+                                             │ · owns the HW    │
+                                             │ · export/teardown│
+                                             │ · power, mux     │
+                                             └────────┬─────────┘
+                                                      ▼
+                                              /dev/ttyACM0, relay, …
 ```
 
-**Single writer is the core invariant.** Nothing but benchd acquires or releases a
-bench. Claim, renew, expiry and preemption are all serialised inside one process
-under one lock, so the classic read-then-force-release race cannot occur by
-construction. This is why the reaper is in-process rather than a separate service.
+**One host process per bench.** Blast radius of a wedged host is one bench; each can
+be restarted independently; ownership of a device node is unambiguous. Deployed as a
+systemd template unit, `benchd-host@mesh-rig.service`, so N benches is a config
+concern rather than an architectural one.
+
+**Same-machine is not a special case.** When the agent and the hardware share a
+machine, the client and host are simply two processes on that machine and the
+materialiser bind-mounts a local inode. Nothing in the protocol changes — which is
+the point of doing this now rather than retrofitting it (D6).
+
+**Authority is still single-writer, but it moved.** The coordinator is the only
+writer of lease state; hosts and clients are executors that never decide anything.
+Since they can now act on stale instructions, executors fence on a lease epoch —
+see D18, which is the piece that replaces the old in-process lock.
 
 ---
 
@@ -179,19 +229,34 @@ reservations exist in the scheduler yet both `client.py:1581` and
 `coordinator.py:1031` hardcode `filters["main"]`, and there is **no USB/IP support
 anywhere** in code, docs or issues.
 
-### D6. Local first, remote behind a trait
+### D6. Distributed from the start; same-machine is a degenerate case
 
-**Decision:** v1 is one machine. `Materializer` is a trait; the remote
-implementation is USB/IP.
+**Decision:** three components (coordinator, host, client) from day one. A
+single-machine lab runs all three on that machine and uses the same protocol.
 
-**Why USB/IP when we get there:** it is the only mechanism that yields a *genuine*
+**Why not local-first-with-a-trait, as originally planned:** the earlier plan put a
+`Materializer` trait behind a local implementation and deferred the network. That
+looks cheap and isn't, because distribution is not a backend detail — it changes
+*where authority lives*. A local build has one process holding a lock; a distributed
+build has executors that can act on stale instructions, and so needs fencing (D18),
+liveness (D19) and reconciliation (D20). Retrofitting those means rewriting the
+lease manager, not swapping a trait. Better to pay it now, while the lease manager
+doesn't exist yet.
+
+**What stays true:** the *materialiser* remains a trait, because the mechanism for
+getting a device node onto the client genuinely does vary — bind mount when host and
+client share a machine, USB/IP when they don't.
+
+**Why USB/IP for the remote case:** it is the only mechanism that yields a *genuine*
 `/dev/ttyUSB0` remotely, because the client's own kernel binds `cp210x`/`ch341`/
-`ftdi_sio` to the forwarded device. Full termios, real DTR/RTS, so auto-reset works.
-Revocation is kernel-level: `usbip unbind` makes the device vanish mid-operation.
+`ftdi_sio` to the forwarded device. Full termios, real DTR/RTS, so ESP32 auto-reset
+works. Revocation is kernel-level: `usbip unbind` on the host makes the device
+vanish from the client mid-operation.
 
-**Known costs:** the protocol is unauthenticated cleartext TCP and **must** be
-tunnelled (SSH/WireGuard, never port 3240 exposed); both ends need kernel modules;
-`attach` needs root on the client, so benchd's agent-side helper does it.
+**Known costs:** the USB/IP protocol is unauthenticated cleartext TCP and **must**
+be tunnelled (SSH/WireGuard; never expose port 3240); both ends need kernel modules;
+`usbip attach` needs root on the client, which is why the client is a privileged
+daemon rather than a library inside the agent (D17).
 
 ### D7. Tag vocabulary is closed, `key=value`, with implications
 
@@ -331,6 +396,100 @@ on).
 **Verified:** `rmcp` 3.2.0 (official `modelcontextprotocol/rust-sdk`), MSRV 1.88 —
 matches the installed toolchain exactly.
 
+### D16. A bench may hold several boards; resources materialise together
+
+**Decision:** a bench's resource map is arbitrary in size and kind. Claiming a bench
+materialises **all** of its resources under the slot directory.
+
+**Why:** a physical grouping is not always one board. A mesh rig with three ESP32s on
+a carrier sharing a power rail cannot be meaningfully split — handing out one node
+while another agent drives the other two produces nonsense. Making the bench the unit
+of exclusion at *whatever size the hardware actually is* keeps the guarantee honest.
+
+**Why not three benches plus an affinity constraint:** affinity would have to be
+satisfied atomically anyway, and it would let an agent ask for two of the three nodes
+— exactly the meaningless request we want to be unable to express. The inventory,
+written by the operator, is the right place to encode "these are inseparable".
+
+**Consequence:** tags describe the bench as a whole (`nodes=3`, `topology=mesh`), not
+any individual board. If boards within a bench differ in ways an agent must select
+on, that is evidence they should have been separate benches.
+
+### D17. The client is a privileged daemon, not a library
+
+**Decision:** the agent-side component is a long-running root daemon that both serves
+MCP to local agents *and* materialises device nodes into their sandboxes.
+
+**Why privileged:** the device node has to appear on the *client* machine — that is
+the whole requirement (Goal 2). Bind-mounting an inode needs `CAP_SYS_ADMIN`;
+`usbip attach` needs root. The agent itself must stay unprivileged, so something on
+its machine holds the privilege on its behalf.
+
+**Why one daemon rather than two:** an unprivileged MCP shim plus a privileged helper
+means more moving parts and its own IPC and authorisation between them — protecting
+against an attacker we have already declared out of scope (§9). One daemon, small
+surface, no agent-supplied strings reaching a syscall.
+
+**Consequence:** one client daemon per agent machine; per-agent identity travels in
+the request rather than being implied by the process.
+
+### D18. Executors fence on a lease epoch
+
+**Decision:** the coordinator is the only writer of lease state. Every grant carries a
+monotonically increasing `epoch` per bench. Hosts and clients record the highest epoch
+seen for a bench and **reject any instruction carrying a lower one**.
+
+**Why:** this replaces the in-process lock that a single-binary design got for free.
+Once executors sit on the far end of a network they can act on stale instructions.
+The classic failure: a delayed `materialize` for lease *N* arrives after *N* expired
+and *N+1* was granted to someone else — handing live hardware to an agent whose lease
+is gone, silently. A monotonic epoch makes that arrival detectably stale, and it is
+dropped.
+
+**Why not timestamps:** clock skew between machines is exactly what you cannot assume
+away, and the resulting failure is silent.
+
+**Consequence:** every host and client operation is idempotent and epoch-qualified.
+`unmaterialize(lease, epoch)` for an unknown lease is a no-op, not an error — the
+reaper will sometimes race a voluntary release and neither path may fail.
+
+### D19. Partition behaviour: the TTL is the failsafe
+
+**Decision:**
+
+- **Host unreachable** (heartbeat missed): the coordinator marks its benches
+  `unavailable` and stops matching them. Existing leases are *not* cancelled — the
+  agent may still be working fine against already-exported hardware.
+- **Coordinator unreachable:** hosts and clients **keep existing materialisations**
+  but refuse to create new ones. Leases drain as their TTLs expire, because the client
+  can no longer renew.
+- **Client unreachable:** nothing special. Its leases expire on schedule and the
+  coordinator instructs the host to tear down.
+
+**Why this split:** it makes the mandatory TTL (D11) double as the partition failsafe.
+Without an authority nobody can *grant*, so exclusivity cannot be violated; and since
+every lease already has a deadline, a partition outlasting the longest TTL leaves no
+hardware held. Safety without a consensus protocol.
+
+**Explicitly accepted:** during a coordinator outage the lab drains and does not
+refill. That is the right trade for a lab — losing availability is annoying, losing
+exclusivity corrupts test results.
+
+### D20. Reconcile from hosts, not from a database
+
+**Decision:** on startup the coordinator asks every host what it currently has
+exported and rebuilds lease state from those answers plus its own persisted metadata.
+Anything a host holds that the coordinator cannot account for is torn down.
+
+**Why:** hosts are ground truth for what is *physically* exported; a database only
+records what the coordinator once intended. Reconciling against reality closes the
+restart hole (formerly Q2): bind mounts and USB/IP attachments are kernel state that
+outlives every process here, so a naive restart orphans them — leaving hardware
+reachable by an agent whose lease no longer exists, violating D2 by accident.
+
+**Still needs persistence** for what hosts don't know: owner, expiry, reason, renewal
+budget. Losing those turns every in-flight lease into an orphan.
+
 ---
 
 ## 7. Component specifications
@@ -412,6 +571,47 @@ are **free right now**, and typical wait. Agents plan far better against
 availability than against a bare list, and it lets them relax a request *before*
 claiming.
 
+### 7.6 Coordinator — *specified, not written*
+
+The only writer of lease state. Holds inventory, matcher, policy, lease manager,
+reaper and persistence. Stateless with respect to hardware: it never touches a
+device, only instructs.
+
+- accepts host registrations and heartbeats; marks silent hosts' benches unavailable
+- serves `claim` / `renew` / `release` / `lease_status` / `tag_list` to clients
+- allocates epochs (D18) and instructs host then client, in that order
+- runs the reaper: grace → revoke → tear down
+- persists lease metadata; reconciles against hosts on startup (D20)
+
+**Ordering rule:** export on the host *before* materialising on the client, and tear
+down on the client *before* unexporting on the host. At no point may a client hold a
+node the host believes is free.
+
+### 7.7 Host — *specified, not written*
+
+Owns the hardware of exactly one bench. Deployed as `benchd-host@<bench>.service`.
+Dumb by design: it decides nothing, it only executes epoch-qualified instructions.
+
+- registers its bench definition and tags with the coordinator (pending Q9)
+- `export(lease, epoch, client)` → make resources reachable by that client
+  (no-op when co-located; `usbip bind` when remote)
+- `unexport(lease, epoch)` → idempotent teardown
+- `describe()` → what it currently has exported, for reconciliation (D20)
+- watches udev; reports `degraded` when a resource vanishes (Q3)
+- owns power/mux control, used for setup and teardown — never exposed to agents
+
+### 7.8 Client — *specified, not written*
+
+One privileged daemon per agent machine (D17).
+
+- serves MCP over stdio to local agents; carries per-agent identity in each request
+- materialises granted resources into that agent's sandbox and removes them on
+  revocation
+- renews on the agent's behalf **only when the agent explicitly calls `renew`** —
+  never automatically (D11)
+- fences on epoch; refuses new materialisations when the coordinator is unreachable
+  while leaving existing ones intact (D19)
+
 ---
 
 ## 8. What agents see when things go wrong
@@ -433,17 +633,27 @@ hardware and start power-cycling boards to "fix" an expired lease.
 
 ## 9. Security posture
 
-**benchd enforces policy, not security.** Identity is self-asserted — an agent
-claiming to be `tom` gets human limits. This stops honest mistakes and runaway
-agents. It stops nothing that is trying.
+**Client identity is self-asserted — policy, not security.** An agent claiming to be
+`tom` gets human limits. This stops honest mistakes and runaway agents. It stops
+nothing that is trying. For a single-user lab that is the correct trade; if it ever
+needs to be a boundary it goes in the transport (per-identity mTLS), not in the
+broker. Do not retrofit trust into the identity string.
 
-For a single-user lab this is the correct trade. If it ever needs to be a boundary,
-it goes in the transport (per-identity SSH or mTLS), not in the broker. Do not
-retrofit trust into the identity string.
+**Host identity is different and must be authenticated.** Introducing a network
+changes the threat model in one specific way: a rogue or spoofed *host* can advertise
+benches that don't exist, absorb claims, and silently deny the lab its hardware — or
+worse, mislead an agent into believing it is talking to a board it isn't.
+Coordinator↔host links therefore use mTLS with pinned certificates, and an unknown
+host is refused rather than registered. This is not a contradiction of the paragraph
+above: a lying client only harms itself, a lying host harms everyone.
 
-The privileged surface is small and should stay small: benchd runs as root and
-mounts device inodes into per-owner directories. It never executes agent-supplied
-strings, and paths are constructed from validated identifiers only.
+**USB/IP is never exposed.** Cleartext, unauthenticated, and it hands the client
+kernel a USB device. Tunnel it (SSH/WireGuard) or bind it to loopback; port 3240 must
+never be reachable.
+
+The privileged surface is small and should stay small: hosts and clients run as root,
+but both only execute epoch-qualified instructions from an authenticated coordinator,
+never agent-supplied strings, and build paths only from validated identifiers.
 
 ---
 
@@ -456,15 +666,16 @@ whether delivery is a directory bind-mount visible live in a running sandbox, a
 `/run/benchd/agents/<owner>` bind-mounted at `/dev/lab` at sandbox start. Wrong guess
 costs about an hour, not a rewrite.
 
-**Q2 — Do leases survive a benchd restart?** Bind mounts are kernel state and will
-outlive the process, so a naive restart orphans them and forgets who holds what.
-Options: persist leases (sqlite/JSON) and reconcile mounts on startup, or
-unmaterialize everything at startup and force re-claims. Leaning reconcile, since a
-restart shouldn't kill in-flight agent work. **Not yet designed.**
+**Q2 — Do leases survive a restart?** *Resolved by D20.* Coordinator persists lease
+metadata and reconciles against hosts on startup; anything a host holds that the
+coordinator cannot account for is torn down. The failure this closes was real: kernel
+state (bind mounts, USB/IP attachments) outlives every process here, so a naive
+restart would leave hardware reachable by an agent whose lease no longer existed.
 
-**Q3 — Device disappears mid-lease** (cable knocked, board resets into a state that
-re-enumerates). Does the lease survive and re-materialize, or fail? Leaning: keep the
-lease, surface `degraded` in `lease_status`, let the agent decide.
+**Q3 — Device disappears mid-lease** (cable knocked, board re-enumerates after
+reset). Does the lease survive and re-materialize, or fail? Leaning: the host detects
+it, reports `degraded`, the lease survives, and `lease_status` surfaces it so the
+agent decides. Needs the host to watch udev.
 
 **Q4 — Idle release.** TTL catches crashes; it doesn't catch an agent that claims a
 board then spends 12 minutes reading source. Detect via no open fd on the node for N
@@ -476,7 +687,35 @@ matching. v2.
 
 **Q6 — Repo layout.** *Resolved 2026-09.* The Rust tree is the repository root and
 the Python prototype has been removed; it survives in git history at commit
-`08d6bf8` if a design decision ever needs archaeology.
+`08d6bf8` if a design decision ever needs archaeology. **Superseded by Q7:** the
+three-component split needs a workspace.
+
+**Q7 — Crate layout for three components.** Proposed:
+
+```
+benchd-core         tags, model, matcher, policy   (pure, no I/O — today's code)
+benchd-proto        wire types + generated gRPC stubs
+benchd-coordinator  inventory, lease manager, reaper, persistence
+benchd-host         owns one bench; export/teardown; power/mux
+benchd-client       MCP server + sandbox materialiser (root)
+```
+
+Core stays pure and property-tested; only the three binaries touch I/O. **Not yet
+done.**
+
+**Q8 — Transport.** gRPC/`tonic` (bidirectional streaming for heartbeats and lease
+push, generated stubs, mTLS via rustls) versus length-prefixed JSON over TLS or a
+unix socket. Leaning tonic — streaming liveness is a core requirement (D19) and
+hand-rolling it is how you get subtle bugs — at the cost of `.proto` files and a
+`build.rs`. **Undecided.**
+
+**Q9 — Where does inventory live?** The coordinator needs to match on benches it does
+not own. Either the coordinator holds the whole inventory file (simple; but bench
+config lives away from the hardware), or each host declares its own bench and
+registers it upward (config next to the hardware; coordinator's view becomes
+dynamic). Leaning host-declares-and-registers, since it makes adding a bench a
+single-machine operation. **Undecided — affects the config schema, so decide before
+writing the coordinator.**
 
 ---
 
@@ -485,16 +724,22 @@ the Python prototype has been removed; it survives in git history at commit
 | Component | State |
 |---|---|
 | Tag model, vocabulary, implications | done, tested |
-| Inventory + TOML config | done, tested |
+| Inventory + TOML config | done, tested (single-file; may move per Q9) |
 | Matcher (match, best-fit, multi-slot, diagnosis) | done, 19 tests + property test |
+| Multi-resource benches (D16) | model supports it; needs an example + test |
 | Policy engine | Python prototype only |
-| Lease manager + reaper | specified here |
-| Materializer (bind-mount) | Python prototype only; blocked on Q1 |
-| MCP server | not started |
+| Coordinator (lease manager, reaper, persistence, reconcile) | specified here |
+| Host (one per bench; export/teardown; heartbeat) | specified here |
+| Client (MCP + sandbox materialiser) | specified here |
+| Wire protocol | undecided (Q8) |
+| USB/IP backend | specified, not started |
 | Skill | not started |
-| USB/IP backend | deferred |
 
-**Suggested order:** close Q1 and Q2 → policy → leases → materializer → MCP → skill.
+**Suggested order:** decide Q8 and Q9 → split into a workspace (Q7) → policy →
+coordinator lease manager → host → client materialiser → MCP → skill.
+
+The existing matcher work is unaffected by the three-way split: it is pure, has no
+I/O, and becomes `benchd-core` unchanged.
 
 ---
 
