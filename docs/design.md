@@ -165,40 +165,52 @@ executors that can act on stale instructions, needing fencing (D7) and a failure
 *What stays a trait:* the materialiser, because the delivery mechanism genuinely varies
 — bind mount when co-located, USB/IP when not.
 
-### D5. Only the coordinator is reachable; gRPC streams both ways
+### D5. Only the coordinator is reachable; newline-delimited JSON over a held-open connection
 
-The coordinator is the sole listener. Hosts and clients always dial in and hold a
-long-lived bidirectional stream; instructions travel back down it.
+The coordinator is the sole listener. Hosts and clients always dial in and hold the
+connection open; instructions travel back down it. Messages are `serde` enums in a
+shared crate, serialised one JSON object per line.
 
-```proto
-rpc HostStream(stream HostMessage)     returns (stream CoordinatorMessage);
-rpc ClientStream(stream ClientMessage) returns (stream CoordinatorMessage);
-```
+*Why coordinator-only:* hosts live wherever the hardware is — lab VLAN, bench laptop,
+behind NAT. Requiring each to be addressable makes adding a bench an infrastructure
+task instead of a `systemctl start`, which is the tax that makes people give up and
+plug everything into one box.
 
-*Why:* hosts live wherever the hardware is — lab VLAN, bench laptop, behind NAT.
-Requiring each to be addressable makes adding a bench an infrastructure task instead of
-a `systemctl start`, which is the tax that makes people give up and plug everything
-into one box. It also reduces the attack surface to one port and simplifies certs: a
-server cert for the coordinator, client certs for everyone else.
+*Why a held-open connection:* the coordinator must reach executors it cannot dial, so
+pushing down an inbound connection is the only delivery mechanism available — not a
+convenience. The same connection carries heartbeats up and `revoking` down.
 
-*Why streams, specifically:* the coordinator must reach executors it cannot dial, so
-server-initiated messages over an inbound stream are the only delivery mechanism
-available — not a convenience. The same stream carries heartbeats up and `revoking`
-notifications down.
+*Why not gRPC/protobuf:* considered and rejected. Its advantages here were schema-
+driven codegen and cross-version compatibility, and **multi-version operation is an
+explicit non-goal** — all three binaries build from one workspace. Sharing the same
+Rust types directly is stronger sync than generating them from a `.proto`, and costs
+no schema language, no `build.rs`, no `prost`/`tonic`. What we hand-roll instead is
+small and dull:
 
-*Cost, accepted:* a stream is a message pipe, not RPC. Coordinator→executor calls need
-an application-level `request_id`, correlation and timeouts, which gRPC would have given
-free in the other direction.
+| Need | Cost |
+|---|---|
+| framing | newline-delimited; `tokio_util::codec::LinesCodec` |
+| correlation | a `request_id: u64` field |
+| liveness | heartbeat every `H`; miss `K` ⇒ dead |
+| reconnect | loop with backoff |
 
-**USB/IP runs the wrong way.** Per the kernel README, the "server" is the machine *with*
-the device — our host — listening on 3240, and the client dials in and holds that
-connection for the whole attachment. A direct remote attach therefore needs exactly the
-host reachability this decision refuses, so **remote device traffic is relayed through
-the coordinator**. That would have been unacceptable under a partition-tolerant design;
-under D6 it costs nothing, because coordinator death is already fatal. Costs: an extra
-hop on a latency-sensitive path (fine for 115200 serial, unproven for OpenOCD), and the
-coordinator as a bandwidth bottleneck. Co-located benches are unaffected — bind mount,
-no network.
+*Bonus, and it matters for a PoC:* the wire is human-readable. You can `socat` into
+the coordinator, watch a lease being granted, and paste it into a bug report.
+
+*Transport:* a unix socket while everything is co-located — `SO_PEERCRED` gives
+identity for free — and TCP later behind the same message layer, so D4's "local is not
+a special case" still holds.
+
+**The USB/IP relay does not use this path.** Per the kernel README the machine *with*
+the device listens on 3240 and the client dials in — exactly the reachability this
+decision refuses — so remote device traffic is relayed through the coordinator on a
+**separate raw byte stream**, not as JSON. Base64-ing URB traffic through a
+line-oriented control channel would be absurd. That relay was previously unacceptable
+because it put the data path through a component whose failure was meant to be
+survivable; under D6 coordinator death is already fatal, so the objection is gone.
+Costs: an extra hop on a latency-sensitive path (fine for 115200 serial, unproven for
+OpenOCD), and the coordinator as a bandwidth bottleneck. Co-located benches are
+unaffected — bind mount, no network.
 
 ### D6. The coordinator is a SPOF; any restart releases leases
 
@@ -377,14 +389,15 @@ it blunts the agent-assisted debugging this project relies on).
 matching the installed toolchain.
 
 ```
-benchd-core         tags, model, matcher, policy   pure, no I/O, property-tested
-benchd-proto        .proto + generated tonic stubs
+benchd-core         tags, model, matcher, policy, wire messages   pure, no I/O
 benchd-coordinator  matching, policy, lease state, reaper   (stateless)
 benchd-host         owns one bench; export/teardown; power/mux
 benchd-client       MCP server + sandbox materialiser (root)
 ```
 
-Core stays free of tonic/tokio/rustls so its property test stays millisecond-scale.
+Four crates, not five: with no `.proto` (D5) the wire messages are just `serde` types
+and live in core, which already depends on serde for config. Core stays free of tokio
+and rustls so its property test stays millisecond-scale.
 
 ---
 
@@ -460,17 +473,20 @@ not an error to escalate.
 `tom` gets human limits. This stops honest mistakes and runaway agents, nothing that is
 trying. If it ever must be a boundary, it goes in the transport, not the broker.
 
-**Host identity is authenticated.** A rogue host can advertise benches that don't exist,
-absorb claims, and mislead an agent about which board it's driving. Coordinator↔host
-uses mTLS with pinned certs; unknown hosts are refused. A lying client harms itself; a
-lying host harms everyone.
+**Host identity matters more than client identity.** A rogue host can advertise benches
+that don't exist, absorb claims, and mislead an agent about which board it's driving. A
+lying client harms only itself; a lying host harms everyone. **Not solved in the PoC:**
+while everything is co-located the coordinator listens on a unix socket and takes
+`SO_PEERCRED` as identity, which is sufficient and free. Host authentication (mTLS with
+pinned certs, unknown hosts refused) is required *before* a host runs on a different
+machine — that is the moment this becomes a real hole, not a theoretical one.
 
 **USB/IP is never exposed** — cleartext, unauthenticated, and it hands the client kernel
 a USB device. It is relayed through the coordinator (D5), never reachable directly.
 
-Hosts and clients run as root but only execute epoch-qualified instructions from an
-authenticated coordinator, never agent-supplied strings, and build paths only from
-validated identifiers.
+Hosts and clients run as root but only execute epoch-qualified instructions from the
+coordinator, never agent-supplied strings, and build paths only from validated
+identifiers.
 
 ---
 
@@ -479,6 +495,7 @@ validated identifiers.
 | # | Question | State |
 |---|---|---|
 | Q10 | Relay implementation for remote USB/IP: framing, flow control, backpressure — and does OpenOCD tolerate the extra hop? | open; only bites when remote benches land |
+| Q11 | Host auth (mTLS) and TCP transport | deliberately deferred; required before the first off-machine host (§9) |
 
 **Deferred ideas.** *Idle release* — TTL catches crashes, not an agent that claims a
 board then reads source for 12 minutes; detect via no open fd for N minutes. *Sticky
@@ -497,16 +514,17 @@ evidence, not now.
 | Matcher | done — 21 tests + property test |
 | Multi-resource benches | done, tested |
 | Policy engine | Python prototype only |
-| Workspace split | not started |
-| Wire protocol / `.proto` | not started |
+| Workspace split (4 crates) | not started |
+| Wire messages + JSON line protocol | not started |
 | Coordinator / host / client | specified |
 | USB/IP relay | specified, not started |
 | Skill | not started |
 
-No persistence layer appears here, and that is the point of D6.
+No persistence layer appears here, and that is the point of D6. No schema language
+either, and that is the point of D5.
 
-**Order:** workspace split → policy → `.proto` → coordinator lease manager → host →
-client materialiser → MCP → skill.
+**Order:** workspace split → policy → wire messages → coordinator lease manager → host
+→ client materialiser → MCP → skill.
 
 ---
 

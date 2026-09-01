@@ -26,7 +26,7 @@ Early. The matcher is implemented and tested; the daemon is not built yet.
 | Coordinator (leases, reaper, reconcile) | specified |
 | Host (one per bench) | specified |
 | Client (MCP + sandbox materialiser) | specified |
-| Wire protocol | undecided |
+| Wire messages (serde enums, JSON lines) | specified |
 
 **Read [`docs/design.md`](docs/design.md) first.** It is authoritative: when the code
 and the design doc disagree, the doc wins. It records 18 numbered decisions with the
@@ -59,8 +59,8 @@ tests/matcher.rs        behavioural spec + property test vs a brute-force oracle
 examples/inventory.toml example inventory
 ```
 
-The crate will split into a workspace (`benchd-core`, `-proto`, `-coordinator`,
-`-host`, `-client`) when the daemons land; today's code is all pure core.
+The crate will split into a workspace (`benchd-core`, `-coordinator`, `-host`,
+`-client`) when the daemons land; today's code is all pure core.
 
 ## Build
 
