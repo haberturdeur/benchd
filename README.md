@@ -29,7 +29,7 @@ Early. The matcher is implemented and tested; the daemon is not built yet.
 | Wire protocol | undecided |
 
 **Read [`docs/design.md`](docs/design.md) first.** It is authoritative: when the code
-and the design doc disagree, the doc wins. It records 20 numbered decisions with the
+and the design doc disagree, the doc wins. It records 23 numbered decisions with the
 alternatives that were rejected and why.
 
 ## Design in one paragraph
@@ -51,7 +51,7 @@ deadline, a network partition drains the lab rather than corrupting it.
 ## Layout
 
 ```
-docs/design.md          the design, 20 decisions, and open questions
+docs/design.md          the design, 23 decisions, and resolved questions
 src/tags.rs             key=value vocabulary, validation, implication closure
 src/model.rs            benches, resources, claim requests, TOML config
 src/matcher.rs          matching, best-fit scoring, allocation, diagnosis

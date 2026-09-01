@@ -475,20 +475,99 @@ hardware held. Safety without a consensus protocol.
 refill. That is the right trade for a lab — losing availability is annoying, losing
 exclusivity corrupts test results.
 
-### D20. Reconcile from hosts, not from a database
+### D20. Fail-stop restart: any restart releases the leases it touches
 
-**Decision:** on startup the coordinator asks every host what it currently has
-exported and rebuilds lease state from those answers plus its own persisted metadata.
-Anything a host holds that the coordinator cannot account for is torn down.
+**Decision:** restarting any component releases the leases it is responsible for.
+Coordinator restart releases everything; host restart releases the leases on its
+bench; client restart releases the leases held by agents on that machine. Every
+component tears down whatever it owns at startup, before accepting work.
 
-**Why:** hosts are ground truth for what is *physically* exported; a database only
-records what the coordinator once intended. Reconciling against reality closes the
-restart hole (formerly Q2): bind mounts and USB/IP attachments are kernel state that
-outlives every process here, so a naive restart orphans them — leaving hardware
-reachable by an agent whose lease no longer exists, violating D2 by accident.
+**Why:** the alternative — persist lease metadata and reconcile against hosts on
+startup — buys continuity for in-flight work at the cost of a database, a
+reconciliation protocol, and a class of bugs where recorded intent and physical
+reality disagree. Leases are minutes long. An agent that loses one gets a clear
+error and re-claims; the work it loses is bounded by its own TTL.
 
-**Still needs persistence** for what hosts don't know: owner, expiry, reason, renewal
-budget. Losing those turns every in-flight lease into an orphan.
+**What it buys, concretely:** the coordinator becomes **stateless** — no sqlite, no
+WAL, no schema migrations, no reconcile handshake. The restart hole that motivated
+this (kernel state outliving every process, leaving hardware reachable by an agent
+whose lease is gone) closes by construction rather than by careful code: on startup,
+nothing is exported and nothing is mounted, because each component just removed it.
+
+**Distinguishing a restart from a partition** — these demand opposite responses
+(D19 keeps materialisations alive across a partition; this decision destroys them
+across a restart), and an executor sees both as "the connection dropped". The
+coordinator therefore advertises an **incarnation id** — fresh per process start —
+on every connection. On reconnect:
+
+- **same incarnation** → it was a partition. Resume; existing leases stand.
+- **different incarnation** → it was a restart. Release everything owned, immediately.
+
+**Accepted cost:** a coordinator restart interrupts every agent in the lab at once.
+For a lab of this size that is a fair trade for deleting persistence entirely. If
+the lab ever gets big enough that this hurts, revisit — but revisit with evidence,
+not in anticipation.
+
+### D21. Transport is gRPC over mTLS
+
+**Decision:** `tonic` for all three links, with rustls and pinned certificates.
+
+**Why:** the architecture needs *server-initiated* messages in both directions — host
+heartbeats up (D19 liveness), instructions down, and prompt `revoking` notifications
+to clients so an agent learns its grace window started without polling. Bidirectional
+streaming is the core requirement, not a nicety, and hand-rolling stream liveness,
+reconnect and backpressure is exactly where subtle bugs live. Generated stubs also
+keep three separately-deployed binaries in sync, which matters more than usual when
+they can be restarted independently. mTLS is required by §9 for host identity anyway,
+and rustls gives it without OpenSSL.
+
+**Rejected:** length-prefixed JSON over TLS or a unix socket. Simpler to start, but
+we would reimplement streaming liveness and versioning by hand, and the local case
+would drift from the remote one — the thing D6 exists to prevent.
+
+**Cost, accepted:** `.proto` files, a `build.rs`, and prost/tonic in the dependency
+tree of everything except `benchd-core`.
+
+### D22. Central vocabulary, host-declared benches
+
+**Decision:** each host declares its own bench — resources, tags, description — and
+registers it with the coordinator at startup. The **tag vocabulary lives with the
+coordinator**, and a registration whose tags are not in it is *refused*.
+
+**Why host-declared benches:** the config belongs next to the hardware it describes.
+Adding a board becomes a single-machine operation — write the unit file, start it,
+done — with no edit to a central file that must be kept in sync with reality.
+
+**Why a central vocabulary:** if each host also defined its own tags, the closed
+vocabulary would stop being closed and rot into `esp32-s3` / `esp32s3` / `s3` across
+machines — precisely the failure D7 exists to prevent, with an extra dimension to rot
+along. Splitting them keeps both properties: *what exists* is local knowledge, *what
+things are called* is global.
+
+**Consequence, and it is a feature:** a typo in a host's bench definition fails at
+registration with a did-you-mean list, so the bench simply never appears rather than
+appearing and matching nothing. Vocabulary changes are a coordinator-side operation;
+adding a genuinely new capability is deliberately a two-step process.
+
+### D23. Workspace layout
+
+**Decision:**
+
+```
+benchd-core         tags, model, matcher, policy   pure, no I/O, property-tested
+benchd-proto        .proto + generated tonic stubs
+benchd-coordinator  inventory, matching, policy, lease state, reaper   (stateless)
+benchd-host         owns one bench; export/teardown; power/mux
+benchd-client       MCP server + sandbox materialiser (root)
+```
+
+**Why core stays separate and pure:** the matcher is the part with real algorithmic
+content and a property test worth keeping fast. Keeping tonic, tokio and rustls out
+of its dependency tree means it stays trivially testable and its tests stay
+millisecond-scale.
+
+**Why proto is its own crate:** all three binaries depend on it; nobody should depend
+on another binary to get wire types.
 
 ---
 
@@ -573,32 +652,40 @@ claiming.
 
 ### 7.6 Coordinator — *specified, not written*
 
-The only writer of lease state. Holds inventory, matcher, policy, lease manager,
-reaper and persistence. Stateless with respect to hardware: it never touches a
-device, only instructs.
+The only writer of lease state, and **stateless across restarts** (D20). Holds
+inventory, matcher, policy, lease manager and reaper. Never touches a device; it only
+instructs.
 
-- accepts host registrations and heartbeats; marks silent hosts' benches unavailable
+- holds the tag **vocabulary**; accepts host registrations and validates their
+  declared tags against it, refusing unknown tags with suggestions (D22)
+- tracks host liveness by heartbeat; marks silent hosts' benches unavailable
 - serves `claim` / `renew` / `release` / `lease_status` / `tag_list` to clients
-- allocates epochs (D18) and instructs host then client, in that order
+- allocates per-bench epochs (D18) and instructs host then client, in that order
 - runs the reaper: grace → revoke → tear down
-- persists lease metadata; reconciles against hosts on startup (D20)
+- advertises an **incarnation id** so executors can tell a restart from a partition
 
 **Ordering rule:** export on the host *before* materialising on the client, and tear
 down on the client *before* unexporting on the host. At no point may a client hold a
 node the host believes is free.
 
+**On startup:** it has no leases, by definition. Hosts and clients that reconnect and
+see a new incarnation release everything they hold.
+
 ### 7.7 Host — *specified, not written*
 
 Owns the hardware of exactly one bench. Deployed as `benchd-host@<bench>.service`.
-Dumb by design: it decides nothing, it only executes epoch-qualified instructions.
+Decides nothing; executes epoch-qualified instructions.
 
-- registers its bench definition and tags with the coordinator (pending Q9)
+- reads its own bench definition — resources, tags, description — from local config
+  and registers it upward (D22)
 - `export(lease, epoch, client)` → make resources reachable by that client
   (no-op when co-located; `usbip bind` when remote)
 - `unexport(lease, epoch)` → idempotent teardown
-- `describe()` → what it currently has exported, for reconciliation (D20)
-- watches udev; reports `degraded` when a resource vanishes (Q3)
-- owns power/mux control, used for setup and teardown — never exposed to agents
+- heartbeats; owns power/mux control for setup and teardown, never exposed to agents
+- **on startup:** unexports everything first, then registers (D20)
+- **on device loss:** a resource vanishing from udev is not recoverable in place — the
+  host reports the failure, releases its lease, and exits so systemd restarts it
+  clean (Q3). Restart re-registers only if the hardware is actually back.
 
 ### 7.8 Client — *specified, not written*
 
@@ -607,10 +694,17 @@ One privileged daemon per agent machine (D17).
 - serves MCP over stdio to local agents; carries per-agent identity in each request
 - materialises granted resources into that agent's sandbox and removes them on
   revocation
-- renews on the agent's behalf **only when the agent explicitly calls `renew`** —
-  never automatically (D11)
+- renews **only when the agent explicitly calls `renew`** — never automatically (D11)
 - fences on epoch; refuses new materialisations when the coordinator is unreachable
   while leaving existing ones intact (D19)
+- **on startup:** removes every materialisation under its root before serving (D20)
+
+**Sandbox mechanism (Q1): bubblewrap.** `/run/benchd/<owner>` is bind-mounted into the
+agent's sandbox at start. Because it is a *directory* bind mount, entries created and
+removed by the client appear and disappear inside a running sandbox with no restart
+and no cooperation from the agent — which is exactly the property that makes leases
+feel instantaneous. Chosen as the easiest starting point; the materialiser is a trait,
+so Docker (`--device` plus a cgroup update) or plain ACLs can follow.
 
 ---
 
@@ -625,8 +719,14 @@ This is a contract, and the skill must state it:
 | All busy | `Contended` + holders + ETA | wait and retry |
 | Over TTL limit | clamped, with a message | proceed with the shorter lease |
 | Lease expired mid-use | `ENOENT` / `EIO` on the device | **your lease ended** — reclaim; do *not* power-cycle |
+| A component restarted | lease gone, device gone, `lease_released` reason on next call | re-claim; the work since your last checkpoint is lost |
+| Bench hardware failed | lease released, bench disappears from `tag_list` | re-claim; the matcher will route around it |
 
-That last row matters: without it agents will interpret revocation as broken
+The last two rows are consequences of D20 and Q3: a restart or a device failure
+releases leases rather than trying to repair them. Agents must treat a lost lease as
+routine and re-claim, not as an error to escalate.
+
+The `ENOENT` row matters most: without it agents will interpret revocation as broken
 hardware and start power-cycling boards to "fix" an expired lease.
 
 ---
@@ -659,63 +759,31 @@ never agent-supplied strings, and build paths only from validated identifiers.
 
 ## 10. Open questions
 
-**Q1 — What are the agent sandboxes?** *(blocking the materializer)*
-bubblewrap, Docker/Podman, systemd-nspawn, VMs, or separate unix users? Determines
-whether delivery is a directory bind-mount visible live in a running sandbox, a
-`--device` + cgroup update, or plain ACLs. **Working assumption:** bubblewrap with
-`/run/benchd/agents/<owner>` bind-mounted at `/dev/lab` at sandbox start. Wrong guess
-costs about an hour, not a rewrite.
+All of the original questions are now closed. Resolutions are recorded here; the
+reasoning lives in the decisions they produced.
 
-**Q2 — Do leases survive a restart?** *Resolved by D20.* Coordinator persists lease
-metadata and reconciles against hosts on startup; anything a host holds that the
-coordinator cannot account for is torn down. The failure this closes was real: kernel
-state (bind mounts, USB/IP attachments) outlives every process here, so a naive
-restart would leave hardware reachable by an agent whose lease no longer existed.
+| # | Question | Resolution |
+|---|---|---|
+| Q1 | Agent sandbox mechanism | **bubblewrap**, as the easiest start. Materialiser is a trait, so Docker/ACLs can follow. §7.8 |
+| Q2 | Do leases survive a restart? | **No.** Any component restart releases the leases it owns — which deletes the persistence requirement entirely. D20 |
+| Q3 | Device disappears mid-lease | Fail gracefully: host releases, reports, and exits for a clean systemd restart. §7.7 |
+| Q4 | Idle release | Not now. TTL is sufficient; revisit with evidence. |
+| Q5 | Sticky reclaim | Agreed as a v2 idea, not v1. |
+| Q6 | Repo layout | Rust at the root; Python prototype removed (in history at `08d6bf8`). |
+| Q7 | Crate layout | Workspace of five crates, core kept pure. D23 |
+| Q8 | Transport | gRPC via `tonic` over mTLS. D21 |
+| Q9 | Where inventory lives | Each host declares its bench; the **vocabulary** stays central. D22 |
 
-**Q3 — Device disappears mid-lease** (cable knocked, board re-enumerates after
-reset). Does the lease survive and re-materialize, or fail? Leaning: the host detects
-it, reports `degraded`, the lease survives, and `lease_status` surfaces it so the
-agent decides. Needs the host to watch udev.
+### Remaining v2 ideas
 
-**Q4 — Idle release.** TTL catches crashes; it doesn't catch an agent that claims a
-board then spends 12 minutes reading source. Detect via no open fd on the node for N
-minutes. Biggest utilisation win once there are more than a couple of agents. v2.
-
-**Q5 — Sticky reclaim.** After release, a short soft-reservation window so the
-flash→test→tweak→reflash loop stays on one board. Best-effort, falls back to normal
-matching. v2.
-
-**Q6 — Repo layout.** *Resolved 2026-09.* The Rust tree is the repository root and
-the Python prototype has been removed; it survives in git history at commit
-`08d6bf8` if a design decision ever needs archaeology. **Superseded by Q7:** the
-three-component split needs a workspace.
-
-**Q7 — Crate layout for three components.** Proposed:
-
-```
-benchd-core         tags, model, matcher, policy   (pure, no I/O — today's code)
-benchd-proto        wire types + generated gRPC stubs
-benchd-coordinator  inventory, lease manager, reaper, persistence
-benchd-host         owns one bench; export/teardown; power/mux
-benchd-client       MCP server + sandbox materialiser (root)
-```
-
-Core stays pure and property-tested; only the three binaries touch I/O. **Not yet
-done.**
-
-**Q8 — Transport.** gRPC/`tonic` (bidirectional streaming for heartbeats and lease
-push, generated stubs, mTLS via rustls) versus length-prefixed JSON over TLS or a
-unix socket. Leaning tonic — streaming liveness is a core requirement (D19) and
-hand-rolling it is how you get subtle bugs — at the cost of `.proto` files and a
-`build.rs`. **Undecided.**
-
-**Q9 — Where does inventory live?** The coordinator needs to match on benches it does
-not own. Either the coordinator holds the whole inventory file (simple; but bench
-config lives away from the hardware), or each host declares its own bench and
-registers it upward (config next to the hardware; coordinator's view becomes
-dynamic). Leaning host-declares-and-registers, since it makes adding a bench a
-single-machine operation. **Undecided — affects the config schema, so decide before
-writing the coordinator.**
+- **Idle release** (Q4). TTL catches crashes; it does not catch an agent that claims a
+  board then spends 12 minutes reading source. Detect via no open fd on the node for N
+  minutes. Revisit when contention is observed, not before.
+- **Sticky reclaim** (Q5). A short soft-reservation window after release so the
+  flash→test→tweak→reflash loop stays on one board. Best-effort, falls back to normal
+  matching.
+- **Affinity between benches.** Two benches in the same RF chamber should be
+  co-allocated or mutually excluded. Not needed until such a chamber exists.
 
 ---
 
@@ -724,22 +792,25 @@ writing the coordinator.**
 | Component | State |
 |---|---|
 | Tag model, vocabulary, implications | done, tested |
-| Inventory + TOML config | done, tested (single-file; may move per Q9) |
-| Matcher (match, best-fit, multi-slot, diagnosis) | done, 19 tests + property test |
-| Multi-resource benches (D16) | model supports it; needs an example + test |
+| Bench/resource model, TOML config | done, tested (schema splits per D22) |
+| Matcher (match, best-fit, multi-slot, diagnosis) | done, 21 tests + property test |
+| Multi-resource benches (D16) | done, tested |
 | Policy engine | Python prototype only |
-| Coordinator (lease manager, reaper, persistence, reconcile) | specified here |
-| Host (one per bench; export/teardown; heartbeat) | specified here |
-| Client (MCP + sandbox materialiser) | specified here |
-| Wire protocol | undecided (Q8) |
+| Workspace split (D23) | not started |
+| Wire protocol / `.proto` (D21) | not started |
+| Coordinator (matching, lease state, reaper) | specified |
+| Host (one per bench, registers upward) | specified |
+| Client (MCP + bwrap materialiser) | specified |
 | USB/IP backend | specified, not started |
 | Skill | not started |
 
-**Suggested order:** decide Q8 and Q9 → split into a workspace (Q7) → policy →
-coordinator lease manager → host → client materialiser → MCP → skill.
+**No persistence layer appears in this table, and that is the point of D20.**
 
-The existing matcher work is unaffected by the three-way split: it is pure, has no
-I/O, and becomes `benchd-core` unchanged.
+**Suggested order:** workspace split → policy → `.proto` → coordinator lease manager
+→ host → client materialiser → MCP → skill.
+
+The existing matcher work is unaffected by any of this: it is pure, has no I/O, and
+becomes `benchd-core` unchanged.
 
 ---
 
