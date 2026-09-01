@@ -42,6 +42,8 @@ struct Args {
 #[derive(Clone)]
 struct Benchd {
     daemon: Arc<Daemon>,
+    // Read by the generated ServerHandler, not by anything we write.
+    #[allow(dead_code)]
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 

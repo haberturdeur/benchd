@@ -1,0 +1,17 @@
+[Unit]
+Description=benchd host for bench %i
+After=network.target
+# One process per bench: the blast radius of a wedged host is one bench, and
+# each can be restarted independently.
+
+[Service]
+ExecStart=/usr/local/bin/benchd-host --config /etc/benchd/benches/%i.toml --coordinator ${BENCHD_COORDINATOR}
+Environment=BENCHD_COORDINATOR=127.0.0.1:4711
+Restart=always
+RestartSec=3
+# Needs root only for usbip sysfs writes on remote benches; a serial-only,
+# co-located bench can drop to a user in the dialout/plugdev group.
+User=root
+
+[Install]
+WantedBy=multi-user.target

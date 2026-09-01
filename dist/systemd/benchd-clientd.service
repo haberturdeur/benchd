@@ -1,0 +1,17 @@
+[Unit]
+Description=benchd client daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/benchd-clientd --coordinator ${BENCHD_COORDINATOR} --root /run/benchd
+Environment=BENCHD_COORDINATOR=127.0.0.1:4711
+Restart=always
+RestartSec=3
+# Root: bind-mounting a device inode needs CAP_SYS_ADMIN, and usbip attach needs
+# root. The agent stays unprivileged, which is the point (D8).
+User=root
+# The materialiser must see mounts propagate into agent sandboxes.
+MountFlags=shared
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=benchd coordinator
+Documentation=https://github.com/tom/benchd
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/benchd-coordinator --config /etc/benchd/coordinator.toml
+Restart=always
+RestartSec=3
+# Stateless by design (D6): a restart releases every lease, so there is nothing
+# to persist and nothing to reconcile.
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target

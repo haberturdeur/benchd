@@ -14,7 +14,8 @@ claim { dut: [soc=esp32s3, psram=octal] }  ttl=15m  reason="wifi reconnect regre
 
 ## Status
 
-Early. The matcher is implemented and tested; the daemon is not built yet.
+Working end-to-end on real hardware, installed as systemd units. Remote benches
+(USB/IP) are specified but not implemented; everything else runs.
 
 | Component | State |
 |---|---|
@@ -24,11 +25,14 @@ Early. The matcher is implemented and tested; the daemon is not built yet.
 | Limits (single global set, no roles) | done, tested |
 | Lease lifecycle (claim/renew/release/revoke/expire) | done — 15 tests |
 | Wire protocol (JSON lines) | done, tested |
-| Coordinator daemon | working end-to-end |
+| Coordinator daemon | done |
+| Host daemon (one per bench) | done |
+| Client daemon + bind-mount materialiser | done |
+| MCP shim (5 tools) | done |
+| Skill | done |
+| USB/IP remote benches | specified, not implemented |
 | Multi-board benches | done, tested |
 | Coordinator (leases, reaper) | specified |
-| Host (one per bench) | specified |
-| Client daemon + per-agent MCP shim | specified |
 | Wire messages (serde enums, JSON lines) | specified |
 
 **Read [`docs/design.md`](docs/design.md) first.** It is authoritative: when the code
@@ -59,25 +63,41 @@ boundary belongs to the network, not the application.
 
 ```
 docs/design.md                    the design, 19 decisions, and open questions
-crates/benchd-core/
-  src/tags.rs                     key=value vocabulary, implication closure
-  src/model.rs                    benches, resources, claim requests, TOML config
-  src/matcher.rs                  matching, best-fit scoring, allocation, diagnosis
-  src/limits.rs                   how long a lease may be held, and how many
-  src/lease.rs                    lease lifecycle state machine (pure)
+dist/install.sh                   build, install binaries and systemd units
+skill/benchd/SKILL.md             the agent-facing skill
+crates/benchd-core/               pure: tags, model, matcher, limits, lease, wire
   tests/matcher.rs                behavioural spec + property test vs a brute-force oracle
   tests/lease.rs                  lease lifecycle spec
-examples/inventory.toml           example inventory
+crates/benchd-coordinator/        the only listener; matching, limits, lease state
+crates/benchd-host/               one process per bench; owns the hardware
+crates/benchd-client/             privileged: materialises device nodes
+crates/benchd-mcp/                per-agent stdio shim, five tools
+examples/coordinator.toml         limits + the central vocabulary
+examples/bench-*.toml             one file per bench, lives with the hardware
 ```
 
 `benchd-core` is pure: no I/O, no clock, no sockets. Time is a parameter and decisions
 come out as `Effect`s, so the whole lifecycle is testable without daemons or hardware.
-The `-coordinator`, `-host` and `-client` crates join the workspace as they land.
+
+## Install
+
+```sh
+dist/install.sh
+sudo systemctl enable --now benchd-coordinator benchd-clientd
+sudo systemctl enable --now benchd-host@esp32s3-a      # one per bench
+```
+
+Then point an agent at it:
+
+```json
+{"mcpServers": {"benchd": {"command": "/usr/local/bin/benchd-mcp",
+                           "env": {"BENCHD_IDENTITY": "agent-3"}}}}
+```
 
 ## Build
 
 ```sh
-cargo test           # 45 tests, incl. a property test over random inventories
+cargo test           # 48 tests, incl. a property test over random inventories
 cargo clippy --all-targets
 ```
 
