@@ -266,7 +266,7 @@ fn single_character_tag_keys_are_allowed() {
 
 #[test]
 fn a_bench_may_hold_several_boards_and_they_are_claimed_together() {
-    // D16: a bench is a *physical grouping*, not a single board. A mesh rig whose
+    // D11: a bench is a *physical grouping*, not a single board. A mesh rig whose
     // three nodes share a carrier and a power rail is one bench; handing out one
     // node while another agent drives the other two is meaningless.
     let toml = r#"
@@ -307,7 +307,7 @@ fn a_bench_may_hold_several_boards_and_they_are_claimed_together() {
 
 #[test]
 fn tags_describe_the_whole_bench_not_individual_boards() {
-    // Corollary of D16: there is no way to ask for "the C3 inside the mesh rig".
+    // Corollary of D11: there is no way to ask for "the C3 inside the mesh rig".
     // If boards within a bench differ in ways an agent must select on, that is
     // evidence they should have been separate benches.
     let inv = inventory();

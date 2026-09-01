@@ -79,7 +79,7 @@ pub struct Bench {
 }
 
 impl Bench {
-    /// Resource names in stable order. A bench may hold several boards (D16);
+    /// Resource names in stable order. A bench may hold several boards (D11);
     /// claiming it yields every one of these.
     pub fn resource_names(&self) -> Vec<&str> {
         self.resources.keys().map(String::as_str).collect()
