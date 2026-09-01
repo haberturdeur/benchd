@@ -207,50 +207,62 @@ heartbeat for liveness, a reconnect loop.
 
 *Bonus, and it matters for a PoC:* the wire is human-readable. `socat` is a debugger.
 
-**USB/IP runs the wrong way, so it is relayed.** Per the kernel README the machine
-*with* the device listens on 3240 and the client dials in — the opposite direction from
-our control plane, and impossible when the host is behind NAT. So a remote attachment
-is brokered by the coordinator, with **both ends dialling out**:
+**USB/IP runs the wrong way, so we hand the kernel our own socket.** Per the kernel
+README the machine *with* the device listens on 3240 and the client dials in — the
+opposite direction from our control plane, and impossible when the host is behind NAT.
+But nothing about USB/IP actually requires a listening socket. Both kernel drivers take
+an **already-connected fd**:
 
-```
-1.  coord → host    Export{lease,epoch}          host: usbip bind, usbipd on 127.0.0.1:3240
-2.  coord → host    OpenChannel{lease,epoch,K}   host dials OUT to coord, sends hello{K},
-                                                 splices that socket to 127.0.0.1:3240
-3.  coord → client  Materialize{lease,epoch,K}   client dials OUT to coord, sends hello{K},
-                                                 opens 127.0.0.1:P spliced to that socket
-4.  client          usbip --tcp-port P attach --remote 127.0.0.1 --busid …
-5.  client          bind-mount the resulting node into the agent's lease directory
+```c
+/* stub_dev.c  — host side  */  usbip_sockfd_store():  sockfd_lookup(sockfd); SOCK_STREAM?
+/* vhci_sysfs.c — client side */  attach_store(): "port sockfd devid speed"
+                                  /* @sockfd: socket descriptor of an established
+                                     TCP connection */
 ```
 
-The coordinator matches the two `hello{K}` sockets and runs `copy_bidirectional`
-between them. Neither host nor client ever accepts an inbound connection, so D5 holds
-for the data plane too.
+So neither end listens. Both dial **out** to the coordinator, which splices the two
+sockets; each side then performs its half of the USB/IP handshake on that socket and
+hands the fd to the kernel:
 
-*Why this is small:* each data channel is its **own TCP connection**, not a stream
-multiplexed over the JSON control channel. That means no framing, no channel ids on the
-wire after the hello, and no backpressure logic — TCP already provides flow control end
-to end. The coordinator's half is a channel registry plus a byte splice.
+```
+1.  coord → host    Export{lease,epoch}         host: bind device to usbip-host
+2.  coord → host    OpenChannel{lease,epoch,K}  host dials OUT, hello{K}
+3.  coord → client  Materialize{lease,epoch,K}  client dials OUT, hello{K}
+4.  coordinator      splices the two sockets matching K (copy_bidirectional)
+5.  host             OP_REQ_IMPORT/OP_REP_IMPORT handshake, then
+                     echo $fd > .../usbip_sockfd
+6.  client           same handshake, then
+                     echo "$port $fd $devid $speed" > .../vhci_hcd.0/attach
+7.  kernel           stub_rx/tx and vhci_rx/tx own the socket; both daemons leave the
+                     data path entirely
+8.  client           bind-mount the resulting node into the agent's lease directory
+```
 
-*`usbip --tcp-port` is what makes step 4 work* (verified in `tools/usb/usbip/src/usbip.c`)
-— the client picks a free loopback port per attachment, so several remote hosts can be
-attached on one client machine without colliding on 3240.
+*What this deletes:* no `usbipd` process, no listening socket on the host, no wildcard
+bind, no firewall rule, no loopback listener or port allocation on the client, and no
+`usbip --tcp-port` juggling. D5's "nothing listens except the coordinator" becomes
+*literally* true rather than true-modulo-a-firewall.
 
-*`usbipd` cannot be confined to loopback* (verified in `usbipd.c`: `do_getaddrinfo(NULL,
-family)` with `AI_PASSIVE` binds wildcard, and there is no bind-address option — `-4`/
-`-6` pick the address family only). Since the protocol has no authentication either —
-`recv_request_import` matches a busid and exports — **the host unit must firewall the
-usbip port to loopback**; see §9.
+*What it costs:* implementing the handshake — `OP_REQ_IMPORT` / `OP_REP_IMPORT`, a
+header plus `struct usbip_usb_device`, fixed-layout big-endian. Perhaps 200 lines. The
+layout must be exact, but it is **differentially testable**: our host against stock
+`usbip attach`, our client against stock `usbipd`.
 
-*Costs, accepted:* the coordinator sits in the data path, adding bandwidth load and one
-RTT per URB round trip. Irrelevant for 115200 serial (~11 KB/s); **unproven for OpenOCD
-or high-rate logging**, which are latency-sensitive — measure before relying on it
-(Q10). Coordinator death already kills the lab (D6), so putting data through it costs
-no availability that was not already gone.
+*Teardown:* writing `-1` to `usbip_sockfd` tears the stub down; the host does that for
+every bound device at startup, which is how D6's "unexport everything before accepting
+work" is implemented. The kernel takes its own reference via `sockfd_lookup`, so the
+socket survives the daemon that created it — exactly why an explicit teardown is
+required rather than optional.
 
-*Deliberately not done:* having the host dial the client directly when the client
-happens to be reachable. Only one end needs reachability for that shortcut, and it
-would cut the coordinator out of the data path — but it is a second code path for a
-topology we cannot rely on. Revisit if the relay measures badly.
+*Costs of the relay itself, accepted:* the coordinator sits in the data path, adding
+bandwidth load and one RTT per URB round trip. Irrelevant for 115200 serial (~11 KB/s);
+**unproven for OpenOCD or high-rate logging** — measure before relying on it (Q10).
+Coordinator death already kills the lab (D6), so this costs no availability that was
+not already gone.
+
+*Deliberately not done:* having the host dial the client directly when the client is
+reachable. It would cut the coordinator out of the data path, but it is a second code
+path for a topology we cannot rely on. Revisit if the relay measures badly.
 
 *Not used locally.* Co-located benches never touch USB/IP: the daemon bind-mounts the
 real inode. The control protocol is identical either way; only the `Materializer`
@@ -612,26 +624,13 @@ Hosts and clients run as root but only execute epoch-qualified instructions from
 coordinator, never agent-supplied strings, and build paths only from validated
 identifiers. That is defence against *bugs*, which remains worthwhile regardless.
 
-**One concrete exposure needs an actual mitigation.** `usbipd` always binds wildcard
-(verified in source; no bind-address option) and its protocol has no authentication, so
-anything that can reach the usbip port can import a bound device. That is a hole even
-under the trusted-LAN assumption, because it bypasses benchd entirely — a lease would
-say one thing while the hardware answered to someone else. The host unit therefore
-ships a firewall rule:
-
-```
-nft add rule inet filter input tcp dport 3240 iif != "lo" drop
-```
-
-Two things reduce the window but do not replace that rule: benchd only `usbip bind`s a
-device for the duration of a lease and unbinds at teardown, so between leases nothing is
-exportable at all; and `usbipd` excludes already-exported devices from its device list
-and refuses a second import (`ST_NA`), so a live lease cannot be stolen mid-flight.
-
-*Airtight alternative, not for the PoC:* run `usbipd` in a network namespace containing
-only `lo`, with the host daemon entering that namespace to reach it. More moving parts
-than this needs. *Not available:* `usbipd`'s optional TCP-wrappers hook — Arch's build
-has no libwrap.
+**We do not run `usbipd`, and that is partly a security decision.** It cannot be
+confined to an interface (verified in `usbipd.c`: `do_getaddrinfo(NULL, family)` with
+`AI_PASSIVE` binds wildcard; there is no bind-address option), and its protocol has no
+authentication — `recv_request_import` matches a busid and exports. Anything reaching
+that port could import a bound device, **bypassing benchd entirely**, so a lease would
+claim one thing while the hardware answered to someone else. Handing the kernel our own
+dialled-out socket (D5) removes the listening socket rather than firewalling it.
 
 ---
 
@@ -642,7 +641,8 @@ None blocking.
 | # | Question | State |
 |---|---|---|
 | Q10 | Does the relay's extra RTT matter for OpenOCD/JTAG? Serial is certainly fine. | open — **measure**, don't guess; only bites when remote benches land |
-| Q11 | Can `usbipd` bind loopback-only? | **No.** It binds wildcard and has no auth, so the host unit firewalls the port (§9). Resolved. |
+| Q11 | Can `usbipd` bind loopback-only? | **Moot — we don't run it.** It binds wildcard with no auth, so instead both ends dial out and hand the kernel the resulting fd (D5). No listening socket to confine. |
+| Q12 | Are the `OP_REQ_IMPORT`/`OP_REP_IMPORT` structs implemented byte-correctly? | open — differential-test against stock `usbip`/`usbipd` in both directions |
 
 **Deferred ideas.** *Idle release* — TTL catches crashes, not an agent that claims a
 board then reads source for 12 minutes; detect via no open fd for N minutes. *Sticky
@@ -665,7 +665,7 @@ revisit-with-evidence, not now.
 | Workspace split (4 crates) | not started |
 | Wire messages + JSON line protocol | not started |
 | Coordinator / host / client | specified |
-| USB/IP relay (dial-back rendezvous) | specified, not started |
+| USB/IP handshake + sysfs fd handoff | specified, not started |
 | Skill | not started |
 
 No persistence layer appears here, and that is the point of D6. No schema language
