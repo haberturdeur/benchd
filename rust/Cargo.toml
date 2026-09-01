@@ -1,0 +1,19 @@
+[package]
+name = "benchd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Lease-based hardware bench broker: claim by tags, get a real device node"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+strsim = "0.11"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

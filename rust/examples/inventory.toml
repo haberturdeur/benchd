@@ -1,0 +1,98 @@
+# benchd inventory - example, modelled on the hardware currently attached.
+#
+# The vocabulary is CLOSED: a tag not listed here is rejected at load time and
+# at claim time, with a did-you-mean list. That is deliberate. Free-form tags
+# rot into `esp32-s3` / `esp32s3` / `s3` within a week once agents are writing
+# the requests.
+
+open_keys = ["name"]
+
+# --- vocabulary ------------------------------------------------------------
+
+[tags.soc]
+description = "System-on-chip on the board"
+# weight 0: identity, not a contended capability. Being the only board with a
+# given SoC should not make the matcher hoard it.
+weight = 0
+[tags.soc.values.esp32]
+description = "Original ESP32, Xtensa dual-core"
+implies = ["family=esp32", "arch=xtensa", "net=wifi", "net=bt"]
+[tags.soc.values.esp32s3]
+description = "ESP32-S3, Xtensa dual-core with native USB"
+implies = ["family=esp32", "arch=xtensa", "net=wifi", "net=bt", "jtag=builtin", "usb=native"]
+[tags.soc.values.esp32c3]
+description = "ESP32-C3, RISC-V single core with native USB"
+implies = ["family=esp32", "arch=riscv", "net=wifi", "net=bt", "jtag=builtin", "usb=native"]
+
+[tags.family]
+description = "SoC family (implied by soc=, rarely set directly)"
+weight = 0
+[tags.family.values.esp32]
+description = "Espressif ESP32 family"
+
+[tags.arch]
+description = "CPU architecture (implied by soc=)"
+weight = 0
+[tags.arch.values.xtensa]
+description = "Tensilica Xtensa"
+[tags.arch.values.riscv]
+description = "RISC-V"
+
+[tags.usb]
+description = "How the board attaches to USB"
+weight = 0
+[tags.usb.values.native]
+description = "SoC's own USB peripheral"
+[tags.usb.values.cp2102n]
+description = "Silicon Labs CP2102N USB-UART bridge"
+
+[tags.net]
+description = "Radios available on the board"
+[tags.net.values.wifi]
+description = "2.4GHz Wi-Fi"
+[tags.net.values.bt]
+description = "Bluetooth / BLE"
+
+[tags.jtag]
+description = "Debug interface"
+[tags.jtag.values.builtin]
+description = "USB-JTAG built into the SoC, no external probe needed"
+[tags.jtag.values.external]
+description = "External JTAG probe wired to the bench"
+
+[tags.psram]
+description = "External PSRAM fitted"
+[tags.psram.values.none]
+description = "No PSRAM"
+[tags.psram.values.octal]
+description = "Octal-SPI PSRAM"
+
+[tags.flash]
+description = "Flash size"
+[tags.flash.values."4mb"]
+description = "4 MiB"
+[tags.flash.values."8mb"]
+description = "8 MiB"
+
+# --- benches ---------------------------------------------------------------
+
+[benches."esp32s3-a"]
+description = "ESP32-S3 devkit, native USB-JTAG"
+tags = ["soc=esp32s3", "psram=octal", "flash=8mb"]
+[benches."esp32s3-a".resources.console]
+kind = "serial"
+by_id = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_F4:12:FA:86:69:94-if00"
+
+[benches."esp32s3-b"]
+description = "ESP32-S3 devkit, native USB-JTAG"
+tags = ["soc=esp32s3", "psram=none", "flash=8mb"]
+[benches."esp32s3-b".resources.console]
+kind = "serial"
+by_id = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:84:27:40:98:90-if00"
+
+[benches."esp32-cp2102"]
+description = "Classic ESP32 devkit behind a CP2102N bridge"
+tags = ["soc=esp32", "usb=cp2102n", "psram=none", "flash=4mb"]
+[benches."esp32-cp2102".resources.console]
+kind = "serial"
+by_id = "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_8642368df26cef11bddfc5a7c169b110-if00-port0"

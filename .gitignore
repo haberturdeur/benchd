@@ -1,0 +1,6 @@
+target/
+
+# Python prototype leftovers (the prototype lives in git history only)
+__pycache__/
+*.py[cod]
+.venv/
