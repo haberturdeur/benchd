@@ -32,6 +32,9 @@ use benchd_core::wire::{ChannelHello, ChannelSide, Outcome, ResourceHandle};
 use futures::SinkExt;
 use tokio_util::codec::{FramedWrite, LinesCodec};
 
+/// A device node and the uid/gid it had before an agent was given it.
+type OwnershipToRestore = (PathBuf, (u32, u32));
+
 pub struct Materializer {
     root: PathBuf,
     coordinator: String,
@@ -45,7 +48,7 @@ pub struct Materializer {
     imported: BTreeMap<LeaseId, Vec<u32>>,
     /// Device ownership to put back on release. A bind mount shares the source
     /// inode, so handing a device to an agent changes it in `/dev` too.
-    restore: BTreeMap<LeaseId, Vec<(PathBuf, (u32, u32))>>,
+    restore: BTreeMap<LeaseId, Vec<OwnershipToRestore>>,
 }
 
 impl Materializer {
@@ -399,40 +402,17 @@ pub fn owner_dir(session: SessionId, name: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
         .take(48)
         .collect();
-    if safe.is_empty() {
-        session.to_string()
-    } else {
+    // Filtering alone is not enough once dots are allowed: a name of ".." keeps
+    // both of them and *is* the parent directory. Run the result through the
+    // same check used for slot names, which rejects "." and "..", and fall back
+    // to the session id if it does not survive.
+    if benchd_core::model::valid_component(&safe) {
         safe
+    } else {
+        session.to_string()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_owner_directory_cannot_escape_the_root() {
-        // The session id is always appended, so even a hostile name stays a
-        // single, unique directory component.
-        let dir = owner_dir(SessionId(3), "../../etc/passwd");
-        assert!(!dir.contains('/'));
-        assert!(!dir.contains(".."));
-        assert!(dir.ends_with("s3"));
-    }
-
-    #[test]
-    fn an_empty_name_still_yields_a_directory() {
-        assert_eq!(owner_dir(SessionId(7), "!!!"), "s7");
-    }
-}
-
-
-/// The uid/gid a device node currently has.
-async fn previous_owner(path: &Path) -> Option<(u32, u32)> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = tokio::fs::metadata(path).await.ok()?;
-    Some((meta.uid(), meta.gid()))
-}
 
 async fn chown(path: &Path, uid: u32) -> std::io::Result<()> {
     let gid = previous_owner(path).await.map(|(_, g)| g).unwrap_or(0);
@@ -446,4 +426,46 @@ async fn chown_gid(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     })
     .await
     .map_err(std::io::Error::other)?
+}
+
+
+
+
+/// The uid/gid a device node currently has.
+async fn previous_owner(path: &Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    Some((meta.uid(), meta.gid()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_owner_directory_cannot_escape_the_root() {
+        // Every one of these must end up a single, harmless component. ".." is
+        // the dangerous one: dots are allowed in names so that identities like
+        // `pi-4f2a.2` work, and filtering alone would let ".." straight through.
+        for hostile in ["../../etc/passwd", "..", ".", "/etc", "a/b", ""] {
+            let dir = owner_dir(SessionId(3), hostile);
+            assert!(!dir.contains('/'), "{hostile:?} produced {dir:?}");
+            assert_ne!(dir, "..", "{hostile:?} produced the parent directory");
+            assert_ne!(dir, ".", "{hostile:?} produced the current directory");
+            assert!(benchd_core::model::valid_component(&dir), "{hostile:?} -> {dir:?}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_identity_is_used_as_the_directory_name() {
+        // It has to be predictable: the sandbox bind-mounts this path before the
+        // coordinator has issued a session id.
+        assert_eq!(owner_dir(SessionId(3), "pi-4f2a"), "pi-4f2a");
+        assert_eq!(owner_dir(SessionId(3), "agent_1.2"), "agent_1.2");
+    }
+
+    #[test]
+    fn an_empty_name_still_yields_a_directory() {
+        assert_eq!(owner_dir(SessionId(7), "!!!"), "s7");
+    }
 }
