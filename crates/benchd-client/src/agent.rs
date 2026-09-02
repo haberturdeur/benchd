@@ -26,6 +26,14 @@ struct Agent {
     name: String,
     session: Option<SessionToken>,
     internal: Option<SessionId>,
+    /// The uid on the other end of the unix socket, from `SO_PEERCRED`.
+    ///
+    /// A materialised device node keeps the source device's ownership, which is
+    /// typically `root:uucp` and mode 0660 — so an unprivileged agent cannot
+    /// open the device it was just granted. Since the lease is exclusive and
+    /// this daemon is root, the node is handed to the agent's own uid for the
+    /// duration and given back on release.
+    uid: u32,
     out: mpsc::UnboundedSender<String>,
 }
 
@@ -43,6 +51,8 @@ struct Inner {
     lease_owner: BTreeMap<LeaseId, u64>,
     /// Internal session id -> directory component, for materialisation paths.
     owners: BTreeMap<SessionId, String>,
+    /// Internal session id -> the uid that should own its device nodes.
+    uids: BTreeMap<SessionId, u32>,
     next_agent: u64,
     next_request: u64,
 }
@@ -51,6 +61,11 @@ impl Agents {
     pub async fn owner_for(&self, session: SessionId) -> String {
         let inner = self.inner.lock().await;
         inner.owners.get(&session).cloned().unwrap_or_else(|| session.to_string())
+    }
+
+    /// Which uid should be able to open this session's devices.
+    pub async fn uid_for(&self, session: SessionId) -> Option<u32> {
+        self.inner.lock().await.uids.get(&session).copied()
     }
 
     /// Rewrite an agent's request into our id space and remember the mapping.
@@ -96,6 +111,9 @@ impl Agents {
                 // Remember where this session's device nodes will live, so a
                 // later Materialize can be placed without another round trip.
                 inner.owners.insert(*id, owner_dir(*id, &name));
+                if let Some(uid) = inner.agents.get(&agent_id).map(|a| a.uid) {
+                    inner.uids.insert(*id, uid);
+                }
             }
             ToClient::Granted { lease, .. } => {
                 inner.lease_owner.insert(*lease, agent_id);
@@ -250,6 +268,9 @@ pub async fn serve(shared: Arc<Shared>, path: &str) -> Result<()> {
 }
 
 async fn serve_agent(shared: Arc<Shared>, socket: tokio::net::UnixStream) -> Result<()> {
+    // Ask the kernel who is on the other end rather than trusting anything the
+    // peer says: this decides who gets to open a device node.
+    let uid = socket.peer_cred().map(|c| c.uid()).unwrap_or(0);
     let (read, write) = socket.into_split();
     let mut lines = FramedRead::new(read, LinesCodec::new());
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -269,7 +290,7 @@ async fn serve_agent(shared: Arc<Shared>, socket: tokio::net::UnixStream) -> Res
         let id = inner.next_agent;
         inner.agents.insert(
             id,
-            Agent { name: String::new(), session: None, internal: None, out: tx.clone() },
+            Agent { name: String::new(), session: None, internal: None, uid, out: tx.clone() },
         );
         id
     };

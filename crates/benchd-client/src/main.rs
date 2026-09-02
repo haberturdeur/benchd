@@ -252,9 +252,10 @@ async fn handle(shared: &Arc<Shared>, msg: ToClient) {
         // Instructions we execute.
         ToClient::Materialize { request, lease, epoch, session, slots } => {
             let owner = shared.agents.owner_for(session).await;
+            let uid = shared.agents.uid_for(session).await;
             let outcome = {
                 let mut m = shared.materializer.lock().await;
-                m.materialize(lease, epoch, &owner, &slots).await
+                m.materialize(lease, epoch, &owner, uid, &slots).await
             };
             if let benchd_core::wire::Outcome::Ok = outcome {
                 let paths = paths_for(&shared.root, &owner, lease, &slots);

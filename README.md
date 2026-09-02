@@ -30,7 +30,7 @@ benches forwarded over USB/IP.
 | Client daemon + bind-mount materialiser | done |
 | MCP shim (5 tools) | done |
 | Skill | done |
-| USB/IP remote benches | done — verified by loopback on real hardware |
+| USB/IP remote benches | done — verified across a real network between two machines |
 | Multi-board benches | done, tested |
 | Coordinator (leases, reaper) | specified |
 | Wire messages (serde enums, JSON lines) | specified |
@@ -99,7 +99,7 @@ Then point an agent at it:
 ## Build
 
 ```sh
-cargo test           # 71 tests, incl. a property test over random inventories
+cargo test           # 72 tests, incl. a property test over random inventories
 cargo clippy --all-targets
 ```
 

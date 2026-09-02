@@ -43,6 +43,9 @@ pub struct Materializer {
     active: BTreeMap<LeaseId, PathBuf>,
     /// vhci ports this lease imported, needing an explicit detach.
     imported: BTreeMap<LeaseId, Vec<u32>>,
+    /// Device ownership to put back on release. A bind mount shares the source
+    /// inode, so handing a device to an agent changes it in `/dev` too.
+    restore: BTreeMap<LeaseId, Vec<(PathBuf, (u32, u32))>>,
 }
 
 impl Materializer {
@@ -52,6 +55,7 @@ impl Materializer {
             coordinator,
             seen: BTreeMap::new(),
             active: BTreeMap::new(),
+            restore: BTreeMap::new(),
             imported: BTreeMap::new(),
         }
     }
@@ -161,6 +165,7 @@ impl Materializer {
         lease: LeaseId,
         epoch: benchd_core::lease::Epoch,
         owner: &str,
+        uid: Option<u32>,
         slots: &BTreeMap<String, BTreeMap<String, ResourceHandle>>,
     ) -> Outcome {
         if let Err(stale) = self.fence(lease, epoch) {
@@ -237,6 +242,24 @@ impl Materializer {
             }
         }
 
+        // Hand the devices to the agent that asked for them. Without this the
+        // node keeps the source device's `root:uucp 0660` and the unprivileged
+        // agent cannot open the hardware it just leased — which fails the one
+        // promise the whole system makes.
+        if let Some(uid) = uid {
+            for (_, dest) in &plan {
+                match previous_owner(dest).await {
+                    Some(prev) => {
+                        self.restore.entry(lease).or_default().push((dest.clone(), prev));
+                        if let Err(err) = chown(dest, uid).await {
+                            tracing::warn!(path = %dest.display(), ?err, "could not hand the device to the agent");
+                        }
+                    }
+                    None => tracing::warn!(path = %dest.display(), "could not read device ownership"),
+                }
+            }
+        }
+
         self.active.insert(lease, dir.clone());
         if !ports.is_empty() {
             self.imported.insert(lease, ports);
@@ -260,6 +283,11 @@ impl Materializer {
     /// Teardown without fencing, for paths that already know the lease is dead
     /// (a failed setup, or clearing state at startup).
     pub async fn unmaterialize_now(&mut self, lease: LeaseId, owner: &str) -> Outcome {
+        // Give the device back before unmounting: afterwards the path is gone
+        // and the inode is unreachable from here.
+        for (path, (uid, gid)) in self.restore.remove(&lease).unwrap_or_default() {
+            let _ = chown_gid(&path, uid, gid).await;
+        }
         // Idempotent: the reaper races voluntary releases, and neither path may
         // fail. Fall back to the computed path so a restarted daemon can still
         // clean up a lease it does not remember.
@@ -392,3 +420,24 @@ mod tests {
     }
 }
 
+
+/// The uid/gid a device node currently has.
+async fn previous_owner(path: &Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    Some((meta.uid(), meta.gid()))
+}
+
+async fn chown(path: &Path, uid: u32) -> std::io::Result<()> {
+    let gid = previous_owner(path).await.map(|(_, g)| g).unwrap_or(0);
+    chown_gid(path, uid, gid).await
+}
+
+async fn chown_gid(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::os::unix::fs::chown(&path, Some(uid), Some(gid))
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}

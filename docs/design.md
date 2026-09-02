@@ -763,6 +763,26 @@ cross-machine claim failed immediately with `usbip version mismatch: peer speaks
 0x0000`. The version check earned its keep: the failure was loud and precise
 rather than a corrupted stream.
 
+### What the cross-machine test proved
+
+Coordinator and host on one machine with the boards, client and agent on
+another, across a routed link (the client arrived from a gateway address, not
+its own). Verified:
+
+- an agent on the far machine claimed a board plugged into this one
+- it received a **real character device**, backed by its own `vhci_hcd`
+- the node was owned by the agent's uid, so unprivileged tools can open it
+- a DTR/RTS toggle over the network **reset the chip**, which answered with
+  `ESP-ROM:esp32c3-api1-20210207`
+
+That last one is the point of D2. Modem control survives the full round trip:
+host → coordinator relay → client → vhci → agent. An `rfc2217` bridge loses
+exactly this, and ESP32 auto-reset depends on it.
+
+The relay is the only path: this machine listens on one port (the coordinator),
+`usbipd` is not running at all, and the far machine holds no connection here
+except to that port.
+
 **The cause was uniform: every test exercised the happy path.** None asked what
 happens when a step fails. `tests/failure_paths.rs` exists to keep that from
 recurring, and immediately found the `tick` bug.
