@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use benchd_core::wire::{ChannelHello, ChannelKey, ChannelSide};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex};
 
@@ -32,8 +33,9 @@ pub struct Relay {
 
 struct Waiting {
     side: ChannelSide,
-    /// Hands the partner's socket to the task that arrived first.
-    deliver: oneshot::Sender<TcpStream>,
+    /// Hands the partner's socket, and anything already read from it, to the
+    /// task that arrived first.
+    deliver: oneshot::Sender<(TcpStream, Vec<u8>)>,
 }
 
 impl Relay {
@@ -42,7 +44,17 @@ impl Relay {
     /// Whichever side arrives first parks here; the second one hands over its
     /// socket and returns. The waiting task then does the copying, so exactly
     /// one task owns the pump.
-    pub async fn join(self: &Arc<Self>, hello: ChannelHello, stream: TcpStream) {
+    /// Take one side of a channel and splice it to the other.
+    ///
+    /// `leftover` is any payload that arrived in the same read as the hello
+    /// line. It belongs to the partner and must be forwarded before the copy
+    /// begins, or the far end sees a stream that starts mid-message.
+    pub async fn join(
+        self: &Arc<Self>,
+        hello: ChannelHello,
+        stream: TcpStream,
+        leftover: Vec<u8>,
+    ) {
         let key = hello.channel.clone();
 
         let partner = {
@@ -67,7 +79,7 @@ impl Relay {
         match partner {
             Some(other) => {
                 // We are second: hand our socket over and let the first task pump.
-                if other.deliver.send(stream).is_err() {
+                if other.deliver.send((stream, leftover)).is_err() {
                     tracing::warn!(channel = %key.0, "partner vanished before pairing");
                 }
             }
@@ -80,7 +92,27 @@ impl Relay {
 
                 let mut ours = stream;
                 match tokio::time::timeout(RENDEZVOUS_TIMEOUT, rx).await {
-                    Ok(Ok(mut theirs)) => {
+                    Ok(Ok((mut theirs, their_leftover))) => {
+                        // Flush what each side had already sent before the copy
+                        // starts, or the stream begins mid-message.
+                        if !leftover.is_empty() {
+                            tracing::debug!(
+                                channel = %key.0, bytes = leftover.len(),
+                                "forwarding payload that arrived with the hello"
+                            );
+                            if theirs.write_all(&leftover).await.is_err() {
+                                return;
+                            }
+                        }
+                        if !their_leftover.is_empty() {
+                            tracing::debug!(
+                                channel = %key.0, bytes = their_leftover.len(),
+                                "forwarding payload that arrived with the partner's hello"
+                            );
+                            if ours.write_all(&their_leftover).await.is_err() {
+                                return;
+                            }
+                        }
                         tracing::info!(channel = %key.0, "relaying");
                         match tokio::io::copy_bidirectional(&mut ours, &mut theirs).await {
                             Ok((a, b)) => {

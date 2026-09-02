@@ -35,11 +35,23 @@ pub async fn serve(shared: Arc<Shared>, socket: TcpStream, peer: SocketAddr) -> 
     let first = first?;
 
     if let Ok(hello) = serde_json::from_str::<ChannelHello>(&first) {
-        let stream = lines
-            .into_inner()
+        // `into_parts`, never `into_inner`: the line codec reads in chunks, so
+        // by the time it has produced the hello line it may already hold the
+        // first bytes of the USB/IP stream that follows. `into_inner` throws
+        // that buffer away.
+        //
+        // On loopback the hello and the protocol bytes almost always arrive in
+        // separate reads and nothing is lost. Across a real network they
+        // coalesce into one segment, and the far end then reads a header of
+        // zeroes — which is exactly how this was found, and why it survived
+        // every loopback test.
+        let parts = lines.into_parts();
+        let leftover = parts.read_buf;
+        let stream = parts
+            .io
             .reunite(write)
             .map_err(|e| anyhow::anyhow!("could not reunite the socket: {e}"))?;
-        Arc::clone(&shared.relay).join(hello, stream).await;
+        Arc::clone(&shared.relay).join(hello, stream, leftover.to_vec()).await;
         return Ok(());
     }
 

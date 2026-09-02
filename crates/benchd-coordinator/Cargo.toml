@@ -30,3 +30,6 @@ uuid = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "io-util"] }

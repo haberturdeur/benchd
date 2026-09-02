@@ -749,6 +749,20 @@ more than the individual bugs.
 | Medium | A bench whose previous host connection was half-open could not be re-registered until the liveness timeout | Registration refused duplicates instead of replacing them |
 | Medium | `unbind` left devices with no driver at all when `drivers_probe` raced the stub teardown | Single attempt, result ignored |
 
+### Third pass: the first test across a real network
+
+| Severity | Bug | Root cause |
+|---|---|---|
+| Critical | The coordinator discarded any payload the line codec had already buffered when a data channel switched from JSON to raw bytes, so the far end read a header of zeroes | `FramedRead::into_inner()` drops the read buffer; `into_parts()` returns it |
+
+Only a real network could find this. A data channel opens with one JSON line and
+is opaque bytes thereafter. On loopback the hello and the USB/IP bytes almost
+always arrive in separate reads, so nothing was lost and every loopback test
+passed. Across a routed link they coalesce into one segment, and the first
+cross-machine claim failed immediately with `usbip version mismatch: peer speaks
+0x0000`. The version check earned its keep: the failure was loud and precise
+rather than a corrupted stream.
+
 **The cause was uniform: every test exercised the happy path.** None asked what
 happens when a step fails. `tests/failure_paths.rs` exists to keep that from
 recurring, and immediately found the `tick` bug.
