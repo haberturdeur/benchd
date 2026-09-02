@@ -83,7 +83,8 @@ come out as `Effect`s, so the whole lifecycle is testable without daemons or har
 ## Install
 
 ```sh
-dist/install.sh
+dist/install.sh          # first time: binaries, config, systemd units
+dist/deploy.sh           # thereafter: rebuild, install, verify checksums
 sudo systemctl enable --now benchd-coordinator benchd-clientd
 sudo systemctl enable --now benchd-host@esp32s3-a      # one per bench
 ```
@@ -98,7 +99,7 @@ Then point an agent at it:
 ## Build
 
 ```sh
-cargo test           # 68 tests, incl. a property test over random inventories
+cargo test           # 71 tests, incl. a property test over random inventories
 cargo clippy --all-targets
 ```
 

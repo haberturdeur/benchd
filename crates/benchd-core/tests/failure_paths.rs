@@ -282,3 +282,47 @@ fn an_epoch_never_goes_backwards_for_a_bench() {
         m.release(s, g.lease, 1).unwrap();
     }
 }
+
+#[test]
+fn teardown_carries_the_epoch_it_was_created_at() {
+    // Teardown effects are produced after the lease is removed, so anything
+    // that looks the epoch up afterwards sees 0 — which an executor fencing on
+    // epoch rejects as stale, leaving the device node live for a lease that no
+    // longer exists. The epoch has to travel with the effect.
+    fn unmaterialize_epoch(effects: &[Effect], label: &str) -> benchd_core::lease::Epoch {
+        effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Unmaterialize { epoch, .. } => Some(*epoch),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{label}: no Unmaterialize"))
+    }
+
+    for (label, end) in [
+        ("release", 0usize),
+        ("drop_lease", 1),
+        ("end_session", 2),
+        ("expiry", 3),
+    ] {
+        let mut m = manager(Limits { grace: 5, ..Default::default() });
+        let s = m.register("agent");
+        let g = m.claim(s, &claim_named("dut", &["psram=octal"], 60), 0).unwrap();
+        let granted = *m.lease(g.lease).unwrap().epochs.values().next().unwrap();
+
+        let effects = match end {
+            0 => m.release(s, g.lease, 1).unwrap(),
+            1 => m.drop_lease(g.lease),
+            2 => m.end_session(s, 1),
+            _ => {
+                m.tick(55);
+                m.tick(60)
+            }
+        };
+        assert_eq!(
+            unmaterialize_epoch(&effects, label),
+            granted,
+            "{label}: teardown must carry the lease's epoch, not 0"
+        );
+    }
+}

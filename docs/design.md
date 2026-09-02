@@ -738,6 +738,17 @@ more than the individual bugs.
 | Medium | The client never fenced on epoch at all | Only the host implemented D7; the client relied on TCP ordering |
 | Medium | No liveness tracking: a wedged host with a live socket kept its bench matchable | Heartbeats were accepted and discarded |
 
+### Second pass: verifying the two things I had called unverified
+
+| Severity | Bug | Root cause |
+|---|---|---|
+| High | Teardown effects carried epoch 0, so the client's own fencing rejected them and the mount outlived the lease | The epoch was looked up *after* the lease was removed — a regression introduced by adding client-side fencing |
+| High | `free_vhci_port` ignored the hub column and could hand a full-speed device a SuperSpeed port | vhci lists both root hubs in one table; a single device always worked, a second one sometimes did not |
+| High | A host killed mid-export left its board bound to the stub with no tty, and identified its device *through* that tty — so it refused to start forever and the board stayed dead | Recovery keyed on the thing the failure destroys |
+| High | A sysfs write to a wedged usbip driver blocks forever, hanging a host at startup while systemd reports it active | No timeout on writes that normally take microseconds |
+| Medium | A bench whose previous host connection was half-open could not be re-registered until the liveness timeout | Registration refused duplicates instead of replacing them |
+| Medium | `unbind` left devices with no driver at all when `drivers_probe` raced the stub teardown | Single attempt, result ignored |
+
 **The cause was uniform: every test exercised the happy path.** None asked what
 happens when a step fails. `tests/failure_paths.rs` exists to keep that from
 recurring, and immediately found the `tick` bug.

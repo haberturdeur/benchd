@@ -117,7 +117,13 @@ pub struct Session {
 pub enum Effect {
     Export { bench: String, lease: LeaseId, epoch: Epoch, session: SessionId },
     Materialize { lease: LeaseId, session: SessionId, slots: BTreeMap<String, String> },
-    Unmaterialize { lease: LeaseId, session: SessionId },
+    /// Carries the epoch it was generated at.
+    ///
+    /// Teardown effects are produced *after* the lease is removed from the
+    /// manager, so anything that looks the epoch up later gets 0 — which the
+    /// client then fences out as stale, and the mount survives the lease. The
+    /// epoch has to travel with the effect.
+    Unmaterialize { lease: LeaseId, session: SessionId, epoch: Epoch },
     Unexport { bench: String, lease: LeaseId, epoch: Epoch },
     Notify { session: SessionId, event: LeaseEvent },
 }
@@ -518,8 +524,11 @@ impl LeaseManager {
 
 /// Tear down in the safe order: the client lets go before the host does.
 fn teardown_effects(lease: &Lease) -> Vec<Effect> {
+    // The highest of this lease's per-bench epochs: monotonic per lease, which
+    // is what the client fences on.
+    let epoch = lease.epochs.values().copied().max().unwrap_or(Epoch(0));
     let mut effects =
-        vec![Effect::Unmaterialize { lease: lease.id, session: lease.session }];
+        vec![Effect::Unmaterialize { lease: lease.id, session: lease.session, epoch }];
     for (bench, epoch) in &lease.epochs {
         effects.push(Effect::Unexport {
             bench: bench.clone(),

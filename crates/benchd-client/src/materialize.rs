@@ -92,7 +92,7 @@ impl Materializer {
             "importing"
         );
 
-        let port = sysfs::free_vhci_port().await.map_err(|e| e.to_string())?;
+        let port = sysfs::free_vhci_port(device.speed).await.map_err(|e| e.to_string())?;
 
         sysfs::vhci_attach(port, stream, device.devid(), device.speed)
             .await

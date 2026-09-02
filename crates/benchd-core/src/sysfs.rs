@@ -19,6 +19,32 @@ use tokio::net::TcpStream;
 const STUB: &str = "/sys/bus/usb/drivers/usbip-host";
 const VHCI: &str = "/sys/devices/platform/vhci_hcd.0";
 
+/// Longest we will wait for a single sysfs write.
+///
+/// These writes normally return in microseconds, but a wedged usbip driver can
+/// block one *forever* — tearing down a stub whose peer socket is in a bad state
+/// waits on kernel threads that never finish. Without a bound, a host hangs at
+/// startup with no output at all and systemd cheerfully reports it as active.
+/// A stuck driver is not something userspace can fix, so the only useful
+/// behaviour is to say so and carry on.
+const SYSFS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Write to sysfs, giving up rather than blocking forever.
+async fn write_sysfs(path: impl AsRef<std::path::Path>, value: &str) -> io::Result<()> {
+    let path = path.as_ref().to_path_buf();
+    match tokio::time::timeout(SYSFS_TIMEOUT, tokio::fs::write(&path, value)).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!(
+                path = %path.display(), value,
+                "sysfs write timed out; the usbip driver is wedged and needs a module \
+                 reload or a reboot"
+            );
+            Err(io::Error::new(io::ErrorKind::TimedOut, "sysfs write timed out"))
+        }
+    }
+}
+
 // -- host side --------------------------------------------------------------
 
 pub fn stub_path(busid: &str) -> PathBuf {
@@ -36,20 +62,92 @@ pub async fn bind(busid: &str) -> io::Result<()> {
     if is_bound(busid) {
         return Ok(());
     }
-    let _ = tokio::fs::write(format!("/sys/bus/usb/devices/{busid}/driver/unbind"), busid).await;
-    tokio::fs::write(format!("{STUB}/match_busid"), format!("add {busid}")).await.ok();
-    tokio::fs::write(format!("{STUB}/bind"), busid).await
+    let _ = write_sysfs(format!("/sys/bus/usb/devices/{busid}/driver/unbind"), busid).await;
+    let _ = write_sysfs(format!("{STUB}/match_busid"), &format!("add {busid}")).await;
+    write_sysfs(format!("{STUB}/bind"), busid).await
 }
 
 pub async fn unbind(busid: &str) {
     // Stop the kernel pumping first, then release the device. The reverse order
     // leaves a live socket attached to a device we no longer own.
-    let _ = tokio::fs::write(stub_path(busid).join("usbip_sockfd"), "-1").await;
-    let _ = tokio::fs::write(format!("{STUB}/unbind"), busid).await;
-    let _ = tokio::fs::write(format!("{STUB}/match_busid"), format!("del {busid}")).await;
-    // Put the device back under its normal driver so the board is usable
-    // locally again once the lease is over.
-    let _ = tokio::fs::write("/sys/bus/usb/drivers_probe", busid).await;
+    let _ = write_sysfs(stub_path(busid).join("usbip_sockfd"), "-1").await;
+    let _ = write_sysfs(format!("{STUB}/unbind"), busid).await;
+    let _ = write_sysfs(format!("{STUB}/match_busid"), &format!("del {busid}")).await;
+    reattach(busid).await;
+}
+
+/// Put a device back under its normal driver.
+///
+/// Worth retrying: immediately after `unbind` the kernel has often not finished
+/// tearing the stub down, and a single `drivers_probe` silently does nothing.
+/// The device is then left with no driver at all — physically present, no tty,
+/// invisible to everything that looks it up by `/dev/serial/by-id`. A board in
+/// that state stays dead until someone finds it by hand, so it is worth several
+/// seconds of patience here.
+pub async fn reattach(busid: &str) {
+    for attempt in 0..6 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        let _ = write_sysfs("/sys/bus/usb/drivers_probe", busid).await;
+        if has_driver(busid).await {
+            if attempt > 0 {
+                tracing::info!(%busid, attempt, "device returned to its normal driver");
+            }
+            return;
+        }
+    }
+    tracing::error!(
+        %busid,
+        "device is left with no driver; it will have no tty until it is re-probed \
+         or replugged"
+    );
+}
+
+/// Whether any interface of this device has a driver bound.
+async fn has_driver(busid: &str) -> bool {
+    let Ok(mut entries) = tokio::fs::read_dir(format!("/sys/bus/usb/devices/{busid}")).await
+    else {
+        return false;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Interfaces are named like `3-2:1.0`.
+        if !name.starts_with(busid) || !name.contains(':') {
+            continue;
+        }
+        if tokio::fs::metadata(entry.path().join("driver")).await.is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether this device currently presents a serial port.
+pub async fn has_tty(busid: &str) -> bool {
+    tty_under(&PathBuf::from(format!("/sys/bus/usb/devices/{busid}"))).await.is_some()
+}
+
+/// Every USB device on the system, as `(busid, serial)`.
+pub async fn devices_by_serial() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir("/sys/bus/usb/devices").await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let busid = entry.file_name().to_string_lossy().into_owned();
+        if !busid.starts_with(|c: char| c.is_ascii_digit()) || busid.contains(':') {
+            continue;
+        }
+        if let Ok(serial) = tokio::fs::read_to_string(entry.path().join("serial")).await {
+            let serial = serial.trim().to_string();
+            if !serial.is_empty() {
+                out.push((busid, serial));
+            }
+        }
+    }
+    out
 }
 
 /// Hand a connected socket to the stub driver for `busid`.
@@ -62,8 +160,7 @@ pub async fn stub_attach(busid: &str, stream: TcpStream) -> io::Result<()> {
     std_stream.set_nonblocking(false)?;
     let fd = std_stream.as_raw_fd();
 
-    let result =
-        tokio::fs::write(stub_path(busid).join("usbip_sockfd"), fd.to_string()).await;
+    let result = write_sysfs(stub_path(busid).join("usbip_sockfd"), &fd.to_string()).await;
 
     // The kernel took its own reference on success, so our copy could be closed;
     // we leak it anyway rather than risk a race between close and the kernel's
@@ -74,37 +171,60 @@ pub async fn stub_attach(busid: &str, stream: TcpStream) -> io::Result<()> {
 
 // -- client side ------------------------------------------------------------
 
-/// A free virtual port on the local vhci hub.
+/// A free virtual port on the vhci hub that matches a device's speed.
 ///
-/// `status` looks like:
+/// `status` lists **both** root hubs in one table:
 ///
 /// ```text
 /// hub port sta spd dev      sockfd local_busid
-/// hs  0000 004 000 00000000 000000 0-0
+/// hs  0000 006 002 0007003b 000012 9-1
+/// ss  0008 004 000 00000000 000000 0-0
 /// ```
 ///
-/// where `sta` 4 is `VDEV_ST_NULL` — unused.
-pub async fn free_vhci_port() -> io::Result<u32> {
+/// where `sta` 4 is `VDEV_ST_NULL` (free) and 6 is `VDEV_ST_USED`. The `hub`
+/// column is not decoration: high-speed ports and SuperSpeed ports are separate
+/// ranges, and attaching a full-speed device to an SS port fails with `EBUSY`.
+/// Ignoring it worked until enough ports were occupied for the search to run off
+/// the end of the hs range — so a single device always succeeded and a second
+/// one sometimes did not.
+pub async fn free_vhci_port(speed: u32) -> io::Result<u32> {
+    let want = if speed >= 5 { "ss" } else { "hs" };
     let status = tokio::fs::read_to_string(format!("{VHCI}/status")).await?;
+
     for line in status.lines().skip(1) {
         let mut fields = line.split_whitespace();
-        let _hub = fields.next();
-        let Some(port) = fields.next() else { continue };
-        let Some(state) = fields.next() else { continue };
-        if state.trim_start_matches('0') == "4" || state == "004" {
-            if let Ok(port) = port.trim_start_matches('0').parse::<u32>() {
-                return Ok(port);
-            }
-            // Port "0000" trims to empty.
-            if port.chars().all(|c| c == '0') {
-                return Ok(0);
-            }
+        let (Some(hub), Some(port), Some(state)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if hub != want {
+            continue;
+        }
+        if parse_padded(state) != Some(4) {
+            continue;
+        }
+        if let Some(port) = parse_padded(port) {
+            return Ok(port);
         }
     }
+
     Err(io::Error::new(
         io::ErrorKind::WouldBlock,
-        "no free vhci port; every virtual slot is in use",
+        format!(
+            "no free {want} vhci port; every virtual slot for this device speed is in use"
+        ),
     ))
+}
+
+/// Parse a zero-padded sysfs field such as `0008` or `004`.
+fn parse_padded(field: &str) -> Option<u32> {
+    let trimmed = field.trim_start_matches('0');
+    if trimmed.is_empty() {
+        field.chars().all(|c| c == '0').then_some(0)
+    } else {
+        trimmed.parse().ok()
+    }
 }
 
 /// Attach a connected socket to the local vhci hub, importing the device.
@@ -120,18 +240,15 @@ pub async fn vhci_attach(
     std_stream.set_nonblocking(false)?;
     let fd = std_stream.as_raw_fd();
 
-    let result = tokio::fs::write(
-        format!("{VHCI}/attach"),
-        format!("{port} {fd} {devid} {speed}"),
-    )
-    .await;
+    let result =
+        write_sysfs(format!("{VHCI}/attach"), &format!("{port} {fd} {devid} {speed}")).await;
 
     let _ = std_stream.into_raw_fd();
     result
 }
 
 pub async fn vhci_detach(port: u32) {
-    let _ = tokio::fs::write(format!("{VHCI}/detach"), port.to_string()).await;
+    let _ = write_sysfs(format!("{VHCI}/detach"), &port.to_string()).await;
 }
 
 /// Which ports this machine currently has attached, and to what.
@@ -150,8 +267,7 @@ pub async fn attached_ports() -> Vec<u32> {
             let port = fields.next()?;
             let state = fields.next()?;
             // 6 is VDEV_ST_USED.
-            (state.trim_start_matches('0') == "6")
-                .then(|| port.trim_start_matches('0').parse().unwrap_or(0))
+            (parse_padded(state)? == 6).then_some(parse_padded(port)?)
         })
         .collect()
 }
@@ -269,6 +385,43 @@ async fn tty_under(device: &std::path::Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_padded;
+
+    /// The real table lists both root hubs together.
+    const STATUS: &str = "\
+hub port sta spd dev      sockfd local_busid
+hs  0000 006 002 0007003b 000012 9-1
+hs  0001 006 002 0003002a 000013 9-2
+hs  0002 004 000 00000000 000000 0-0
+ss  0008 004 000 00000000 000000 0-0";
+
+    fn first_free(want: &str) -> Option<u32> {
+        STATUS.lines().skip(1).find_map(|line| {
+            let mut f = line.split_whitespace();
+            let (hub, port, state) = (f.next()?, f.next()?, f.next()?);
+            (hub == want && parse_padded(state)? == 4).then_some(parse_padded(port)?)
+        })
+    }
+
+    #[test]
+    fn a_full_speed_device_never_gets_a_superspeed_port() {
+        // Both hubs share one table. Attaching a full-speed device to an ss port
+        // fails with EBUSY, and the failure only appears once enough hs ports
+        // are occupied for a naive scan to run past the end of the hs range —
+        // so one device always worked and a second one sometimes did not.
+        assert_eq!(first_free("hs"), Some(2));
+        assert_eq!(first_free("ss"), Some(8));
+    }
+
+    #[test]
+    fn zero_padded_sysfs_fields_parse_including_zero() {
+        assert_eq!(parse_padded("0000"), Some(0));
+        assert_eq!(parse_padded("0008"), Some(8));
+        assert_eq!(parse_padded("004"), Some(4));
+        assert_eq!(parse_padded("0"), Some(0));
+        assert_eq!(parse_padded("x"), None);
+    }
+
     #[test]
     fn a_free_port_is_recognised_in_the_status_table() {
         // Parsing lifted straight from a real /sys/.../status dump; the leading

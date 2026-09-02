@@ -130,6 +130,29 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to read {}", args.config))?;
     let config: BenchConfig =
         toml::from_str(&text).with_context(|| format!("failed to parse {}", args.config))?;
+
+    // Before resolving hardware, release anything a previous incarnation left
+    // bound to the USB/IP stub. Resolution goes through the tty, and a
+    // stub-bound device has none — so without this a host killed mid-export can
+    // never start again, and the board stays dead through every restart.
+    {
+        let probe = BenchSpec {
+            id: config.id.clone(),
+            description: String::new(),
+            tags: Vec::new(),
+            resources: config
+                .resources
+                .iter()
+                .filter_map(|(name, r)| {
+                    r.by_id.as_ref().map(|p| {
+                        (name.clone(), Resource::Serial { by_id: std::path::PathBuf::from(p) })
+                    })
+                })
+                .collect(),
+        };
+        crate::export::recover_orphans(&probe).await;
+    }
+
     let spec = config.to_spec()?;
 
     tracing::info!(bench = %spec.id, resources = spec.resources.len(), "bench");

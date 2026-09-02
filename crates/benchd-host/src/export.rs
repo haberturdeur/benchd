@@ -243,6 +243,59 @@ impl Exports {
     }
 }
 
+/// Recover a device this bench owns that was left bound to the USB/IP stub.
+///
+/// A host killed mid-export (SIGKILL, power cut, an OOM) never runs its
+/// teardown, so the device stays bound to `usbip-host` and has no tty. That is
+/// unrecoverable by the normal path, because the normal path *identifies* the
+/// device through the tty that no longer exists — so the host refuses to start,
+/// systemd restarts it, it refuses again, and the board is dead until someone
+/// finds it by hand.
+///
+/// So before resolving anything, look for a stub-bound device whose USB serial
+/// appears in one of this bench's by-id paths, and release it. by-id names
+/// embed the serial, which is what makes the match possible without a tty.
+pub async fn recover_orphans(spec: &BenchSpec) {
+    let wanted: Vec<String> = spec
+        .resources
+        .values()
+        .filter_map(|r| match r {
+            Resource::Serial { by_id } => Some(by_id.to_string_lossy().into_owned()),
+            Resource::Usb { .. } => None,
+        })
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+
+    // Match by USB serial, which is what by-id names embed. Two states need
+    // recovering and neither can be found through a tty, because neither has
+    // one: a device still bound to the stub, and a device that was unbound but
+    // never got its driver back.
+    for (busid, serial) in sysfs::devices_by_serial().await {
+        if !wanted.iter().any(|path| path.contains(&serial)) {
+            continue;
+        }
+        if sysfs::is_bound(&busid) {
+            tracing::warn!(
+                %busid, %serial,
+                "this bench's device was left bound to the usbip stub; releasing it"
+            );
+            sysfs::unbind(&busid).await;
+        } else if !sysfs::has_tty(&busid).await {
+            tracing::warn!(
+                %busid, %serial,
+                "this bench's device has no driver; re-probing it"
+            );
+            sysfs::reattach(&busid).await;
+        } else {
+            continue;
+        }
+        // udev has to recreate the device node before anything resolves it.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    }
+}
+
 /// Walk from a `/dev/serial/by-id` symlink up to the USB device that owns it.
 ///
 /// `/sys/class/tty/ttyACM0/device` is the *interface* (`1-2:1.0`); the device is

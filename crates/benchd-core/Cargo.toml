@@ -12,6 +12,7 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 strsim = { workspace = true }
 uuid = { workspace = true }
+tracing = { workspace = true, optional = true }
 serde_json = { workspace = true }
 
 [dependencies.tokio]
@@ -20,7 +21,7 @@ optional = true
 
 [features]
 # The USB/IP protocol needs async I/O; the rest of core is pure and stays so.
-usbip = ["dep:tokio", "tokio/fs", "tokio/net", "tokio/io-util", "tokio/time"]
+usbip = ["dep:tokio", "dep:tracing", "tokio/fs", "tokio/net", "tokio/io-util", "tokio/time"]
 
 [dev-dependencies]
 proptest = "1"

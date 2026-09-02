@@ -88,6 +88,16 @@ async fn serve_host(
 
     {
         let mut state = shared.state.lock().await;
+        // Drop any previous registration's leases first: the hardware may have
+        // been reset by whatever restarted the host, so nobody can still be
+        // holding it meaningfully.
+        let stale = drop_bench(&mut state, &bench_id);
+        drop(state);
+        for msg in stale {
+            msg.send();
+        }
+
+        let mut state = shared.state.lock().await;
         match state.register_bench(&spec) {
             Ok(bench) => {
                 state.leases.inventory_mut().benches.insert(bench_id.clone(), bench);

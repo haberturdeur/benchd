@@ -139,8 +139,23 @@ impl State {
     /// vocabulary, so unknown tags are refused here rather than silently
     /// producing a bench that matches nothing (D9).
     pub fn register_bench(&mut self, spec: &BenchSpec) -> Result<Bench, String> {
-        if self.hosts.contains_key(&spec.id) {
-            return Err(format!("bench {:?} is already registered", spec.id));
+        // A bench already registered is *replaced*, not refused.
+        //
+        // A host that has just connected and registered is demonstrably alive;
+        // the one holding the old entry may not be. Refusing meant a host whose
+        // previous connection was half-open — a crash, a yanked cable, a
+        // sleeping machine — was locked out until the liveness timeout reaped
+        // it, retrying and failing the whole time. The old registration is
+        // dropped along with its leases, since whoever holds them can no longer
+        // be sure the hardware is theirs.
+        //
+        // Two hosts genuinely configured for one bench will flap, which is
+        // loud, visible in the log, and a configuration error worth seeing.
+        if let Some(old) = self.hosts.get(&spec.id) {
+            tracing::warn!(
+                bench = %spec.id, old = %old.peer_ip,
+                "re-registering a bench that was already claimed by another connection"
+            );
         }
         for name in spec.resources.keys() {
             // Resource names are also path components on the client daemon.
@@ -239,9 +254,8 @@ impl State {
                         },
                     });
                 }
-                Effect::Unmaterialize { lease, session } => {
+                Effect::Unmaterialize { lease, session, epoch } => {
                     let Some(conn) = self.client_for(session) else { continue };
-                    let epoch = self.lease_epoch(lease);
                     let request = self.next_request();
                     out.push(Outgoing::Client {
                         out: conn,
