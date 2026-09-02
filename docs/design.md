@@ -552,8 +552,22 @@ runs the reaper (grace → revoke → teardown).
 
 **Host** — owns one bench, decides nothing, executes epoch-qualified instructions.
 Registers its bench upward; `export` / `unexport`; heartbeats; owns power/mux for setup
-and teardown only. Unexports everything at startup. On device loss it releases, reports,
-and exits for a clean systemd restart.
+and teardown only. Unexports everything at startup.
+
+> **Device loss is watched for, reported, and waited out.** The host polls its
+> resources; when one disappears it sends `DeviceLost`, and the coordinator
+> withdraws the bench and releases its leases so the matcher routes around it.
+> The host then *waits* for the hardware rather than exiting: `Restart=always`
+> would turn an unplugged board into an endless restart loop, whereas waiting
+> means a board that is unplugged and plugged back in recovers on its own and
+> the bench is simply not offered in between. Verified by unbinding a board from
+> its USB driver: withdrawn in ~5s, back automatically on rebind, zero restarts.
+>
+> This matters more than it looks for a co-located bench, where `export` never
+> touches the device: without a watcher the bench stayed registered and
+> matchable forever, every claim picked it and failed on the client, and the
+> capability was dead until someone restarted the host by hand — even with
+> another matching bench free.
 
 **Client** — `benchd-clientd`, one privileged daemon per agent machine, holding the
 coordinator connection. Materialises and revokes; renews only on explicit agent call;

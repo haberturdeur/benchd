@@ -38,6 +38,10 @@ struct Args {
     /// Heartbeat interval.
     #[arg(long, default_value_t = 10)]
     heartbeat_seconds: u64,
+
+    /// How often to check that this bench's hardware is still attached.
+    #[arg(long, default_value_t = 5)]
+    device_poll_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,18 +157,19 @@ async fn main() -> Result<()> {
         crate::export::recover_orphans(&probe).await;
     }
 
-    let spec = config.to_spec()?;
-
-    tracing::info!(bench = %spec.id, resources = spec.resources.len(), "bench");
-
-    // Nothing this process exported can outlive it: the kernel holds its own
-    // reference to a handed-over socket, so teardown is mandatory rather than
-    // optional. Clear anything a previous incarnation left behind before we
-    // accept work (D6).
-    let mut exports = Exports::new(spec.clone(), args.coordinator.clone());
-    exports.clear_stale().await;
-
     loop {
+        // Resolved fresh each time round, so a board that was unplugged and
+        // plugged back in is picked up without anyone restarting anything.
+        let spec = wait_for_hardware(&config, args.device_poll_seconds).await;
+        tracing::info!(bench = %spec.id, resources = spec.resources.len(), "bench");
+
+        // Nothing this process exported can outlive it: the kernel holds its own
+        // reference to a handed-over socket, so teardown is mandatory rather
+        // than optional. Clear anything a previous incarnation left behind
+        // before we accept work (D6).
+        let mut exports = Exports::new(spec.clone(), args.coordinator.clone());
+        exports.clear_stale().await;
+
         match run(&args, &spec, &mut exports).await {
             Ok(()) => tracing::warn!("coordinator closed the connection"),
             Err(err) => tracing::warn!(?err, "connection failed"),
@@ -174,6 +179,60 @@ async fn main() -> Result<()> {
         exports.release_all().await;
         tokio::time::sleep(Duration::from_secs(3)).await;
         tracing::info!("reconnecting");
+    }
+}
+
+/// Block until every resource this bench declares is actually present.
+///
+/// The alternative — exit and let systemd restart — turns an unplugged board
+/// into a restart loop that never ends, and `Restart=always` means it never
+/// gives up. Waiting here means a board that is unplugged and plugged back in
+/// recovers on its own, and the bench simply is not offered in between.
+async fn wait_for_hardware(config: &BenchConfig, poll_seconds: u64) -> BenchSpec {
+    let mut complained = false;
+    loop {
+        match config.to_spec() {
+            Ok(spec) => {
+                if complained {
+                    tracing::info!(bench = %config.id, "hardware is back");
+                }
+                return spec;
+            }
+            Err(err) => {
+                if !complained {
+                    tracing::warn!(
+                        bench = %config.id, %err,
+                        "waiting for this bench's hardware; it will not be offered until it appears"
+                    );
+                    complained = true;
+                }
+                tokio::time::sleep(Duration::from_secs(poll_seconds.max(1))).await;
+            }
+        }
+    }
+}
+
+/// Watch this bench's resources and report the first one that disappears.
+///
+/// Without this, `HostMsg::DeviceLost` was a message nothing ever sent: an
+/// unplugged co-located board left the bench registered and matchable forever,
+/// because the host kept heartbeating and never touches the device on a
+/// co-located export. Every claim then picked the dead bench and failed on the
+/// client, and the capability was unusable until someone restarted the host by
+/// hand — even with another matching bench free.
+async fn watch_hardware(spec: BenchSpec, poll_seconds: u64) -> (String, String) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(poll_seconds.max(1))).await;
+        for (name, resource) in &spec.resources {
+            if let Resource::Serial { by_id } = resource {
+                if tokio::fs::metadata(by_id).await.is_err() {
+                    return (
+                        name.clone(),
+                        format!("{} is no longer present", by_id.display()),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -205,8 +264,22 @@ async fn run(args: &Args, spec: &BenchSpec, exports: &mut Exports) -> Result<()>
         })
     };
 
+    let mut watcher = Box::pin(watch_hardware(spec.clone(), args.device_poll_seconds));
+
     let result = loop {
         tokio::select! {
+            lost = &mut watcher => {
+                // Tell the coordinator before dropping the connection, so it
+                // withdraws the bench and releases its leases rather than
+                // waiting out the liveness timeout.
+                let (resource, detail) = lost;
+                tracing::error!(%resource, %detail, "device lost; withdrawing this bench");
+                let msg = HostMsg::DeviceLost { resource, detail };
+                if let Ok(line) = serde_json::to_string(&msg) {
+                    let _ = sink.send(line).await;
+                }
+                break Err(anyhow::anyhow!("hardware disappeared"));
+            }
             outbound = rx.recv() => {
                 let Some(line) = outbound else { break Ok(()) };
                 sink.send(line).await?;
