@@ -117,6 +117,16 @@ pub enum ClientMsg {
     Heartbeat,
     /// Reply to [`ToClient::Materialize`] / [`ToClient::Unmaterialize`].
     Done { request: RequestId, result: Outcome },
+
+    /// Create this identity's lease directory and report where it is.
+    ///
+    /// Handled entirely by the client daemon; it never reaches the coordinator.
+    /// The sandbox launcher calls this *before* starting an agent, because it
+    /// must bind-mount that directory at launch — and the directory has to be
+    /// created by root, not by the agent. An agent that can write its own lease
+    /// directory can plant a symlink where root will later create the next
+    /// lease, which turns a bind mount into an arbitrary-location one.
+    PrepareOwner { request: RequestId, name: String },
 }
 
 /// A claim as it crosses the wire. Mirrors [`crate::model::ClaimRequest`] but
@@ -149,6 +159,8 @@ pub enum ToClient {
     SessionOpened { request: RequestId, session: SessionToken, id: SessionId },
     /// Reply to a request that succeeded but returns nothing.
     Ok { request: RequestId },
+    /// Reply to `PrepareOwner`: the directory to bind-mount.
+    OwnerReady { request: RequestId, path: String },
     /// Reply to any request that failed. `retryable` is the machine-readable
     /// form of the unsatisfiable-versus-contended distinction (D14): an agent
     /// must never retry-spin on a request that can never succeed.

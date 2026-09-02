@@ -147,9 +147,15 @@ pub struct NoMatch {
 }
 
 impl NoMatch {
-    /// True if any slot can never be satisfied. Do not retry.
+    /// True if retrying unchanged can never succeed.
+    ///
+    /// `conflict_only` counts. Two slots that both match exactly one bench,
+    /// which is *free*, fail on distinctness — and no amount of waiting fixes
+    /// that, because nothing is busy. Reporting it as merely contended told an
+    /// agent to retry a request that can never succeed, which is precisely the
+    /// spin D14 exists to prevent.
     pub fn unsatisfiable(&self) -> bool {
-        self.slots.iter().any(|s| s.failure == Failure::Unsatisfiable)
+        self.conflict_only || self.slots.iter().any(|s| s.failure == Failure::Unsatisfiable)
     }
 
     /// Soonest the *whole* claim could be satisfiable: every slot must free up,
@@ -169,7 +175,10 @@ impl fmt::Display for NoMatch {
         if self.conflict_only {
             writeln!(
                 f,
-                "no assignment satisfies all slots at once (slots are individually available but must be distinct)"
+                "no assignment satisfies all slots at once: these slots must land on \
+                 different benches, and there are not enough distinct benches that match. \
+                 Waiting will not help - relax a slot's tags, or set distinct=false if \
+                 sharing one bench is acceptable."
             )?;
         }
         for (i, slot) in self.slots.iter().enumerate() {

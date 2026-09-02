@@ -250,12 +250,20 @@ impl LeaseManager {
                 .get(&lease.session)
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| lease.session.to_string());
+            // A lease being revoked frees its bench at `teardown_at`, which can
+            // be far sooner than its nominal expiry — an operator taking a
+            // 1-hour lease back frees it in 30s. Quoting `expires_at` told the
+            // next claimant to wait a hundred times too long.
+            let free_in = match lease.state {
+                LeaseState::Revoking { teardown_at, .. } => teardown_at.saturating_sub(now),
+                LeaseState::Held => lease.remaining(now),
+            };
             for bench in lease.benches() {
                 busy.insert(
                     bench.clone(),
                     BusyInfo {
                         owner: owner.clone(),
-                        expires_in: Some(lease.remaining(now) as f64),
+                        expires_in: Some(free_in as f64),
                         reason: lease.reason.clone(),
                     },
                 );
@@ -328,9 +336,15 @@ impl LeaseManager {
 
         // A fresh epoch per bench, so any instruction still in flight for a
         // previous lease on this bench is now detectably stale (D7).
+        // De-duplicated: with `distinct: false` two slots can share a bench, and
+        // iterating the assignment directly bumped that bench's epoch twice and
+        // emitted two Exports. The host short-circuits the second as already
+        // active, so it serves the first channel key while the client is handed
+        // the second — and the relay can never pair them.
         let mut epochs = BTreeMap::new();
         let mut effects = Vec::new();
-        for bench in allocation.assignment.values() {
+        let unique: BTreeSet<&String> = allocation.assignment.values().collect();
+        for bench in unique {
             let counter = self.bench_epoch.entry(bench.clone()).or_insert(0);
             *counter += 1;
             let epoch = Epoch(*counter);

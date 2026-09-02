@@ -797,6 +797,33 @@ The relay is the only path: this machine listens on one port (the coordinator),
 `usbipd` is not running at all, and the far machine holds no connection here
 except to that port.
 
+### Fourth pass: a full adversarial review of the whole system
+
+Four reviewers, one per area. Two of the findings were **privilege escalations**,
+and three were introduced by the previous round's fixes.
+
+| Severity | Bug | Root cause |
+|---|---|---|
+| Critical | A registered bench's `by_id` was never validated, so a bench declaring `/etc/shadow` got it bind-mounted into an agent's sandbox **and chowned to the agent's uid** | The path was validated nowhere; the chown added in pass three turned a read into a write |
+| Critical | The containment check was lexical, and the agent owned its own lease directory — plant a symlink at the next lease id and root follows it | `dest.starts_with(root)` before resolution, plus a world-writable `/run/benchd` |
+| Blocker | A read *error* on a connection skipped the whole cleanup block, so leases were never released and benches stayed busy for their full TTL | `line?` returned early past `end_session` |
+| Blocker | The client's epoch watermark and per-lease maps were never cleared, so a coordinator restart made it fence out legitimate work permanently | Exactly the host bug from pass two, reintroduced when fencing was added to the client |
+| Blocker | A refused registration deleted a healthy bench and killed its leases | `drop_bench` ran before validation — from pass three's "replace stale registration" fix |
+| High | A lingering host connection's heartbeats were credited to its replacement, hiding a wedged host; its disconnect removed the successor | `HostConn` keyed by bench with no connection identity |
+| High | A distinctness conflict against **free** benches was advertised as retryable | `unsatisfiable()` ignored `conflict_only` — the exact spin D14 exists to prevent |
+| High | Two slots sharing one bench burned two epochs and emitted two `Export`s, so a relayed claim could never pair | The claim loop iterated assignments rather than distinct benches |
+| Medium | Contention ETA ignored a pending teardown, so agents were told to wait ~100× too long after a forced release | `busy()` always quoted `expires_at` |
+
+**Three of these came from the previous round of fixes.** Each pass has
+introduced new bugs of the same class as the ones it fixed — the epoch reset
+most starkly, fixed on the host and then reintroduced on the client weeks of
+work later. The lesson is not "test more" but that a fix to an invariant must be
+applied to *every* component that holds it, and the invariant itself written
+down somewhere a reviewer can check.
+
+The privileged daemons remain the least-tested surface: both escalations lived
+where no test ran.
+
 **The cause was uniform: every test exercised the happy path.** None asked what
 happens when a step fails. `tests/failure_paths.rs` exists to keep that from
 recurring, and immediately found the `tick` bug.

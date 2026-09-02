@@ -52,8 +52,20 @@ fi
 IDENTITY=$(echo "$IDENTITY" | tr -cd '[:alnum:]._-' | cut -c1-48)
 
 [ -d "$ROOT" ] || { echo "$ROOT does not exist; is benchd-clientd running?" >&2; exit 1; }
-OWNER="$ROOT/$IDENTITY"
-mkdir -p "$OWNER"
+
+# Ask the daemon to create the lease directory rather than creating it here.
+# It must be owned by root and not writable by the agent: an agent that can
+# write its own lease directory can plant a symlink where root will later
+# create the next lease, and root follows it.
+SOCK="$ROOT/agent.sock"
+[ -S "$SOCK" ] || { echo "$SOCK missing; is benchd-clientd running?" >&2; exit 1; }
+OWNER=$(printf '{"msg":"prepare_owner","request":1,"name":"%s"}\n' "$IDENTITY" \
+  | timeout 5 socat - "UNIX-CONNECT:$SOCK" 2>/dev/null \
+  | sed -n 's/.*"path":"\([^"]*\)".*/\1/p' | head -1)
+if [ -z "$OWNER" ]; then
+  echo "benchd-clientd did not prepare a lease directory for $IDENTITY" >&2
+  exit 1
+fi
 
 # --- which serial devices belong to the lab? -------------------------------
 #

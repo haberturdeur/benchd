@@ -330,6 +330,35 @@ async fn forward(shared: &Arc<Shared>, agent_id: u64, msg: ClientMsg) {
         inner.agents.get(&agent_id).and_then(|a| a.session.clone())
     };
 
+    // Handled locally: the coordinator has no idea where this machine puts
+    // device nodes, and the caller is a sandbox launcher rather than an agent.
+    if let ClientMsg::PrepareOwner { request, name } = &msg {
+        let dir = shared.root.join(owner_dir(SessionId(0), name));
+        let reply = match std::fs::create_dir_all(&dir).and_then(|_| {
+            // Root-owned and not writable by the agent: the whole point is that
+            // the agent cannot plant symlinks where root will later create
+            // lease directories.
+            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        }) {
+            Ok(()) => ToClient::OwnerReady {
+                request: *request,
+                path: dir.display().to_string(),
+            },
+            Err(err) => ToClient::Error {
+                request: *request,
+                error: format!("could not prepare {}: {err}", dir.display()),
+                retryable: false,
+            },
+        };
+        let inner = shared.agents.inner.lock().await;
+        if let Some(agent) = inner.agents.get(&agent_id) {
+            if let Ok(line) = serde_json::to_string(&reply) {
+                let _ = agent.out.send(line);
+            }
+        }
+        return;
+    }
+
     let out = match msg {
         ClientMsg::OpenSession { request, name } => {
             {
@@ -379,6 +408,7 @@ fn request_of(msg: &ClientMsg) -> RequestId {
         | ClientMsg::Release { request, .. }
         | ClientMsg::Status { request, .. }
         | ClientMsg::TagList { request }
+        | ClientMsg::PrepareOwner { request, .. }
         | ClientMsg::Done { request, .. } => *request,
         ClientMsg::Heartbeat => RequestId(0),
     }

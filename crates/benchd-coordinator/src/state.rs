@@ -24,6 +24,13 @@ use crate::conn::Outbox;
 /// A connected host, and the bench it owns.
 pub struct HostConn {
     pub bench: String,
+    /// Which connection owns this entry.
+    ///
+    /// Hosts are keyed by bench, so without this a lingering old connection's
+    /// heartbeats are credited to its replacement (hiding a wedged host from
+    /// the liveness reaper) and its eventual disconnect removes the replacement
+    /// instead of itself.
+    pub conn_id: u64,
     pub out: Outbox,
     /// When we last heard anything from this host. A TCP connection can stay
     /// open long after the peer stops functioning — a wedged process, a
@@ -89,9 +96,22 @@ impl State {
     }
 
     /// Note that a peer is alive.
-    pub fn touch_host(&mut self, bench: &str, now: u64) {
+    pub fn touch_host(&mut self, bench: &str, conn_id: u64, now: u64) {
         if let Some(host) = self.hosts.get_mut(bench) {
-            host.last_seen = now;
+            if host.conn_id == conn_id {
+                host.last_seen = now;
+            }
+        }
+    }
+
+    /// Remove a host entry only if this connection still owns it.
+    pub fn remove_host(&mut self, bench: &str, conn_id: u64) -> bool {
+        match self.hosts.get(bench) {
+            Some(host) if host.conn_id == conn_id => {
+                self.hosts.remove(bench);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -156,6 +176,12 @@ impl State {
                 bench = %spec.id, old = %old.peer_ip,
                 "re-registering a bench that was already claimed by another connection"
             );
+        }
+        for (name, resource) in &spec.resources {
+            if let benchd_core::model::Resource::Serial { by_id } = resource {
+                benchd_core::model::valid_device_path(by_id)
+                    .map_err(|e| format!("resource {name:?}: {e}"))?;
+            }
         }
         for name in spec.resources.keys() {
             // Resource names are also path components on the client daemon.

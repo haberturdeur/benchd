@@ -180,6 +180,7 @@ fn set_request(msg: &mut ClientMsg, id: RequestId) {
         | Release { request, .. }
         | Status { request, .. }
         | TagList { request }
+        | PrepareOwner { request, .. }
         | Done { request, .. } => *request = id,
         Heartbeat => {}
     }

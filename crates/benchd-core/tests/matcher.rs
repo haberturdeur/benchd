@@ -197,10 +197,17 @@ fn a_distinctness_conflict_is_not_reported_as_contention() {
     let err = allocate_in(&inv, &req, &no_one_is_busy()).unwrap_err();
 
     assert!(err.conflict_only);
-    assert!(!err.unsatisfiable());
+    // ...and it must NOT be advertised as worth retrying. Nothing is busy, so
+    // waiting can never help. This assertion originally read
+    // `assert!(!err.unsatisfiable())`, encoding the bug: an agent following the
+    // retryable flag would spin forever against a free bench.
+    assert!(
+        err.unsatisfiable(),
+        "a conflict against free benches cannot be fixed by waiting"
+    );
     let rendered = err.to_string();
-    assert!(rendered.contains("must be distinct"), "{rendered}");
-    assert!(rendered.contains("free"), "{rendered}");
+    assert!(rendered.contains("different benches"), "{rendered}");
+    assert!(rendered.contains("Waiting will not help"), "{rendered}");
 }
 
 // --- vocabulary ------------------------------------------------------------

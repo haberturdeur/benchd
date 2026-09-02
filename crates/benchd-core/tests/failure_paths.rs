@@ -326,3 +326,89 @@ fn teardown_carries_the_epoch_it_was_created_at() {
         );
     }
 }
+
+// --- what agents are told to do about a failure ----------------------------
+
+#[test]
+fn a_distinctness_conflict_is_never_reported_as_worth_retrying() {
+    // Two slots, one matching bench, and it is FREE. Nothing is busy, so no
+    // amount of waiting can satisfy this. Reporting it as contended made agents
+    // retry-spin at full speed - the exact failure D14 exists to prevent.
+    let inv = Inventory::from_toml_str(INVENTORY).unwrap();
+    let request = ClaimRequest {
+        slots: [
+            ("dut".to_string(), Requirement::parse(["psram=octal"]).unwrap()),
+            ("peer".to_string(), Requirement::parse(["psram=octal"]).unwrap()),
+        ]
+        .into_iter()
+        .collect(),
+        distinct: Distinct::All,
+        ttl_seconds: 60,
+        reason: String::new(),
+    };
+    let err = benchd_core::allocate_in(&inv, &request, &Default::default()).unwrap_err();
+
+    assert!(err.conflict_only, "only one bench has psram=octal");
+    assert!(
+        err.unsatisfiable(),
+        "a distinctness conflict against a FREE bench must not be advertised as retryable"
+    );
+    let rendered = err.to_string();
+    assert!(rendered.contains("Waiting will not help"), "{rendered}");
+}
+
+#[test]
+fn sharing_one_bench_between_slots_grants_one_epoch_and_one_export() {
+    // With distinct=false two slots may land on the same bench. Iterating the
+    // assignment directly bumped that bench's epoch twice and emitted two
+    // Exports; the host treats the second as already active, so it serves the
+    // first channel key while the client is handed the second, and a relayed
+    // claim can never pair.
+    let mut m = manager(Limits::default());
+    let s = m.register("agent");
+    let request = ClaimRequest {
+        slots: [
+            ("a".to_string(), Requirement::parse(["psram=octal"]).unwrap()),
+            ("b".to_string(), Requirement::parse(["psram=octal"]).unwrap()),
+        ]
+        .into_iter()
+        .collect(),
+        distinct: Distinct::None,
+        ttl_seconds: 60,
+        reason: String::new(),
+    };
+    let g = m.claim(s, &request, 0).unwrap();
+
+    assert_eq!(g.assignment["a"], g.assignment["b"], "both slots share the bench");
+    let exports = g.effects.iter().filter(|e| matches!(e, Effect::Export { .. })).count();
+    assert_eq!(exports, 1, "one bench in one claim must be exported once");
+    assert_eq!(
+        m.lease(g.lease).unwrap().epochs.len(),
+        1,
+        "and must hold exactly one epoch"
+    );
+    assert_eq!(
+        m.lease(g.lease).unwrap().epochs.values().next().unwrap().0,
+        1,
+        "which must not have been bumped twice"
+    );
+}
+
+#[test]
+fn a_revoked_lease_reports_when_the_bench_actually_frees() {
+    // An operator taking a one-hour lease back frees the bench in `grace`
+    // seconds, not an hour. Quoting the nominal expiry told the next claimant
+    // to wait a hundred times too long.
+    let mut m = manager(Limits { grace: 30, ..Default::default() });
+    let s = m.register("agent-1");
+    let g = m.claim(s, &claim_named("dut", &["psram=octal"], 3600), 0).unwrap();
+    let bench = g.assignment["dut"].clone();
+
+    m.force_release(g.lease, 100);
+    let busy = m.busy(101);
+    let eta = busy[&bench].expires_in.unwrap();
+    assert!(
+        eta <= 30.0,
+        "bench frees at t=130 but the ETA says {eta}s"
+    );
+}

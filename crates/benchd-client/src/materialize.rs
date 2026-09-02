@@ -132,6 +132,23 @@ impl Materializer {
     /// without this a restart would leave hardware reachable by an agent whose
     /// lease is gone (D6).
     pub async fn clear_stale(&mut self) {
+        // Every lease the coordinator granted is void, so none of the
+        // bookkeeping about them means anything either.
+        //
+        // `seen` in particular MUST be cleared. It is keyed by lease id, and a
+        // stateless coordinator restarts both lease ids and per-bench epochs at
+        // 1 — but they advance at different rates once there is more than one
+        // bench, so a reused lease id can arrive with a *lower* epoch than the
+        // one recorded against it and be fenced out as stale, permanently. This
+        // is the same bug Appendix B records for the host, reintroduced on the
+        // client when fencing was added here; the host clears its watermark in
+        // `release_all` for exactly this reason. It hid because a single-bench
+        // lab keeps lease ids and epochs in lockstep.
+        self.seen.clear();
+        self.active.clear();
+        self.imported.clear();
+        self.restore.clear();
+
         // Imported devices are kernel state too, and outlive us just as mounts do.
         for port in sysfs::attached_ports().await {
             tracing::warn!(port, "detaching a stale imported device from a previous run");
@@ -212,6 +229,34 @@ impl Materializer {
                                 };
                             }
                         };
+                        // Checked again after canonicalising, and against the
+                        // resolved path rather than the declared one: a symlink
+                        // under /dev could otherwise point anywhere. The
+                        // coordinator validates too, but this process is root
+                        // and must not trust it.
+                        if let Err(why) = benchd_core::model::valid_device_path(&source) {
+                            return Outcome::Failed {
+                                detail: format!("{slot}/{name}: refusing to mount: {why}"),
+                            };
+                        }
+                        match tokio::fs::metadata(&source).await {
+                            Ok(meta) => {
+                                use std::os::unix::fs::FileTypeExt;
+                                if !meta.file_type().is_char_device() {
+                                    return Outcome::Failed {
+                                        detail: format!(
+                                            "{slot}/{name}: {} is not a character device",
+                                            source.display()
+                                        ),
+                                    };
+                                }
+                            }
+                            Err(err) => {
+                                return Outcome::Failed {
+                                    detail: format!("{slot}/{name}: {err}"),
+                                };
+                            }
+                        }
                         plan.push((source, dir.join(slot).join(name)));
                     }
                     ResourceHandle::UsbIp { channel, busid } => {

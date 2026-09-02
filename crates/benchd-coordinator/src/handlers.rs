@@ -97,26 +97,27 @@ async fn serve_host(
     spec: benchd_core::wire::BenchSpec,
 ) -> Result<()> {
     let bench_id = spec.id.clone();
+    let conn_id = shared.state.lock().await.next_conn();
 
     {
         let mut state = shared.state.lock().await;
-        // Drop any previous registration's leases first: the hardware may have
-        // been reset by whatever restarted the host, so nobody can still be
-        // holding it meaningfully.
-        let stale = drop_bench(&mut state, &bench_id);
-        drop(state);
-        for msg in stale {
-            msg.send();
-        }
-
-        let mut state = shared.state.lock().await;
+        // Validate BEFORE evicting the incumbent. Dropping first meant a bad
+        // registration — a stale config on another machine, an unknown tag —
+        // deleted a healthy bench and killed its live leases, then failed, and
+        // the healthy host never re-registered because it was still connected.
         match state.register_bench(&spec) {
             Ok(bench) => {
+                // Only now is it safe to displace whatever was there.
+                let stale = drop_bench(&mut state, &bench_id);
+                for msg in stale {
+                    msg.send();
+                }
                 state.leases.inventory_mut().benches.insert(bench_id.clone(), bench);
                 state.hosts.insert(
                     bench_id.clone(),
                     HostConn {
                         bench: bench_id.clone(),
+                        conn_id,
                         out: out.clone(),
                         peer_ip: peer.ip(),
                         last_seen: now(),
@@ -135,8 +136,12 @@ async fn serve_host(
         }
     }
 
-    while let Some(line) = lines.next().await {
-        let line = line?;
+    let outcome: Result<()> = loop {
+        let line = match lines.next().await {
+            Some(Ok(line)) => line,
+            Some(Err(err)) => break Err(err.into()),
+            None => break Ok(()),
+        };
         let msg: HostMsg = match serde_json::from_str(&line) {
             Ok(msg) => msg,
             Err(err) => {
@@ -145,7 +150,7 @@ async fn serve_host(
             }
         };
         // Any message proves liveness, not just an explicit heartbeat.
-        shared.state.lock().await.touch_host(&bench_id, now());
+        shared.state.lock().await.touch_host(&bench_id, conn_id, now());
 
         match msg {
             HostMsg::Heartbeat | HostMsg::Register { .. } => {}
@@ -171,18 +176,24 @@ async fn serve_host(
                 }
             }
         }
-    }
+    };
 
     tracing::info!(bench = %bench_id, "host disconnected");
     let outgoing = {
         let mut state = shared.state.lock().await;
-        state.hosts.remove(&bench_id);
-        drop_bench(&mut state, &bench_id)
+        // Only tear the bench down if this connection still owns it. A late
+        // disconnect from a replaced host must not remove its successor.
+        if state.remove_host(&bench_id, conn_id) {
+            drop_bench(&mut state, &bench_id)
+        } else {
+            tracing::info!(bench = %bench_id, "a replaced host connection closed; leaving the bench alone");
+            Vec::new()
+        }
     };
     for msg in outgoing {
         msg.send();
     }
-    Ok(())
+    outcome
 }
 
 /// Remove a bench and release everything holding it.
@@ -313,13 +324,18 @@ async fn serve_client(
     };
     tracing::info!(%peer, conn_id, "client connected");
 
+    // The loop's result is captured rather than propagated: a read *error*
+    // (a reset peer, a non-UTF-8 byte) must still run the cleanup below, or the
+    // session's leases are never released and the bench stays busy for its full
+    // TTL with no backstop. `?` here used to skip all of it.
     let mut pending = replay;
-    loop {
+    let outcome: Result<()> = loop {
         let line = match pending.take() {
             Some(line) => line,
             None => match lines.next().await {
-                Some(line) => line?,
-                None => break,
+                Some(Ok(line)) => line,
+                Some(Err(err)) => break Err(err.into()),
+                None => break Ok(()),
             },
         };
 
@@ -335,7 +351,7 @@ async fn serve_client(
         for msg in outgoing {
             msg.send();
         }
-    }
+    };
 
     // The client daemon is gone, so every agent behind it is gone too. Release
     // immediately: there is nobody left to warn, and gracing would only idle
@@ -369,7 +385,7 @@ async fn serve_client(
     for msg in outgoing {
         msg.send();
     }
-    Ok(())
+    outcome
 }
 
 async fn handle_client(
@@ -383,6 +399,15 @@ async fn handle_client(
 
     match msg {
         ClientMsg::Heartbeat => Vec::new(),
+        // Handled by the client daemon; it must never reach here.
+        ClientMsg::PrepareOwner { request, .. } => {
+            out.send(&ToClient::Error {
+                request,
+                error: "PrepareOwner is a client-daemon request".into(),
+                retryable: false,
+            });
+            Vec::new()
+        }
         ClientMsg::Done { request, result } => {
             fail_lease_if_needed(&mut state, request, result, "client", "")
         }

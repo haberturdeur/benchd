@@ -139,6 +139,30 @@ pub fn valid_component(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
+/// Where a bench's serial resources are allowed to live.
+///
+/// A host declares this path and the client daemon — running as root —
+/// bind-mounts it and hands it to the agent's uid. Anyone who can reach the
+/// coordinator can register a bench (§9 accepts that), so without this check a
+/// registration string reaches `mount(2)` and `chown(2)` unvalidated: register a
+/// bench whose "device" is `/etc/shadow`, claim it, and the file is mounted into
+/// your sandbox owned by you.
+///
+/// Devices live under `/dev`. Nothing else is a device, so nothing else is
+/// accepted.
+pub fn valid_device_path(path: &std::path::Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("{} is not an absolute path", path.display()));
+    }
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(format!("{} contains '..'", path.display()));
+    }
+    if !path.starts_with("/dev/") {
+        return Err(format!("{} is not under /dev/", path.display()));
+    }
+    Ok(())
+}
+
 /// Which slots must land on *different* benches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Distinct {
