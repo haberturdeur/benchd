@@ -100,6 +100,14 @@ async fn main() -> Result<()> {
     let root = std::path::PathBuf::from(&args.root);
     std::fs::create_dir_all(&root)
         .with_context(|| format!("failed to create {}", root.display()))?;
+    // Sticky and world-writable, like /tmp: an agent's sandbox creates its own
+    // owner directory before it starts, because it must bind-mount that
+    // directory at launch — before the coordinator has issued it a session. The
+    // sticky bit stops one agent removing another's. Device nodes inside are
+    // owned by their agent's uid and mode 0660, so the directory being listable
+    // does not make anything openable.
+    std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o1777))
+        .with_context(|| format!("failed to set permissions on {}", root.display()))?;
 
     let mut materializer = Materializer::new(root.clone(), args.coordinator.clone());
     // Nothing we mounted survives us in any meaningful sense: the coordinator

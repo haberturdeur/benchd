@@ -561,10 +561,24 @@ removes every materialisation under its root at startup. `benchd-mcp` is the thi
 unprivileged stdio shim spawned per agent (D8), which registers a session and forwards
 calls over a local socket.
 
-> **Sandbox mechanism: bubblewrap.** `/run/benchd/<owner>` is bind-mounted into the
-> agent's sandbox at start. Because it's a *directory* mount, entries appear and
-> disappear inside a running sandbox with no restart and no cooperation from the agent.
-> Chosen as the easiest start; the materialiser is a trait, so Docker or ACLs can follow.
+> **Sandbox mechanism: bubblewrap** (`dist/benchd-sandbox`). The agent runs with
+> `--dev /dev`, which is a fresh minimal `/dev` containing no serial devices at all;
+> every serial device that is *not* a bench resource is handed back with
+> `--dev-bind`, so a board that is not part of the lab still works normally. Its
+> `/run/benchd/<identity>` is bind-mounted, and because that is a *directory*
+> mount, leases appear and disappear inside a running sandbox with no restart and
+> no cooperation from the agent.
+>
+> Verified end to end: before a claim `/dev/ttyACM0` does not exist inside the
+> sandbox; after one, the lease path exists, is owned by the agent's uid and opens;
+> on release it is gone and reopening gives `ENOENT`. The raw device path is never
+> visible, even while the lease is held.
+>
+> The owner directory is named from the agent's declared identity alone, never a
+> session id: the sandbox must bind-mount it at launch, which is before the
+> coordinator has issued a session. `/run/benchd` is mode 1777 like `/tmp` so an
+> unprivileged sandbox can create its own; the device nodes inside are 0660 owned
+> by the agent's uid, so a listable directory grants nothing.
 
 **Matcher** *(implemented)* — `allocate(request, benches, busy, counts, weights)`.
 Invariants pinned by property test: succeeds ⟺ a valid assignment exists; returned cost

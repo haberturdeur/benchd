@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Launch a command in a sandbox where the lab's hardware is unreachable without
+# a lease.
+#
+# This is what makes a lease *enforced* rather than advisory (design decision
+# D2). Inside the sandbox:
+#
+#   * /dev has no serial devices at all to begin with
+#   * every serial device NOT owned by a bench is handed back, so a board that
+#     is not part of the lab still works normally
+#   * /run/benchd/<identity> is bind-mounted, so leases appear and disappear
+#     live while the sandbox runs
+#
+# An agent that ignores the skill and reaches for /dev/ttyUSB0 therefore gets
+# ENOENT rather than someone else's test run.
+#
+# Usage:
+#   benchd-sandbox [--identity NAME] [--root DIR] -- command [args...]
+#
+# Example:
+#   benchd-sandbox --identity pi-4f2a -- pi
+set -euo pipefail
+
+ROOT=/run/benchd
+BENCHES=/etc/benchd/benches
+IDENTITY=${BENCHD_IDENTITY:-}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --identity) IDENTITY=$2; shift 2 ;;
+    --root)     ROOT=$2; shift 2 ;;
+    --benches)  BENCHES=$2; shift 2 ;;
+    --)         shift; break ;;
+    -h|--help)  sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *)          echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ $# -gt 0 ] || { echo "nothing to run; use: benchd-sandbox [opts] -- command" >&2; exit 2; }
+
+# A stable name per agent. Harnesses expose a session id, but it is usually a
+# full UUID and makes contention messages unreadable, so take a short prefix.
+if [ -z "$IDENTITY" ]; then
+  if [ -n "${PI_SESSION_ID:-}" ]; then
+    IDENTITY="pi-$(echo "$PI_SESSION_ID" | tr -cd '[:alnum:]' | cut -c1-8)"
+  else
+    IDENTITY="agent-$$"
+  fi
+fi
+# Must match benchd's own sanitising, or the daemon will materialise somewhere
+# this sandbox cannot see.
+IDENTITY=$(echo "$IDENTITY" | tr -cd '[:alnum:]._-' | cut -c1-48)
+
+[ -d "$ROOT" ] || { echo "$ROOT does not exist; is benchd-clientd running?" >&2; exit 1; }
+OWNER="$ROOT/$IDENTITY"
+mkdir -p "$OWNER"
+
+# --- which serial devices belong to the lab? -------------------------------
+#
+# Resolved from the bench definitions on this machine. A device that is not a
+# bench resource is none of benchd's business and stays visible.
+declare -A BENCH_DEV=()
+if [ -d "$BENCHES" ]; then
+  while IFS= read -r byid; do
+    [ -e "$byid" ] || continue
+    real=$(readlink -f "$byid") || continue
+    BENCH_DEV["$real"]=1
+  done < <(grep -ho 'by_id *= *"[^"]*"' "$BENCHES"/*.toml 2>/dev/null | sed 's/.*"\(.*\)"/\1/')
+fi
+
+ALLOW=()
+HIDDEN=()
+for dev in /dev/ttyUSB* /dev/ttyACM* /dev/ttyS*; do
+  [ -e "$dev" ] || continue
+  real=$(readlink -f "$dev")
+  if [ -n "${BENCH_DEV[$real]:-}" ]; then
+    HIDDEN+=("$dev")
+  else
+    ALLOW+=(--dev-bind "$dev" "$dev")
+  fi
+done
+
+if [ "${BENCHD_SANDBOX_VERBOSE:-}" = "1" ]; then
+  echo "benchd-sandbox: identity=$IDENTITY leases=$OWNER" >&2
+  echo "benchd-sandbox: hidden (bench-owned): ${HIDDEN[*]:-none}" >&2
+  echo "benchd-sandbox: visible (not a bench): $(printf '%s ' "${ALLOW[@]}" | grep -o '/dev/tty[^ ]*' | sort -u | tr '\n' ' ')" >&2
+fi
+
+# --ro-bind / / keeps the normal filesystem; --dev /dev replaces /dev with a
+# minimal one that has no serial devices. Order matters: --dev first, then the
+# devices we are handing back.
+exec bwrap \
+  --ro-bind / / \
+  --dev /dev \
+  "${ALLOW[@]}" \
+  --bind "$OWNER" "$OWNER" \
+  --bind /run/benchd/agent.sock /run/benchd/agent.sock \
+  --proc /proc \
+  --tmpfs /tmp \
+  --bind "${HOME}" "${HOME}" \
+  --setenv BENCHD_IDENTITY "$IDENTITY" \
+  --setenv BENCHD_LEASES "$OWNER" \
+  --die-with-parent \
+  -- "$@"

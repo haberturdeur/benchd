@@ -14,6 +14,11 @@ they renumber when boards are replugged, and writing to one mid-test corrupts
 someone else's run — silently, which is the expensive kind of bug. Use the path
 `claim` gives you.
 
+On a correctly set up machine you will not find them anyway: lab boards are not
+present in your `/dev` at all until you hold a lease. If `ls /dev/ttyACM0` says
+it does not exist, that is not a broken board — it is a board you have not
+claimed.
+
 ## The loop
 
 ```

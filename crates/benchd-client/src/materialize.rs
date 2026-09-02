@@ -383,20 +383,26 @@ pub fn resource_path(
     root.join(owner).join(lease.to_string()).join(slot).join(resource)
 }
 
-/// Sanitise a session name into a directory component.
+/// Sanitise an agent's declared name into a directory component.
 ///
-/// Agent-supplied, so it must never be able to escape the root — this is the
-/// one place an agent's input reaches a path.
+/// Agent-supplied, so it must never escape the root — this is the one place an
+/// agent's input reaches a path.
+///
+/// **Derived from the name alone, deliberately.** The sandbox has to bind-mount
+/// this directory when the agent *starts*, which is before the coordinator has
+/// issued a session id — so the path cannot depend on one. Two sessions calling
+/// themselves the same thing share a directory and are told apart by their lease
+/// subdirectories, which is the right answer anyway: it is the same agent.
 pub fn owner_dir(session: SessionId, name: &str) -> String {
     let safe: String = name
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(32)
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .take(48)
         .collect();
     if safe.is_empty() {
         session.to_string()
     } else {
-        format!("{safe}-{session}")
+        safe
     }
 }
 

@@ -89,6 +89,12 @@ sudo systemctl enable --now benchd-coordinator benchd-clientd
 sudo systemctl enable --now benchd-host@esp32s3-a      # one per bench
 ```
 
+Run agents sandboxed, so a lease is enforced rather than advisory:
+
+```sh
+benchd-sandbox -- pi        # lab boards are absent from /dev until claimed
+```
+
 Then point an agent at it:
 
 ```json
