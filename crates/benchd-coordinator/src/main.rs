@@ -43,6 +43,11 @@ struct Args {
     #[arg(long)]
     force_relay: bool,
 
+    /// Write the address actually bound to this file, then continue. Useful
+    /// with `--listen 127.0.0.1:0`, where the kernel chooses the port.
+    #[arg(long)]
+    report_address: Option<String>,
+
     /// How long a host may go silent before its bench stops being matched.
     /// Should be a few times the executors' heartbeat interval.
     #[arg(long, default_value_t = 45)]
@@ -160,7 +165,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    let listener = conn::listen(&args.listen).await?;
+    let listener = conn::listen(&args.listen, args.report_address.as_deref()).await?;
     tracing::info!("ready");
 
     loop {

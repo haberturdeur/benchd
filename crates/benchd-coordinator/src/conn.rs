@@ -51,10 +51,25 @@ pub fn spawn_writer(write: OwnedWriteHalf, peer: String) -> Outbox {
 }
 
 /// Bind, logging the address so a misconfigured port is obvious immediately.
-pub async fn listen(addr: &str) -> Result<tokio::net::TcpListener> {
+///
+/// `report_to` receives the address actually bound. With `--listen 127.0.0.1:0`
+/// the kernel picks a free port, and this is how anything else finds out which
+/// one — used by the integration tests so they never contend for a fixed port
+/// with whatever else is running on a shared CI machine.
+pub async fn listen(addr: &str, report_to: Option<&str>) -> Result<tokio::net::TcpListener> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
-    tracing::info!(%addr, "listening");
+    let bound = listener
+        .local_addr()
+        .with_context(|| format!("bound {addr} but could not read the address back"))?;
+    tracing::info!(%bound, "listening");
+
+    if let Some(path) = report_to {
+        // Written after the listener exists, so a reader that sees the file
+        // knows the port is already accepting connections.
+        std::fs::write(path, bound.to_string())
+            .with_context(|| format!("failed to write the bound address to {path}"))?;
+    }
     Ok(listener)
 }

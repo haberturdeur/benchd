@@ -10,11 +10,17 @@
 //! `benchd-clientd`, because that needs root; the assertions here are about what
 //! the coordinator refuses to pass on.
 //!
-//! Ignored by default so `cargo test` stays hermetic and fast. Run with:
+//! Ignored by default so `cargo test` stays hermetic and fast, and **serial**:
 //!
 //! ```sh
-//! cargo build --release && cargo test --test daemons -- --ignored --test-threads=1
+//! cargo test --test daemons -- --ignored --test-threads=1
 //! ```
+//!
+//! `--test-threads=1` is not optional. Each test spawns its own coordinator
+//! process, and running eight debug builds at once starves them of CPU until
+//! replies miss their deadline — a failure that looks like a protocol bug and is
+//! not one. They bind an ephemeral port, so it is contention rather than a port
+//! clash, but the effect is the same. CI passes the flag.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -130,7 +136,10 @@ impl Harness {
     fn exchange(&self, line: &str) -> String {
         let stream = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            // Generous: CI machines are shared and a coordinator that has just
+            // been spawned may be waiting on CPU. A real hang still fails, just
+            // later.
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
             .expect("timeout");
         let mut writer = stream.try_clone().expect("clone");
         writeln!(writer, "{line}").expect("write");
@@ -264,7 +273,7 @@ fn an_agent_cannot_claim_a_bench_by_name() {
     // Same connection, so the session is still known.
     let stream = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();
     let mut w = stream.try_clone().unwrap();
     let mut r = BufReader::new(stream);
@@ -307,7 +316,7 @@ fn a_claim_with_a_hostile_slot_name_is_refused() {
     let h = Harness::start("slot");
     let stream = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();
     let mut w = stream.try_clone().unwrap();
     let mut r = BufReader::new(stream);
