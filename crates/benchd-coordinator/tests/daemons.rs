@@ -109,7 +109,11 @@ impl Harness {
             .expect("spawn coordinator");
 
         // Wait for it to accept connections rather than sleeping blindly.
-        let mut harness = Harness { coordinator, port, _dir: dir };
+        let mut harness = Harness {
+            coordinator,
+            port,
+            _dir: dir,
+        };
         for _ in 0..100 {
             if TcpStream::connect(("127.0.0.1", port)).is_ok() {
                 return harness;
@@ -227,7 +231,10 @@ fn a_failed_registration_does_not_destroy_the_bench_already_there() {
     let bad = h.exchange(
         r#"{"msg":"register","bench":{"id":"shared","description":"","tags":["soc=nonsense"],"resources":{"console":{"kind":"serial","path":"/dev/null"}}}}"#,
     );
-    assert!(reply.contains("registered") && bad.contains("rejected"), "bad host: {bad}");
+    assert!(
+        reply.contains("registered") && bad.contains("rejected"),
+        "bad host: {bad}"
+    );
 
     // The good bench must still be listed.
     let state = h.exchange(r#"{"msg":"inspect"}"#);
@@ -262,7 +269,11 @@ fn an_agent_cannot_claim_a_bench_by_name() {
     let mut w = stream.try_clone().unwrap();
     let mut r = BufReader::new(stream);
 
-    writeln!(w, r#"{{"msg":"open_session","request":1,"name":"agent-1"}}"#).unwrap();
+    writeln!(
+        w,
+        r#"{{"msg":"open_session","request":1,"name":"agent-1"}}"#
+    )
+    .unwrap();
     w.flush().unwrap();
     let mut line = String::new();
     r.read_line(&mut line).unwrap();
@@ -301,7 +312,11 @@ fn a_claim_with_a_hostile_slot_name_is_refused() {
     let mut w = stream.try_clone().unwrap();
     let mut r = BufReader::new(stream);
 
-    writeln!(w, r#"{{"msg":"open_session","request":1,"name":"agent-1"}}"#).unwrap();
+    writeln!(
+        w,
+        r#"{{"msg":"open_session","request":1,"name":"agent-1"}}"#
+    )
+    .unwrap();
     w.flush().unwrap();
     let mut line = String::new();
     r.read_line(&mut line).unwrap();

@@ -11,7 +11,10 @@ use benchd_core::model::{Bench, ClaimRequest, Distinct, Inventory, Requirement};
 use benchd_core::tags::{parse_tags, Tag, TagError};
 use benchd_core::{allocate_in, format_tags};
 
-const INVENTORY: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/inventory.toml"));
+const INVENTORY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../examples/inventory.toml"
+));
 
 fn inventory() -> Inventory {
     Inventory::from_toml_str(INVENTORY).expect("example inventory should load")
@@ -22,7 +25,10 @@ fn claim(slots: &[(&str, &[&str])], distinct: Distinct) -> ClaimRequest {
         slots: slots
             .iter()
             .map(|(name, tags)| {
-                (name.to_string(), Requirement::parse(tags.iter().copied()).unwrap())
+                (
+                    name.to_string(),
+                    Requirement::parse(tags.iter().copied()).unwrap(),
+                )
             })
             .collect(),
         distinct,
@@ -137,11 +143,19 @@ fn all_benches_busy_is_reported_as_contended_not_unsatisfiable() {
     let busy: BTreeMap<String, BusyInfo> = [
         (
             "esp32s3-a".to_string(),
-            BusyInfo { owner: "agent-3".into(), expires_in: Some(240.0), reason: "wifi".into() },
+            BusyInfo {
+                owner: "agent-3".into(),
+                expires_in: Some(240.0),
+                reason: "wifi".into(),
+            },
         ),
         (
             "esp32s3-b".to_string(),
-            BusyInfo { owner: "tom".into(), expires_in: None, reason: String::new() },
+            BusyInfo {
+                owner: "tom".into(),
+                expires_in: None,
+                reason: String::new(),
+            },
         ),
     ]
     .into();
@@ -149,7 +163,10 @@ fn all_benches_busy_is_reported_as_contended_not_unsatisfiable() {
     let req = claim(&[("dut", &["soc=esp32s3"])], Distinct::All);
     let err = allocate_in(&inv, &req, &busy).unwrap_err();
 
-    assert!(!err.unsatisfiable(), "agents must know to wait, not to give up");
+    assert!(
+        !err.unsatisfiable(),
+        "agents must know to wait, not to give up"
+    );
     assert_eq!(err.slots[0].failure, Failure::Contended);
     assert_eq!(err.slots[0].matching.len(), 2);
     assert_eq!(err.slots[0].earliest_free(), Some(240.0));
@@ -164,12 +181,18 @@ fn an_impossible_request_names_the_tag_that_makes_it_impossible() {
     let req = claim(&[("dut", &["soc=esp32c3", "psram=octal"])], Distinct::All);
     let err = allocate_in(&inv, &req, &no_one_is_busy()).unwrap_err();
 
-    assert!(err.unsatisfiable(), "no ESP32-C3 exists; retrying will never help");
+    assert!(
+        err.unsatisfiable(),
+        "no ESP32-C3 exists; retrying will never help"
+    );
     let diag = &err.slots[0];
     assert!(diag.impossible_tags.contains(&Tag::new("soc", "esp32c3")));
     // ...and tells the agent exactly how to relax the request.
     assert_eq!(diag.drop_to_match, parse_tags(["soc=esp32c3"]).unwrap());
-    assert_eq!(diag.closest_satisfiable, parse_tags(["psram=octal"]).unwrap());
+    assert_eq!(
+        diag.closest_satisfiable,
+        parse_tags(["psram=octal"]).unwrap()
+    );
 }
 
 #[test]
@@ -181,8 +204,15 @@ fn an_impossible_combination_of_individually_possible_tags_is_explained() {
 
     let diag = &err.slots[0];
     assert!(err.unsatisfiable());
-    assert!(diag.impossible_tags.is_empty(), "each tag exists on its own");
-    assert_eq!(diag.drop_to_match.len(), 1, "dropping one tag should suffice");
+    assert!(
+        diag.impossible_tags.is_empty(),
+        "each tag exists on its own"
+    );
+    assert_eq!(
+        diag.drop_to_match.len(),
+        1,
+        "dropping one tag should suffice"
+    );
 }
 
 #[test]
@@ -434,13 +464,33 @@ mod properties {
                 }
                 used.push(b.id.clone());
                 let c = benchd_core::fit_cost(b, req, counts, weights);
-                go(i + 1, slots, request, free, used, counts, weights, acc + c, best);
+                go(
+                    i + 1,
+                    slots,
+                    request,
+                    free,
+                    used,
+                    counts,
+                    weights,
+                    acc + c,
+                    best,
+                );
                 used.pop();
             }
         }
 
         let mut best = None;
-        go(0, &slots, request, &free, &mut Vec::new(), counts, weights, 0.0, &mut best);
+        go(
+            0,
+            &slots,
+            request,
+            &free,
+            &mut Vec::new(),
+            counts,
+            weights,
+            0.0,
+            &mut best,
+        );
         best
     }
 

@@ -26,9 +26,11 @@ pub struct Daemon {
 
 impl Daemon {
     pub async fn connect(socket: &str, name: &str) -> Result<Arc<Self>> {
-        let stream = tokio::net::UnixStream::connect(socket).await.with_context(|| {
-            format!("failed to connect to the benchd client daemon at {socket}")
-        })?;
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .with_context(|| {
+                format!("failed to connect to the benchd client daemon at {socket}")
+            })?;
         let (read, write) = stream.into_split();
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
@@ -64,7 +66,12 @@ impl Daemon {
 
         // Registration is a request for a token and always succeeds; there is
         // no authentication (D19).
-        daemon.request(ClientMsg::OpenSession { request: RequestId(0), name: name.into() }).await?;
+        daemon
+            .request(ClientMsg::OpenSession {
+                request: RequestId(0),
+                name: name.into(),
+            })
+            .await?;
         Ok(daemon)
     }
 
@@ -113,11 +120,17 @@ impl Daemon {
             .map_err(|_| anyhow!("the benchd client daemon closed the connection"))?;
 
         if value.get("msg").and_then(Value::as_str) == Some("error") {
-            let detail = value.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+            let detail = value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
             // The retryable flag is the machine-readable form of
             // unsatisfiable-versus-contended; surface it in the text so the
             // agent sees it too (D14).
-            let retryable = value.get("retryable").and_then(Value::as_bool).unwrap_or(false);
+            let retryable = value
+                .get("retryable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             return Err(anyhow!(
                 "{detail}{}",
                 if retryable {
@@ -151,7 +164,10 @@ impl Daemon {
             .map_err(|_| anyhow!("the benchd client daemon closed the connection"))?;
 
         if paths.get("msg").and_then(Value::as_str) == Some("failed") {
-            let detail = paths.get("detail").and_then(Value::as_str).unwrap_or("unknown");
+            let detail = paths
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
             return Err(anyhow!(
                 "the claim could not be set up and has been released: {detail}\n\n\
                  (nothing is held; the bench is free for another attempt)"

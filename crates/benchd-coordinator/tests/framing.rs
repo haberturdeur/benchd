@@ -27,7 +27,9 @@ async fn switching_out_of_line_framing_keeps_the_bytes_that_follow() {
     wire.extend_from_slice(br#"{"channel":"k1","side":"host"}"#);
     wire.push(b'\n');
     wire.extend_from_slice(payload);
-    tokio::io::AsyncWriteExt::write_all(&mut writer, &wire).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut writer, &wire)
+        .await
+        .unwrap();
 
     let mut lines = FramedRead::new(reader, LinesCodec::new());
     let hello = lines.next().await.unwrap().unwrap();

@@ -37,7 +37,10 @@ fn ordinary_device_paths_are_accepted() {
         "/dev/ttyACM0",
         "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_30:ED:A0:EC:ED:41-if00",
     ] {
-        assert!(valid_device_path(Path::new(ok)).is_ok(), "{ok:?} should be allowed");
+        assert!(
+            valid_device_path(Path::new(ok)).is_ok(),
+            "{ok:?} should be allowed"
+        );
     }
 }
 
@@ -45,7 +48,16 @@ fn ordinary_device_paths_are_accepted() {
 fn path_components_that_could_escape_a_directory_are_refused() {
     // Slot names come from an agent's claim, resource names from a host's
     // config; both become directory components inside a root daemon.
-    for hostile in ["..", ".", "a/b", "/abs", "", "..\\/..", "with space", "a\0b"] {
+    for hostile in [
+        "..",
+        ".",
+        "a/b",
+        "/abs",
+        "",
+        "..\\/..",
+        "with space",
+        "a\0b",
+    ] {
         assert!(!valid_component(hostile), "{hostile:?} must be refused");
     }
     for ok in ["dut", "peer", "node_a", "node-b", "usb.0"] {

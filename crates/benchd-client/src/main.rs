@@ -28,7 +28,10 @@ use crate::agent::Agents;
 use crate::materialize::Materializer;
 
 #[derive(Parser)]
-#[command(name = "benchd-clientd", about = "benchd client daemon (one per machine)")]
+#[command(
+    name = "benchd-clientd",
+    about = "benchd client daemon (one per machine)"
+)]
 struct Args {
     /// Coordinator to dial. Only the coordinator listens (D5).
     #[arg(long, default_value_t = format!("127.0.0.1:{DEFAULT_PORT}"))]
@@ -62,7 +65,11 @@ pub struct Shared {
 impl Shared {
     async fn lease_queue(&self, lease: benchd_core::lease::LeaseId) -> Arc<Mutex<()>> {
         let mut locks = self.lease_locks.lock().await;
-        Arc::clone(locks.entry(lease).or_insert_with(|| Arc::new(Mutex::new(()))))
+        Arc::clone(
+            locks
+                .entry(lease)
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
     }
 
     pub async fn send(&self, msg: &ClientMsg) {
@@ -175,7 +182,9 @@ async fn run(args: &Args, shared: Arc<Shared>) -> Result<()> {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                let Ok(line) = serde_json::to_string(&ClientMsg::Heartbeat) else { break };
+                let Ok(line) = serde_json::to_string(&ClientMsg::Heartbeat) else {
+                    break;
+                };
                 if tx.send(line).is_err() {
                     break;
                 }
@@ -256,7 +265,13 @@ fn dispatch(shared: &Arc<Shared>, msg: ToClient) {
 async fn handle(shared: &Arc<Shared>, msg: ToClient) {
     match msg {
         // Instructions we execute.
-        ToClient::Materialize { request, lease, epoch, session, slots } => {
+        ToClient::Materialize {
+            request,
+            lease,
+            epoch,
+            session,
+            slots,
+        } => {
             let owner = shared.agents.owner_for(session).await;
             let uid = shared.agents.uid_for(session).await;
             let outcome = {
@@ -269,20 +284,42 @@ async fn handle(shared: &Arc<Shared>, msg: ToClient) {
             } else {
                 tracing::error!(%lease, ?outcome, "materialisation failed");
             }
-            shared.send(&ClientMsg::Done { request, result: outcome }).await;
+            shared
+                .send(&ClientMsg::Done {
+                    request,
+                    result: outcome,
+                })
+                .await;
         }
-        ToClient::Unmaterialize { request, lease, epoch, session } => {
+        ToClient::Unmaterialize {
+            request,
+            lease,
+            epoch,
+            session,
+        } => {
             let owner = shared.agents.owner_for(session).await;
             let outcome = {
                 let mut m = shared.materializer.lock().await;
                 m.unmaterialize(lease, epoch, &owner).await
             };
-            shared.send(&ClientMsg::Done { request, result: outcome }).await;
+            shared
+                .send(&ClientMsg::Done {
+                    request,
+                    result: outcome,
+                })
+                .await;
         }
 
         // Unsolicited lease events: forward to whichever agent holds it.
-        ToClient::Revoking { lease, reason, teardown_at } => {
-            shared.agents.notify_revoking(lease, &reason, teardown_at).await;
+        ToClient::Revoking {
+            lease,
+            reason,
+            teardown_at,
+        } => {
+            shared
+                .agents
+                .notify_revoking(lease, &reason, teardown_at)
+                .await;
         }
         ToClient::Ended { lease, reason } => {
             shared.agents.notify_ended(lease, &reason).await;
@@ -291,7 +328,10 @@ async fn handle(shared: &Arc<Shared>, msg: ToClient) {
             // The agent has already been told (see `dispatch`); this is the
             // teardown, which had to wait for any in-flight materialisation of
             // the same lease so it cannot undo work that has not happened yet.
-            let owner = shared.agents.owner_for(lease_session(shared, lease).await).await;
+            let owner = shared
+                .agents
+                .owner_for(lease_session(shared, lease).await)
+                .await;
             let mut m = shared.materializer.lock().await;
             m.unmaterialize_now(lease, &owner).await;
         }

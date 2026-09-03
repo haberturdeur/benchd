@@ -48,7 +48,11 @@ struct Args {
 fn derive_identity() -> String {
     for (var, prefix) in [("PI_SESSION_ID", "pi"), ("CLAUDE_SESSION_ID", "claude")] {
         if let Ok(id) = std::env::var(var) {
-            let short: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+            let short: String = id
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(8)
+                .collect();
             if !short.is_empty() {
                 return format!("{prefix}-{short}");
             }
@@ -109,11 +113,15 @@ impl Benchd {
     async fn tag_list(&self, _: Parameters<NoArgs>) -> Result<CallToolResult, ErrorData> {
         let value = self
             .daemon
-            .simple(ClientMsg::TagList { request: RequestId(0) })
+            .simple(ClientMsg::TagList {
+                request: RequestId(0),
+            })
             .await
             .map_err(internal)?;
         let tags = value.get("tags").cloned().unwrap_or_default();
-        Ok(text(&serde_json::to_string_pretty(&tags).unwrap_or_default()))
+        Ok(text(
+            &serde_json::to_string_pretty(&tags).unwrap_or_default(),
+        ))
     }
 
     #[tool(
@@ -144,7 +152,10 @@ impl Benchd {
         lines.push(format!(
             "lease {} — expires at {} (unix seconds)",
             value.get("lease").and_then(|v| v.as_u64()).unwrap_or(0),
-            value.get("expires_at").and_then(|v| v.as_u64()).unwrap_or(0),
+            value
+                .get("expires_at")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
         ));
         if let Some(note) = value.get("note").and_then(|v| v.as_str()) {
             lines.push(format!("note: {note}"));
@@ -195,7 +206,10 @@ impl Benchd {
         Ok(text(&format!(
             "lease {} now expires at {}",
             args.lease,
-            value.get("expires_at").and_then(|v| v.as_u64()).unwrap_or(0)
+            value
+                .get("expires_at")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
         )))
     }
 
@@ -237,7 +251,9 @@ impl Benchd {
         if leases.as_array().map(|a| a.is_empty()).unwrap_or(true) {
             return Ok(text("no leases held"));
         }
-        Ok(text(&serde_json::to_string_pretty(&leases).unwrap_or_default()))
+        Ok(text(
+            &serde_json::to_string_pretty(&leases).unwrap_or_default(),
+        ))
     }
 }
 
@@ -265,9 +281,12 @@ async fn main() -> anyhow::Result<()> {
     let daemon = Daemon::connect(&args.socket, &identity).await?;
     tracing::info!(%identity, "registered");
 
-    let service = Benchd { daemon, tool_router: Benchd::tool_router() }
-        .serve(rmcp::transport::stdio())
-        .await?;
+    let service = Benchd {
+        daemon,
+        tool_router: Benchd::tool_router(),
+    }
+    .serve(rmcp::transport::stdio())
+    .await?;
     service.waiting().await?;
     Ok(())
 }

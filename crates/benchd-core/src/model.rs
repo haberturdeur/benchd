@@ -18,9 +18,15 @@ pub enum InventoryError {
     #[error("{0}")]
     Tag(#[from] TagError),
     #[error("failed to read {path}: {source}")]
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("failed to parse {path}: {source}")]
-    Parse { path: PathBuf, source: toml::de::Error },
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
     #[error("bench {bench}: {reason}")]
     Bench { bench: String, reason: String },
 }
@@ -53,7 +59,10 @@ pub enum Resource {
     /// describe. Declare it and a silent board swap is refused at registration
     /// instead of handing an agent an ESP32-C3 that every tag calls an S3.
     /// Leave it out and whatever is in the slot is accepted.
-    Serial { path: PathBuf, serial: Option<String> },
+    Serial {
+        path: PathBuf,
+        serial: Option<String>,
+    },
     /// A whole USB device, for USB/IP export to a remote client. Carries the
     /// bus id (`1-2.3`) that `usbip bind` needs. Not handled by the local
     /// bind-mount backend.
@@ -127,7 +136,9 @@ impl Requirement {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        Ok(Requirement { tags: parse_tags(items)? })
+        Ok(Requirement {
+            tags: parse_tags(items)?,
+        })
     }
 
     /// The entire matching semantic, in one line: a bench matches when its tags
@@ -173,7 +184,10 @@ pub fn valid_device_path(path: &std::path::Path) -> Result<(), String> {
     if !path.is_absolute() {
         return Err(format!("{} is not an absolute path", path.display()));
     }
-    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return Err(format!("{} contains '..'", path.display()));
     }
     if !path.starts_with("/dev/") {
@@ -261,19 +275,22 @@ impl Inventory {
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, InventoryError> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path)
-            .map_err(|source| InventoryError::Io { path: path.to_path_buf(), source })?;
-        let raw: RawInventory = toml::from_str(&text)
-            .map_err(|source| InventoryError::Parse { path: path.to_path_buf(), source })?;
+        let text = std::fs::read_to_string(path).map_err(|source| InventoryError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let raw: RawInventory = toml::from_str(&text).map_err(|source| InventoryError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
         raw.build()
     }
 
     pub fn from_toml_str(text: &str) -> Result<Self, InventoryError> {
-        let raw: RawInventory =
-            toml::from_str(text).map_err(|source| InventoryError::Parse {
-                path: PathBuf::from("<inline>"),
-                source,
-            })?;
+        let raw: RawInventory = toml::from_str(text).map_err(|source| InventoryError::Parse {
+            path: PathBuf::from("<inline>"),
+            source,
+        })?;
         raw.build()
     }
 }
@@ -390,25 +407,27 @@ impl RawInventory {
             // through the parser means a bench id that could never be written
             // as `name=<id>` fails at load time rather than producing a bench
             // nobody can select.
-            let name_tag = Tag::parse(&format!("name={id}")).map_err(|e| InventoryError::Bench {
-                bench: id.clone(),
-                reason: format!("bench id is not usable as a tag value: {e}"),
-            })?;
+            let name_tag =
+                Tag::parse(&format!("name={id}")).map_err(|e| InventoryError::Bench {
+                    bench: id.clone(),
+                    reason: format!("bench id is not usable as a tag value: {e}"),
+                })?;
             tags.insert(name_tag);
 
             let mut resources = BTreeMap::new();
             for (res_name, res) in body.resources {
                 let resource = match res.kind.as_str() {
                     "serial" => Resource::Serial {
-                        path: res.by_path.or(res.by_id).ok_or_else(|| {
-                            InventoryError::Bench {
+                        path: res
+                            .by_path
+                            .or(res.by_id)
+                            .ok_or_else(|| InventoryError::Bench {
                                 bench: id.clone(),
                                 reason: format!(
                                     "serial resource {res_name:?} needs 'by_path' \
                                      (preferred) or 'by_id'"
                                 ),
-                            }
-                        })?,
+                            })?,
                         serial: res.serial,
                     },
                     "usb" => Resource::Usb {
@@ -439,6 +458,9 @@ impl RawInventory {
             );
         }
 
-        Ok(Inventory { benches, vocabulary })
+        Ok(Inventory {
+            benches,
+            vocabulary,
+        })
     }
 }

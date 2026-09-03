@@ -60,9 +60,10 @@ async fn main() -> Result<()> {
 
     let request = match &args.command {
         Command::Benches | Command::Leases => OperatorMsg::Inspect,
-        Command::Release { bench, now } => {
-            OperatorMsg::ForceRelease { bench: bench.clone(), immediate: *now }
-        }
+        Command::Release { bench, now } => OperatorMsg::ForceRelease {
+            bench: bench.clone(),
+            immediate: *now,
+        },
     };
     sink.send(serde_json::to_string(&request)?).await?;
 
@@ -70,9 +71,8 @@ async fn main() -> Result<()> {
         .await
         .map_err(|_| anyhow!("the coordinator did not reply within 10s"))?
         .ok_or_else(|| anyhow!("the coordinator closed the connection"))??;
-    let reply: ToOperator = serde_json::from_str(&line).with_context(|| {
-        format!("could not understand the coordinator's reply: {line}")
-    })?;
+    let reply: ToOperator = serde_json::from_str(&line)
+        .with_context(|| format!("could not understand the coordinator's reply: {line}"))?;
 
     match (&args.command, reply) {
         (Command::Benches, ToOperator::State { benches, leases }) => {
@@ -96,7 +96,10 @@ async fn main() -> Result<()> {
 }
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn print_benches(
@@ -118,7 +121,11 @@ fn print_benches(
             Some(lease) => format!(
                 "held by {} — {} ({}s left)",
                 lease.owner,
-                if lease.reason.is_empty() { "no reason given" } else { &lease.reason },
+                if lease.reason.is_empty() {
+                    "no reason given"
+                } else {
+                    &lease.reason
+                },
                 lease.expires_at.saturating_sub(now())
             ),
             None => "free".into(),

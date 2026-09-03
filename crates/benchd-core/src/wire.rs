@@ -61,13 +61,21 @@ pub struct BenchSpec {
 #[serde(tag = "msg", rename_all = "snake_case")]
 pub enum HostMsg {
     /// First message on the connection.
-    Register { bench: BenchSpec },
+    Register {
+        bench: BenchSpec,
+    },
     Heartbeat,
     /// Reply to [`ToHost::Export`] / [`ToHost::Unexport`].
-    Done { request: RequestId, result: Outcome },
+    Done {
+        request: RequestId,
+        result: Outcome,
+    },
     /// A resource vanished from under us. The host releases and exits for a
     /// clean restart rather than trying to repair itself in place.
-    DeviceLost { resource: String, detail: String },
+    DeviceLost {
+        resource: String,
+        detail: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -92,7 +100,11 @@ pub enum ToHost {
         #[serde(default)]
         channels: BTreeMap<String, ChannelKey>,
     },
-    Unexport { request: RequestId, lease: LeaseId, epoch: Epoch },
+    Unexport {
+        request: RequestId,
+        lease: LeaseId,
+        epoch: Epoch,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -105,18 +117,45 @@ pub enum ClientMsg {
     /// A new agent appeared on this machine. There is no authentication: this
     /// is a request for a token and it always succeeds (D19). `name` is a
     /// diagnostic label, not an authorisation input.
-    OpenSession { request: RequestId, name: String },
-    CloseSession { request: RequestId, session: SessionToken },
+    OpenSession {
+        request: RequestId,
+        name: String,
+    },
+    CloseSession {
+        request: RequestId,
+        session: SessionToken,
+    },
 
-    Claim { request: RequestId, session: SessionToken, claim: ClaimSpec },
-    Renew { request: RequestId, session: SessionToken, lease: LeaseId, extra: Secs },
-    Release { request: RequestId, session: SessionToken, lease: LeaseId },
-    Status { request: RequestId, session: SessionToken },
-    TagList { request: RequestId },
+    Claim {
+        request: RequestId,
+        session: SessionToken,
+        claim: ClaimSpec,
+    },
+    Renew {
+        request: RequestId,
+        session: SessionToken,
+        lease: LeaseId,
+        extra: Secs,
+    },
+    Release {
+        request: RequestId,
+        session: SessionToken,
+        lease: LeaseId,
+    },
+    Status {
+        request: RequestId,
+        session: SessionToken,
+    },
+    TagList {
+        request: RequestId,
+    },
 
     Heartbeat,
     /// Reply to [`ToClient::Materialize`] / [`ToClient::Unmaterialize`].
-    Done { request: RequestId, result: Outcome },
+    Done {
+        request: RequestId,
+        result: Outcome,
+    },
 
     /// Create this identity's lease directory and report where it is.
     ///
@@ -126,7 +165,10 @@ pub enum ClientMsg {
     /// created by root, not by the agent. An agent that can write its own lease
     /// directory can plant a symlink where root will later create the next
     /// lease, which turns a bind mount into an arbitrary-location one.
-    PrepareOwner { request: RequestId, name: String },
+    PrepareOwner {
+        request: RequestId,
+        name: String,
+    },
 }
 
 /// A claim as it crosses the wire. Mirrors [`crate::model::ClaimRequest`] but
@@ -156,7 +198,11 @@ pub enum ToClient {
     /// Carries the internal id as well as the token: the client daemon needs it
     /// to tie a later `Materialize` back to an owner directory, and it is not
     /// secret — the token is what authorises, the id merely identifies.
-    SessionOpened { request: RequestId, session: SessionToken, id: SessionId },
+    SessionOpened {
+        request: RequestId,
+        session: SessionToken,
+        id: SessionId,
+    },
     /// Reply to a request that succeeded but returns nothing.
     Ok { request: RequestId },
     /// Reply to `PrepareOwner`: the directory to bind-mount.
@@ -164,7 +210,11 @@ pub enum ToClient {
     /// Reply to any request that failed. `retryable` is the machine-readable
     /// form of the unsatisfiable-versus-contended distinction (D14): an agent
     /// must never retry-spin on a request that can never succeed.
-    Error { request: RequestId, error: String, retryable: bool },
+    Error {
+        request: RequestId,
+        error: String,
+        retryable: bool,
+    },
 
     /// A claim succeeded. Deliberately carries only the *assignment*, not
     /// paths: the coordinator does not know where the client will put the
@@ -181,9 +231,18 @@ pub enum ToClient {
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
-    Renewed { request: RequestId, expires_at: Secs },
-    Status { request: RequestId, leases: Vec<LeaseStatus> },
-    Tags { request: RequestId, tags: Vec<TagInfo> },
+    Renewed {
+        request: RequestId,
+        expires_at: Secs,
+    },
+    Status {
+        request: RequestId,
+        leases: Vec<LeaseStatus>,
+    },
+    Tags {
+        request: RequestId,
+        tags: Vec<TagInfo>,
+    },
 
     /// Make a granted lease's devices appear for `session`.
     Materialize {
@@ -194,10 +253,19 @@ pub enum ToClient {
         /// slot -> resources to expose
         slots: BTreeMap<String, BTreeMap<String, ResourceHandle>>,
     },
-    Unmaterialize { request: RequestId, lease: LeaseId, epoch: Epoch, session: SessionId },
+    Unmaterialize {
+        request: RequestId,
+        lease: LeaseId,
+        epoch: Epoch,
+        session: SessionId,
+    },
 
     /// Unsolicited: the grace window has started. Park the board or renew.
-    Revoking { lease: LeaseId, reason: String, teardown_at: Secs },
+    Revoking {
+        lease: LeaseId,
+        reason: String,
+        teardown_at: Secs,
+    },
     /// Unsolicited: the lease is gone.
     Ended { lease: LeaseId, reason: String },
     /// Unsolicited: the lease was withdrawn before it ever worked. The holder
@@ -273,9 +341,16 @@ pub enum OperatorMsg {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "msg", rename_all = "snake_case")]
 pub enum ToOperator {
-    State { benches: Vec<BenchView>, leases: Vec<LeaseView> },
-    Released { count: usize },
-    Error { error: String },
+    State {
+        benches: Vec<BenchView>,
+        leases: Vec<LeaseView>,
+    },
+    Released {
+        count: usize,
+    },
+    Error {
+        error: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -309,8 +384,12 @@ pub enum Outcome {
     Ok,
     /// The instruction was for a superseded lease and was ignored (D7). Not an
     /// error: it is the fencing working as designed.
-    Stale { seen: Epoch },
-    Failed { detail: String },
+    Stale {
+        seen: Epoch,
+    },
+    Failed {
+        detail: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -342,7 +421,13 @@ pub struct TagInfo {
 pub fn env_var(slot: &str, resource: &str) -> String {
     let clean = |s: &str| {
         s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>()
     };
     format!("LAB_{}_{}", clean(slot), clean(resource))
@@ -415,7 +500,10 @@ mod tests {
 
     #[test]
     fn a_resource_handle_says_how_to_reach_it() {
-        let local = encode(&ResourceHandle::Local { path: "/dev/ttyACM0".into() }).unwrap();
+        let local = encode(&ResourceHandle::Local {
+            path: "/dev/ttyACM0".into(),
+        })
+        .unwrap();
         assert_eq!(local, r#"{"via":"local","path":"/dev/ttyACM0"}"#);
 
         let remote = encode(&ResourceHandle::UsbIp {

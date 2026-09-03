@@ -86,7 +86,11 @@ impl UsbDevice {
         if buf.len() < USB_DEVICE_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("usbip_usb_device is {} bytes, got {}", USB_DEVICE_SIZE, buf.len()),
+                format!(
+                    "usbip_usb_device is {} bytes, got {}",
+                    USB_DEVICE_SIZE,
+                    buf.len()
+                ),
             ));
         }
         let mut at = 0;
@@ -161,7 +165,9 @@ async fn recv_op_common<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<(u16, 
     if version != USBIP_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("usbip version mismatch: peer speaks {version:#06x}, we speak {USBIP_VERSION:#06x}"),
+            format!(
+                "usbip version mismatch: peer speaks {version:#06x}, we speak {USBIP_VERSION:#06x}"
+            ),
         ));
     }
     Ok((
@@ -227,7 +233,10 @@ where
         stream.flush().await?;
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("client asked for {wanted}, this bench exports {}", device.busid),
+            format!(
+                "client asked for {wanted}, this bench exports {}",
+                device.busid
+            ),
         ));
     }
 
@@ -277,7 +286,10 @@ mod tests {
     #[test]
     fn strings_are_nul_terminated_and_never_overflow_their_field() {
         let long = "x".repeat(500);
-        let device = UsbDevice { path: long, ..sample() };
+        let device = UsbDevice {
+            path: long,
+            ..sample()
+        };
         let encoded = device.encode();
         assert_eq!(encoded.len(), USB_DEVICE_SIZE);
         // Truncated with room for the terminator, so the kernel's strlen stops.

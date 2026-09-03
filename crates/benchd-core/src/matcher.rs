@@ -96,9 +96,17 @@ impl fmt::Display for SlotDiagnosis {
 
         match self.failure {
             Failure::Unsatisfiable => {
-                write!(f, "slot {:?}: no bench exists matching {{{want}}}", self.slot)?;
+                write!(
+                    f,
+                    "slot {:?}: no bench exists matching {{{want}}}",
+                    self.slot
+                )?;
                 if !self.impossible_tags.is_empty() {
-                    write!(f, "\n  no bench has: {}", format_tags(&self.impossible_tags))?;
+                    write!(
+                        f,
+                        "\n  no bench has: {}",
+                        format_tags(&self.impossible_tags)
+                    )?;
                 }
                 if !self.drop_to_match.is_empty() {
                     write!(
@@ -155,7 +163,11 @@ impl NoMatch {
     /// agent to retry a request that can never succeed, which is precisely the
     /// spin D14 exists to prevent.
     pub fn unsatisfiable(&self) -> bool {
-        self.conflict_only || self.slots.iter().any(|s| s.failure == Failure::Unsatisfiable)
+        self.conflict_only
+            || self
+                .slots
+                .iter()
+                .any(|s| s.failure == Failure::Unsatisfiable)
     }
 
     /// Soonest the *whole* claim could be satisfiable: every slot must free up,
@@ -251,7 +263,11 @@ pub fn allocate(
             .filter(|b| requirement.matches(b))
             .map(|b| b.id.clone())
             .collect();
-        let available = hits.iter().filter(|id| !busy.contains_key(*id)).cloned().collect();
+        let available = hits
+            .iter()
+            .filter(|id| !busy.contains_key(*id))
+            .cloned()
+            .collect();
         matching.insert(slot.as_str(), hits);
         free.insert(slot.as_str(), available);
     }
@@ -342,7 +358,9 @@ fn best_assignment(
     for slot in &order {
         let mut ids: Vec<&str> = free[slot].iter().map(String::as_str).collect();
         ids.sort_by(|a, b| {
-            cost[&(*slot, *a)].total_cmp(&cost[&(*slot, *b)]).then_with(|| a.cmp(b))
+            cost[&(*slot, *a)]
+                .total_cmp(&cost[&(*slot, *b)])
+                .then_with(|| a.cmp(b))
         });
         candidates.insert(slot, ids);
     }
@@ -402,7 +420,13 @@ fn best_assignment(
         best: None,
         nodes: 0,
     };
-    recurse(&mut search, 0, &mut BTreeSet::new(), &mut BTreeMap::new(), 0.0);
+    recurse(
+        &mut search,
+        0,
+        &mut BTreeSet::new(),
+        &mut BTreeMap::new(),
+        0.0,
+    );
     search.best
 }
 

@@ -42,7 +42,12 @@ struct Active {
 
 impl Exports {
     pub fn new(spec: BenchSpec, coordinator: String) -> Self {
-        Exports { spec, coordinator, seen: Epoch(0), active: BTreeMap::new() }
+        Exports {
+            spec,
+            coordinator,
+            seen: Epoch(0),
+            active: BTreeMap::new(),
+        }
     }
 
     /// Undo anything a previous incarnation of this process left behind.
@@ -108,7 +113,14 @@ impl Exports {
 
         if channels.is_empty() {
             tracing::info!(bench = %self.spec.id, %lease, ?epoch, "exported (co-located)");
-            self.active.insert(lease, Active { epoch, session, exported: Vec::new() });
+            self.active.insert(
+                lease,
+                Active {
+                    epoch,
+                    session,
+                    exported: Vec::new(),
+                },
+            );
             return Outcome::Ok;
         }
 
@@ -142,7 +154,9 @@ impl Exports {
                 // too — otherwise the board vanishes from the machine until the
                 // host process restarts.
                 sysfs::unbind(busid).await;
-                return Outcome::Failed { detail: format!("usbip bind {busid}: {err}") };
+                return Outcome::Failed {
+                    detail: format!("usbip bind {busid}: {err}"),
+                };
             }
 
             // From here the device IS bound, so every failure path below must
@@ -155,14 +169,18 @@ impl Exports {
                 Ok(device) => device,
                 Err(err) => {
                     self.tear_down(&bound).await;
-                    return Outcome::Failed { detail: format!("reading {busid}: {err}") };
+                    return Outcome::Failed {
+                        detail: format!("reading {busid}: {err}"),
+                    };
                 }
             };
             match self.serve_channel(&key, device).await {
                 Ok(()) => exported.push(busid.clone()),
                 Err(err) => {
                     self.tear_down(&bound).await;
-                    return Outcome::Failed { detail: format!("exporting {busid}: {err}") };
+                    return Outcome::Failed {
+                        detail: format!("exporting {busid}: {err}"),
+                    };
                 }
             }
         }
@@ -171,7 +189,14 @@ impl Exports {
             bench = %self.spec.id, %lease, ?epoch,
             devices = exported.len(), "exported (relayed)"
         );
-        self.active.insert(lease, Active { epoch, session, exported });
+        self.active.insert(
+            lease,
+            Active {
+                epoch,
+                session,
+                exported,
+            },
+        );
         Outcome::Ok
     }
 
@@ -188,7 +213,10 @@ impl Exports {
         // One line of JSON to identify the channel, then the socket is opaque
         // USB/IP bytes for the rest of its life.
         let mut sink = FramedWrite::new(write, LinesCodec::new());
-        let hello = ChannelHello { channel: key.clone(), side: ChannelSide::Host };
+        let hello = ChannelHello {
+            channel: key.clone(),
+            side: ChannelSide::Host,
+        };
         sink.send(serde_json::to_string(&hello)?)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -349,7 +377,10 @@ fn busid_for_tty(path: &std::path::Path) -> Option<String> {
 async fn describe(busid: &str) -> std::io::Result<UsbDevice> {
     let base = format!("/sys/bus/usb/devices/{busid}");
     async fn field(base: &str, name: &str) -> std::io::Result<String> {
-        Ok(tokio::fs::read_to_string(format!("{base}/{name}")).await?.trim().to_string())
+        Ok(tokio::fs::read_to_string(format!("{base}/{name}"))
+            .await?
+            .trim()
+            .to_string())
     }
     fn hex(text: &str) -> u16 {
         u16::from_str_radix(text.trim(), 16).unwrap_or(0)
@@ -379,12 +410,10 @@ async fn describe(busid: &str) -> std::io::Result<UsbDevice> {
         b_device_class: dec(&field(&base, "bDeviceClass").await.unwrap_or_default()),
         b_device_subclass: dec(&field(&base, "bDeviceSubClass").await.unwrap_or_default()),
         b_device_protocol: dec(&field(&base, "bDeviceProtocol").await.unwrap_or_default()),
-        b_configuration_value: dec(
-            &field(&base, "bConfigurationValue").await.unwrap_or_default(),
-        ),
-        b_num_configurations: dec(
-            &field(&base, "bNumConfigurations").await.unwrap_or_default(),
-        ),
+        b_configuration_value: dec(&field(&base, "bConfigurationValue")
+            .await
+            .unwrap_or_default()),
+        b_num_configurations: dec(&field(&base, "bNumConfigurations").await.unwrap_or_default()),
         b_num_interfaces: dec(&field(&base, "bNumInterfaces").await.unwrap_or_default()),
     })
 }

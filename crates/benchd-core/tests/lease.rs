@@ -23,9 +23,12 @@ fn manager(limits: Limits) -> LeaseManager {
 
 fn claim(tags: &[&str], ttl: u64) -> ClaimRequest {
     ClaimRequest {
-        slots: [("dut".to_string(), Requirement::parse(tags.iter().copied()).unwrap())]
-            .into_iter()
-            .collect(),
+        slots: [(
+            "dut".to_string(),
+            Requirement::parse(tags.iter().copied()).unwrap(),
+        )]
+        .into_iter()
+        .collect(),
         distinct: Distinct::All,
         ttl_seconds: ttl,
         reason: "test".into(),
@@ -35,8 +38,14 @@ fn claim(tags: &[&str], ttl: u64) -> ClaimRequest {
 fn two_slot_claim(ttl: u64) -> ClaimRequest {
     ClaimRequest {
         slots: [
-            ("dut".to_string(), Requirement::parse(["soc=esp32s3"]).unwrap()),
-            ("peer".to_string(), Requirement::parse(["family=esp32"]).unwrap()),
+            (
+                "dut".to_string(),
+                Requirement::parse(["soc=esp32s3"]).unwrap(),
+            ),
+            (
+                "peer".to_string(),
+                Requirement::parse(["family=esp32"]).unwrap(),
+            ),
         ]
         .into_iter()
         .collect(),
@@ -99,11 +108,21 @@ fn each_grant_on_a_bench_gets_a_fresh_higher_epoch() {
     let s = m.register("agent-1");
 
     let first = m.claim(s, &claim(&["name=esp32s3-a"], 60), 0).unwrap();
-    let e1 = *m.lease(first.lease).unwrap().epochs.get("esp32s3-a").unwrap();
+    let e1 = *m
+        .lease(first.lease)
+        .unwrap()
+        .epochs
+        .get("esp32s3-a")
+        .unwrap();
     m.release(s, first.lease, 10).unwrap();
 
     let second = m.claim(s, &claim(&["name=esp32s3-a"], 60), 20).unwrap();
-    let e2 = *m.lease(second.lease).unwrap().epochs.get("esp32s3-a").unwrap();
+    let e2 = *m
+        .lease(second.lease)
+        .unwrap()
+        .epochs
+        .get("esp32s3-a")
+        .unwrap();
 
     assert!(e2 > e1, "epoch must increase: {e1:?} -> {e2:?}");
     assert_eq!(e1, Epoch(1));
@@ -112,7 +131,10 @@ fn each_grant_on_a_bench_gets_a_fresh_higher_epoch() {
 
 #[test]
 fn the_bench_limit_counts_across_all_of_a_sessions_leases() {
-    let mut m = manager(Limits { max_benches: 2, ..Default::default() });
+    let mut m = manager(Limits {
+        max_benches: 2,
+        ..Default::default()
+    });
     let s = m.register("agent-1");
     m.claim(s, &claim(&["family=esp32"], 60), 0).unwrap();
     m.claim(s, &claim(&["family=esp32"], 60), 0).unwrap();
@@ -120,13 +142,20 @@ fn the_bench_limit_counts_across_all_of_a_sessions_leases() {
     let err = m.claim(s, &claim(&["family=esp32"], 60), 0).unwrap_err();
     assert!(matches!(
         err,
-        ClaimError::Limit(LimitError::TooManyBenches { max: 2, held: 2, wanted: 1 })
+        ClaimError::Limit(LimitError::TooManyBenches {
+            max: 2,
+            held: 2,
+            wanted: 1
+        })
     ));
 }
 
 #[test]
 fn a_multi_slot_claim_counts_as_its_number_of_benches() {
-    let mut m = manager(Limits { max_benches: 2, ..Default::default() });
+    let mut m = manager(Limits {
+        max_benches: 2,
+        ..Default::default()
+    });
     let s = m.register("agent-1");
     let g = m.claim(s, &two_slot_claim(60), 0).unwrap();
     assert_eq!(g.assignment.len(), 2);
@@ -139,7 +168,11 @@ fn a_multi_slot_claim_counts_as_its_number_of_benches() {
 
 #[test]
 fn renewal_extends_from_now_and_is_trimmed_by_the_total_hold() {
-    let mut m = manager(Limits { max_ttl: 600, max_total_hold: 900, ..Default::default() });
+    let mut m = manager(Limits {
+        max_ttl: 600,
+        max_total_hold: 900,
+        ..Default::default()
+    });
     let s = m.register("agent-1");
     let g = m.claim(s, &claim(&["soc=esp32s3"], 600), 0).unwrap();
 
@@ -151,7 +184,10 @@ fn renewal_extends_from_now_and_is_trimmed_by_the_total_hold() {
 
 #[test]
 fn renewal_is_refused_once_the_hold_budget_is_spent() {
-    let mut m = manager(Limits { max_total_hold: 300, ..Default::default() });
+    let mut m = manager(Limits {
+        max_total_hold: 300,
+        ..Default::default()
+    });
     let s = m.register("agent-1");
     let g = m.claim(s, &claim(&["soc=esp32s3"], 300), 0).unwrap();
     assert!(matches!(
@@ -177,7 +213,10 @@ fn another_session_cannot_renew_or_release_your_lease() {
 fn a_lease_warns_inside_its_ttl_and_frees_the_bench_exactly_when_promised() {
     // An agent that asked for 600s gets 600s: the warning lands at T-grace and
     // teardown at T, so the ETA the matcher quoted stays true.
-    let mut m = manager(Limits { grace: 30, ..Default::default() });
+    let mut m = manager(Limits {
+        grace: 30,
+        ..Default::default()
+    });
     let s = m.register("agent-1");
     let g = m.claim(s, &claim(&["soc=esp32s3"], 600), 0).unwrap();
 
@@ -195,21 +234,36 @@ fn a_lease_warns_inside_its_ttl_and_frees_the_bench_exactly_when_promised() {
             }
         }]
     );
-    assert!(matches!(m.lease(g.lease).unwrap().state, LeaseState::Revoking { .. }));
+    assert!(matches!(
+        m.lease(g.lease).unwrap().state,
+        LeaseState::Revoking { .. }
+    ));
 
     let gone = m.tick(600);
     assert!(m.lease(g.lease).is_none(), "bench is free at exactly T");
-    assert!(matches!(gone[0], Effect::Unmaterialize { .. }), "client lets go first");
+    assert!(
+        matches!(gone[0], Effect::Unmaterialize { .. }),
+        "client lets go first"
+    );
     assert!(matches!(gone[1], Effect::Unexport { .. }));
     assert!(gone.iter().any(|e| matches!(
         e,
-        Effect::Notify { event: LeaseEvent::Ended { reason: EndReason::Expired, .. }, .. }
+        Effect::Notify {
+            event: LeaseEvent::Ended {
+                reason: EndReason::Expired,
+                ..
+            },
+            ..
+        }
     )));
 }
 
 #[test]
 fn noticing_the_warning_and_renewing_rescues_the_lease() {
-    let mut m = manager(Limits { grace: 30, ..Default::default() });
+    let mut m = manager(Limits {
+        grace: 30,
+        ..Default::default()
+    });
     let s = m.register("agent-1");
     let g = m.claim(s, &claim(&["soc=esp32s3"], 600), 0).unwrap();
 
@@ -242,7 +296,10 @@ fn losing_the_session_releases_immediately_rather_than_waiting_out_the_ttl() {
 
 #[test]
 fn an_operator_forced_release_is_graced_but_cannot_be_renewed_away() {
-    let mut m = manager(Limits { grace: 30, ..Default::default() });
+    let mut m = manager(Limits {
+        grace: 30,
+        ..Default::default()
+    });
     let s = m.register("agent-1");
     let g = m.claim(s, &claim(&["soc=esp32s3"], 3600), 0).unwrap();
 
@@ -260,14 +317,23 @@ fn an_operator_forced_release_is_graced_but_cannot_be_renewed_away() {
     );
 
     // The holder gets a window to park the board, but cannot cling on.
-    assert_eq!(m.renew(s, g.lease, 600, 105), Err(LeaseError::ForciblyRevoked));
+    assert_eq!(
+        m.renew(s, g.lease, 600, 105),
+        Err(LeaseError::ForciblyRevoked)
+    );
     assert!(m.lease(g.lease).is_some(), "still held during grace");
 
     let gone = m.tick(130);
     assert!(m.lease(g.lease).is_none());
     assert!(gone.iter().any(|e| matches!(
         e,
-        Effect::Notify { event: LeaseEvent::Ended { reason: EndReason::Forced, .. }, .. }
+        Effect::Notify {
+            event: LeaseEvent::Ended {
+                reason: EndReason::Forced,
+                ..
+            },
+            ..
+        }
     )));
 }
 
@@ -281,7 +347,13 @@ fn releasing_is_immediate_because_the_holder_asked() {
     assert!(m.lease(g.lease).is_none());
     assert!(effects.iter().any(|e| matches!(
         e,
-        Effect::Notify { event: LeaseEvent::Ended { reason: EndReason::Released, .. }, .. }
+        Effect::Notify {
+            event: LeaseEvent::Ended {
+                reason: EndReason::Released,
+                ..
+            },
+            ..
+        }
     )));
     assert!(m.busy(10).is_empty());
 }
@@ -312,5 +384,8 @@ fn a_bench_can_leave_the_inventory_and_its_lease_goes_with_it() {
     let effects = m.drop_lease(g.lease);
     assert!(m.lease(g.lease).is_none());
     assert!(matches!(effects[0], Effect::Unmaterialize { .. }));
-    assert!(m.busy(1).is_empty(), "the bench is free for whoever is left");
+    assert!(
+        m.busy(1).is_empty(),
+        "the bench is free for whoever is left"
+    );
 }

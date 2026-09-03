@@ -41,7 +41,10 @@ impl<'de> Deserialize<'de> for Tag {
 
 impl Tag {
     pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
-        Tag { key: key.into(), value: value.into() }
+        Tag {
+            key: key.into(),
+            value: value.into(),
+        }
     }
 
     /// Parse `"key=value"`.
@@ -107,7 +110,10 @@ pub type TagSet = BTreeSet<Tag>;
 
 /// Render a tag set as a stable, space-separated string.
 pub fn format_tags(tags: &TagSet) -> String {
-    tags.iter().map(Tag::to_string).collect::<Vec<_>>().join(" ")
+    tags.iter()
+        .map(Tag::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Parse a list of `key=value` strings into a set.
@@ -189,7 +195,12 @@ impl Vocabulary {
         key_weights: BTreeMap<String, f64>,
         key_descriptions: BTreeMap<String, String>,
     ) -> Result<Self, TagError> {
-        let vocab = Vocabulary { defs, open_keys, key_weights, key_descriptions };
+        let vocab = Vocabulary {
+            defs,
+            open_keys,
+            key_weights,
+            key_descriptions,
+        };
         vocab.validate()?;
         Ok(vocab)
     }

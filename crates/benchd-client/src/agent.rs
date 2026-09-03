@@ -60,7 +60,11 @@ struct Inner {
 impl Agents {
     pub async fn owner_for(&self, session: SessionId) -> String {
         let inner = self.inner.lock().await;
-        inner.owners.get(&session).cloned().unwrap_or_else(|| session.to_string())
+        inner
+            .owners
+            .get(&session)
+            .cloned()
+            .unwrap_or_else(|| session.to_string())
     }
 
     /// Which uid should be able to open this session's devices.
@@ -121,7 +125,9 @@ impl Agents {
             _ => {}
         }
 
-        let Some(agent) = inner.agents.get(&agent_id) else { return };
+        let Some(agent) = inner.agents.get(&agent_id) else {
+            return;
+        };
         let msg = with_request(msg, theirs);
         if let Ok(line) = serde_json::to_string(&msg) {
             let _ = agent.out.send(line);
@@ -136,16 +142,23 @@ impl Agents {
         paths: BTreeMap<String, BTreeMap<String, String>>,
     ) {
         let inner = self.inner.lock().await;
-        let Some(agent_id) = inner.lease_owner.get(&lease) else { return };
-        let Some(agent) = inner.agents.get(agent_id) else { return };
+        let Some(agent_id) = inner.lease_owner.get(&lease) else {
+            return;
+        };
+        let Some(agent) = inner.agents.get(agent_id) else {
+            return;
+        };
         let msg = serde_json::json!({ "msg": "paths", "lease": lease, "slots": paths });
         let _ = agent.out.send(msg.to_string());
     }
 
     pub async fn notify_revoking(&self, lease: LeaseId, reason: &str, teardown_at: u64) {
-        self.notify(lease, serde_json::json!({
-            "msg": "revoking", "lease": lease, "reason": reason, "teardown_at": teardown_at
-        }))
+        self.notify(
+            lease,
+            serde_json::json!({
+                "msg": "revoking", "lease": lease, "reason": reason, "teardown_at": teardown_at
+            }),
+        )
         .await;
     }
 
@@ -155,9 +168,12 @@ impl Agents {
         // Deliberately does NOT forget the lease owner: the teardown for this
         // lease runs afterwards and still needs it to find the right directory.
         // It is cleaned up by notify_ended, or when the agent disconnects.
-        self.notify(lease, serde_json::json!({
-            "msg": "failed", "lease": lease, "detail": detail
-        }))
+        self.notify(
+            lease,
+            serde_json::json!({
+                "msg": "failed", "lease": lease, "detail": detail
+            }),
+        )
         .await;
     }
 
@@ -173,17 +189,24 @@ impl Agents {
     }
 
     pub async fn notify_ended(&self, lease: LeaseId, reason: &str) {
-        self.notify(lease, serde_json::json!({
-            "msg": "ended", "lease": lease, "reason": reason
-        }))
+        self.notify(
+            lease,
+            serde_json::json!({
+                "msg": "ended", "lease": lease, "reason": reason
+            }),
+        )
         .await;
         self.inner.lock().await.lease_owner.remove(&lease);
     }
 
     async fn notify(&self, lease: LeaseId, msg: serde_json::Value) {
         let inner = self.inner.lock().await;
-        let Some(agent_id) = inner.lease_owner.get(&lease) else { return };
-        let Some(agent) = inner.agents.get(agent_id) else { return };
+        let Some(agent_id) = inner.lease_owner.get(&lease) else {
+            return;
+        };
+        let Some(agent) = inner.agents.get(agent_id) else {
+            return;
+        };
         let _ = agent.out.send(msg.to_string());
     }
 
@@ -235,13 +258,36 @@ impl Agents {
 fn with_request(msg: ToClient, request: RequestId) -> ToClient {
     use ToClient::*;
     match msg {
-        SessionOpened { session, id, .. } => SessionOpened { request, session, id },
+        SessionOpened { session, id, .. } => SessionOpened {
+            request,
+            session,
+            id,
+        },
         Ok { .. } => Ok { request },
-        Error { error, retryable, .. } => Error { request, error, retryable },
-        Granted { lease, slots, expires_at, note, .. } => {
-            Granted { request, lease, slots, expires_at, note }
-        }
-        Renewed { expires_at, .. } => Renewed { request, expires_at },
+        Error {
+            error, retryable, ..
+        } => Error {
+            request,
+            error,
+            retryable,
+        },
+        Granted {
+            lease,
+            slots,
+            expires_at,
+            note,
+            ..
+        } => Granted {
+            request,
+            lease,
+            slots,
+            expires_at,
+            note,
+        },
+        Renewed { expires_at, .. } => Renewed {
+            request,
+            expires_at,
+        },
         Status { leases, .. } => Status { request, leases },
         Tags { tags, .. } => Tags { request, tags },
         other => other,
@@ -290,7 +336,13 @@ async fn serve_agent(shared: Arc<Shared>, socket: tokio::net::UnixStream) -> Res
         let id = inner.next_agent;
         inner.agents.insert(
             id,
-            Agent { name: String::new(), session: None, internal: None, uid, out: tx.clone() },
+            Agent {
+                name: String::new(),
+                session: None,
+                internal: None,
+                uid,
+                out: tx.clone(),
+            },
         );
         id
     };
@@ -316,7 +368,9 @@ async fn serve_agent(shared: Arc<Shared>, socket: tokio::net::UnixStream) -> Res
     };
     if let Some(session) = session {
         let request = shared.agents.track(agent_id, RequestId(0)).await;
-        shared.send(&ClientMsg::CloseSession { request, session }).await;
+        shared
+            .send(&ClientMsg::CloseSession { request, session })
+            .await;
     }
     tracing::info!(agent_id, "agent disconnected");
     Ok(())
@@ -368,7 +422,10 @@ async fn forward(shared: &Arc<Shared>, agent_id: u64, msg: ClientMsg) {
                 }
             }
             let ours = shared.agents.track(agent_id, request).await;
-            ClientMsg::OpenSession { request: ours, name }
+            ClientMsg::OpenSession {
+                request: ours,
+                name,
+            }
         }
         other => {
             let Some(session) = session else {
@@ -377,20 +434,31 @@ async fn forward(shared: &Arc<Shared>, agent_id: u64, msg: ClientMsg) {
             };
             let ours = shared.agents.track(agent_id, request_of(&other)).await;
             match other {
-                ClientMsg::Claim { claim, .. } => {
-                    ClientMsg::Claim { request: ours, session, claim }
-                }
-                ClientMsg::Renew { lease, extra, .. } => {
-                    ClientMsg::Renew { request: ours, session, lease, extra }
-                }
-                ClientMsg::Release { lease, .. } => {
-                    ClientMsg::Release { request: ours, session, lease }
-                }
-                ClientMsg::Status { .. } => ClientMsg::Status { request: ours, session },
+                ClientMsg::Claim { claim, .. } => ClientMsg::Claim {
+                    request: ours,
+                    session,
+                    claim,
+                },
+                ClientMsg::Renew { lease, extra, .. } => ClientMsg::Renew {
+                    request: ours,
+                    session,
+                    lease,
+                    extra,
+                },
+                ClientMsg::Release { lease, .. } => ClientMsg::Release {
+                    request: ours,
+                    session,
+                    lease,
+                },
+                ClientMsg::Status { .. } => ClientMsg::Status {
+                    request: ours,
+                    session,
+                },
                 ClientMsg::TagList { .. } => ClientMsg::TagList { request: ours },
-                ClientMsg::CloseSession { .. } => {
-                    ClientMsg::CloseSession { request: ours, session }
-                }
+                ClientMsg::CloseSession { .. } => ClientMsg::CloseSession {
+                    request: ours,
+                    session,
+                },
                 _ => return,
             }
         }
@@ -416,8 +484,14 @@ fn request_of(msg: &ClientMsg) -> RequestId {
 
 async fn reply_error(shared: &Arc<Shared>, agent_id: u64, request: RequestId, error: &str) {
     let inner = shared.agents.inner.lock().await;
-    let Some(agent) = inner.agents.get(&agent_id) else { return };
-    let msg = ToClient::Error { request, error: error.into(), retryable: false };
+    let Some(agent) = inner.agents.get(&agent_id) else {
+        return;
+    };
+    let msg = ToClient::Error {
+        request,
+        error: error.into(),
+        retryable: false,
+    };
     if let Ok(line) = serde_json::to_string(&msg) {
         let _ = agent.out.send(line);
     }

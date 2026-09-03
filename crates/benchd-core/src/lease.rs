@@ -43,9 +43,7 @@ id_type!(LeaseId, "l");
 /// Monotonically increasing per bench. An executor records the highest it has
 /// seen and rejects anything lower, so a delayed instruction for a dead lease
 /// cannot hand out live hardware (D7).
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Epoch(pub u64);
 
@@ -69,7 +67,10 @@ pub enum EndReason {
 pub enum LeaseState {
     Held,
     /// Teardown is coming at `teardown_at`. The holder should park the board.
-    Revoking { reason: RevokeReason, teardown_at: Secs },
+    Revoking {
+        reason: RevokeReason,
+        teardown_at: Secs,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -115,28 +116,61 @@ pub struct Session {
 /// believes is free.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
-    Export { bench: String, lease: LeaseId, epoch: Epoch, session: SessionId },
-    Materialize { lease: LeaseId, session: SessionId, slots: BTreeMap<String, String> },
+    Export {
+        bench: String,
+        lease: LeaseId,
+        epoch: Epoch,
+        session: SessionId,
+    },
+    Materialize {
+        lease: LeaseId,
+        session: SessionId,
+        slots: BTreeMap<String, String>,
+    },
     /// Carries the epoch it was generated at.
     ///
     /// Teardown effects are produced *after* the lease is removed from the
     /// manager, so anything that looks the epoch up later gets 0 — which the
     /// client then fences out as stale, and the mount survives the lease. The
     /// epoch has to travel with the effect.
-    Unmaterialize { lease: LeaseId, session: SessionId, epoch: Epoch },
-    Unexport { bench: String, lease: LeaseId, epoch: Epoch },
-    Notify { session: SessionId, event: LeaseEvent },
+    Unmaterialize {
+        lease: LeaseId,
+        session: SessionId,
+        epoch: Epoch,
+    },
+    Unexport {
+        bench: String,
+        lease: LeaseId,
+        epoch: Epoch,
+    },
+    Notify {
+        session: SessionId,
+        event: LeaseEvent,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseEvent {
-    Granted { lease: LeaseId, expires_at: Secs },
+    Granted {
+        lease: LeaseId,
+        expires_at: Secs,
+    },
     /// The lease could not be set up and has been withdrawn. Distinct from
     /// `Ended`: the holder never got working hardware, so it should be told why
     /// rather than left to discover a device that never appears.
-    Failed { lease: LeaseId, detail: String },
-    Revoking { lease: LeaseId, reason: RevokeReason, teardown_at: Secs },
-    Ended { lease: LeaseId, reason: EndReason },
+    Failed {
+        lease: LeaseId,
+        detail: String,
+    },
+    Revoking {
+        lease: LeaseId,
+        reason: RevokeReason,
+        teardown_at: Secs,
+    },
+    Ended {
+        lease: LeaseId,
+        reason: EndReason,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -227,7 +261,10 @@ impl LeaseManager {
         let mut effects = teardown_effects(&l);
         effects.push(Effect::Notify {
             session: l.session,
-            event: LeaseEvent::Ended { lease, reason: EndReason::Forced },
+            event: LeaseEvent::Ended {
+                lease,
+                reason: EndReason::Forced,
+            },
         });
         effects
     }
@@ -278,7 +315,14 @@ impl LeaseManager {
     pub fn register(&mut self, name: impl Into<String>) -> SessionId {
         let id = SessionId(self.next_session);
         self.next_session += 1;
-        self.sessions.insert(id, Session { id, name: name.into(), leases: BTreeSet::new() });
+        self.sessions.insert(
+            id,
+            Session {
+                id,
+                name: name.into(),
+                leases: BTreeSet::new(),
+            },
+        );
         id
     }
 
@@ -320,7 +364,9 @@ impl LeaseManager {
             .map(|l| l.slots.len())
             .sum::<usize>();
 
-        let ttl = self.limits.grant(request.ttl_seconds, request.slots.len(), held)?;
+        let ttl = self
+            .limits
+            .grant(request.ttl_seconds, request.slots.len(), held)?;
 
         let benches = self.inventory.enabled_benches();
         let allocation = allocate(
@@ -349,7 +395,12 @@ impl LeaseManager {
             *counter += 1;
             let epoch = Epoch(*counter);
             epochs.insert(bench.clone(), epoch);
-            effects.push(Effect::Export { bench: bench.clone(), lease: id, epoch, session });
+            effects.push(Effect::Export {
+                bench: bench.clone(),
+                lease: id,
+                epoch,
+                session,
+            });
         }
         // Export on the host strictly before materialising on the client.
         effects.push(Effect::Materialize {
@@ -361,7 +412,10 @@ impl LeaseManager {
         let expires_at = now + ttl.granted;
         effects.push(Effect::Notify {
             session,
-            event: LeaseEvent::Granted { lease: id, expires_at },
+            event: LeaseEvent::Granted {
+                lease: id,
+                expires_at,
+            },
         });
 
         self.leases.insert(
@@ -377,7 +431,11 @@ impl LeaseManager {
                 reason: request.reason.clone(),
             },
         );
-        self.sessions.get_mut(&session).expect("checked above").leases.insert(id);
+        self.sessions
+            .get_mut(&session)
+            .expect("checked above")
+            .leases
+            .insert(id);
 
         Ok(Granted {
             lease: id,
@@ -404,7 +462,11 @@ impl LeaseManager {
     ) -> Result<Renewed, LeaseError> {
         let limits = self.limits;
         let l = self.owned_mut(session, lease)?;
-        if let LeaseState::Revoking { reason: RevokeReason::Forced, .. } = l.state {
+        if let LeaseState::Revoking {
+            reason: RevokeReason::Forced,
+            ..
+        } = l.state
+        {
             return Err(LeaseError::ForciblyRevoked);
         }
 
@@ -413,7 +475,11 @@ impl LeaseManager {
         l.state = LeaseState::Held;
         let expires_at = l.expires_at;
 
-        Ok(Renewed { expires_at, ttl, effects: Vec::new() })
+        Ok(Renewed {
+            expires_at,
+            ttl,
+            effects: Vec::new(),
+        })
     }
 
     /// The holder is done. No grace period: it asked.
@@ -431,7 +497,10 @@ impl LeaseManager {
         let mut effects = teardown_effects(&l);
         effects.push(Effect::Notify {
             session,
-            event: LeaseEvent::Ended { lease, reason: EndReason::Released },
+            event: LeaseEvent::Ended {
+                lease,
+                reason: EndReason::Released,
+            },
         });
         Ok(effects)
     }
@@ -446,7 +515,10 @@ impl LeaseManager {
         // Never later than the lease would have ended anyway: taking a bench
         // back must not hand the holder extra time.
         let teardown_at = (now + grace).min(l.expires_at.max(now));
-        l.state = LeaseState::Revoking { reason: RevokeReason::Forced, teardown_at };
+        l.state = LeaseState::Revoking {
+            reason: RevokeReason::Forced,
+            teardown_at,
+        };
         vec![Effect::Notify {
             session: l.session,
             event: LeaseEvent::Revoking {
@@ -508,7 +580,10 @@ impl LeaseManager {
         for id in expired {
             let lease = self.leases.remove(&id).expect("just listed");
             let reason = match lease.state {
-                LeaseState::Revoking { reason: RevokeReason::Forced, .. } => EndReason::Forced,
+                LeaseState::Revoking {
+                    reason: RevokeReason::Forced,
+                    ..
+                } => EndReason::Forced,
                 _ => EndReason::Expired,
             };
             if let Some(s) = self.sessions.get_mut(&lease.session) {
@@ -528,7 +603,10 @@ impl LeaseManager {
         if !self.sessions.contains_key(&session) {
             return Err(LeaseError::UnknownSession);
         }
-        let l = self.leases.get_mut(&lease).ok_or(LeaseError::UnknownLease)?;
+        let l = self
+            .leases
+            .get_mut(&lease)
+            .ok_or(LeaseError::UnknownLease)?;
         if l.session != session {
             return Err(LeaseError::NotYours);
         }
@@ -541,8 +619,11 @@ fn teardown_effects(lease: &Lease) -> Vec<Effect> {
     // The highest of this lease's per-bench epochs: monotonic per lease, which
     // is what the client fences on.
     let epoch = lease.epochs.values().copied().max().unwrap_or(Epoch(0));
-    let mut effects =
-        vec![Effect::Unmaterialize { lease: lease.id, session: lease.session, epoch }];
+    let mut effects = vec![Effect::Unmaterialize {
+        lease: lease.id,
+        session: lease.session,
+        epoch,
+    }];
     for (bench, epoch) in &lease.epochs {
         effects.push(Effect::Unexport {
             bench: bench.clone(),

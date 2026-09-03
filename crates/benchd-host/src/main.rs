@@ -112,13 +112,13 @@ impl BenchConfig {
         for (name, raw) in &self.resources {
             let resource = match raw.kind.as_str() {
                 "serial" => {
-                    let declared = raw
-                        .by_path
-                        .as_ref()
-                        .or(raw.by_id.as_ref())
-                        .with_context(|| {
-                            format!("resource {name:?} needs by_path (preferred) or by_id")
-                        })?;
+                    let declared =
+                        raw.by_path
+                            .as_ref()
+                            .or(raw.by_id.as_ref())
+                            .with_context(|| {
+                                format!("resource {name:?} needs by_path (preferred) or by_id")
+                            })?;
                     let path = std::path::PathBuf::from(declared);
                     let resolved = std::fs::canonicalize(&path).with_context(|| {
                         format!(
@@ -154,14 +154,19 @@ impl BenchConfig {
                         serial = observed.as_deref().unwrap_or("unknown"),
                         "resource present"
                     );
-                    Resource::Serial { path, serial: observed }
+                    Resource::Serial {
+                        path,
+                        serial: observed,
+                    }
                 }
                 "usb" => {
                     let busid = raw
                         .busid
                         .as_ref()
                         .with_context(|| format!("resource {name:?} needs busid"))?;
-                    Resource::Usb { busid: busid.clone() }
+                    Resource::Usb {
+                        busid: busid.clone(),
+                    }
                 }
                 other => anyhow::bail!("resource {name:?} has unknown kind {other:?}"),
             };
@@ -206,7 +211,13 @@ async fn main() -> Result<()> {
                 .iter()
                 .filter_map(|(name, r)| {
                     r.by_id.as_ref().map(|p| {
-                        (name.clone(), Resource::Serial { path: std::path::PathBuf::from(p), serial: None })
+                        (
+                            name.clone(),
+                            Resource::Serial {
+                                path: std::path::PathBuf::from(p),
+                                serial: None,
+                            },
+                        )
                     })
                 })
                 .collect(),
@@ -296,11 +307,9 @@ async fn watch_hardware(
                 // stays put whichever driver holds it, and vanishes only when
                 // the board actually does.
                 Resource::Serial { path, .. } => match busids.get(name) {
-                    Some(busid) => {
-                        tokio::fs::metadata(format!("/sys/bus/usb/devices/{busid}"))
-                            .await
-                            .is_err()
-                    }
+                    Some(busid) => tokio::fs::metadata(format!("/sys/bus/usb/devices/{busid}"))
+                        .await
+                        .is_err(),
                     // No busid resolved (a hub-less device, an odd topology):
                     // fall back to the tty, which is still right when nothing
                     // is exported.
@@ -313,7 +322,10 @@ async fn watch_hardware(
                 }
             };
             if gone {
-                return (name.clone(), "the USB device is no longer attached".to_string());
+                return (
+                    name.clone(),
+                    "the USB device is no longer attached".to_string(),
+                );
             }
         }
     }
@@ -328,7 +340,10 @@ async fn run(args: &Args, spec: &BenchSpec, exports: &mut Exports) -> Result<()>
     let mut lines = FramedRead::new(read, LinesCodec::new());
     let mut sink = FramedWrite::new(write, LinesCodec::new());
 
-    sink.send(serde_json::to_string(&HostMsg::Register { bench: spec.clone() })?).await?;
+    sink.send(serde_json::to_string(&HostMsg::Register {
+        bench: spec.clone(),
+    })?)
+    .await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let heartbeat = {
@@ -339,7 +354,9 @@ async fn run(args: &Args, spec: &BenchSpec, exports: &mut Exports) -> Result<()>
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                let Ok(line) = serde_json::to_string(&HostMsg::Heartbeat) else { break };
+                let Ok(line) = serde_json::to_string(&HostMsg::Heartbeat) else {
+                    break;
+                };
                 if tx.send(line).is_err() {
                     break;
                 }
@@ -349,8 +366,11 @@ async fn run(args: &Args, spec: &BenchSpec, exports: &mut Exports) -> Result<()>
 
     // Resolved while the ttys still exist, i.e. before anything is exported.
     let busids = crate::export::busids_for(spec);
-    let mut watcher =
-        Box::pin(watch_hardware(spec.clone(), busids, args.device_poll_seconds));
+    let mut watcher = Box::pin(watch_hardware(
+        spec.clone(),
+        busids,
+        args.device_poll_seconds,
+    ));
 
     let result = loop {
         tokio::select! {

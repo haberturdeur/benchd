@@ -49,12 +49,7 @@ impl Relay {
     /// `leftover` is any payload that arrived in the same read as the hello
     /// line. It belongs to the partner and must be forwarded before the copy
     /// begins, or the far end sees a stream that starts mid-message.
-    pub async fn join(
-        self: &Arc<Self>,
-        hello: ChannelHello,
-        stream: TcpStream,
-        leftover: Vec<u8>,
-    ) {
+    pub async fn join(self: &Arc<Self>, hello: ChannelHello, stream: TcpStream, leftover: Vec<u8>) {
         let key = hello.channel.clone();
 
         let partner = {
@@ -87,7 +82,10 @@ impl Relay {
                 let (tx, rx) = oneshot::channel();
                 self.waiting.lock().await.insert(
                     key.clone(),
-                    Waiting { side: hello.side, deliver: tx },
+                    Waiting {
+                        side: hello.side,
+                        deliver: tx,
+                    },
                 );
 
                 let mut ours = stream;

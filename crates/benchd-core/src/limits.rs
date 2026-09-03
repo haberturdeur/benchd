@@ -28,7 +28,12 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_ttl: 15 * 60, max_total_hold: 2 * 60 * 60, max_benches: 2, grace: 30 }
+        Limits {
+            max_ttl: 15 * 60,
+            max_total_hold: 2 * 60 * 60,
+            max_benches: 2,
+            grace: 30,
+        }
     }
 }
 
@@ -44,7 +49,11 @@ pub enum LimitError {
         "you may hold at most {max} bench(es); already holding {held} and asked \
          for {wanted} more. Release something first."
     )]
-    TooManyBenches { max: usize, held: usize, wanted: usize },
+    TooManyBenches {
+        max: usize,
+        held: usize,
+        wanted: usize,
+    },
 
     #[error(
         "this lease has reached its maximum total hold of {max_total_hold}s. \
@@ -115,7 +124,9 @@ impl Limits {
         }
         let remaining_budget = self.max_total_hold.saturating_sub(held_for);
         if remaining_budget == 0 {
-            return Err(LimitError::HoldExhausted { max_total_hold: self.max_total_hold });
+            return Err(LimitError::HoldExhausted {
+                max_total_hold: self.max_total_hold,
+            });
         }
         Ok(GrantedTtl {
             granted: requested.min(self.max_ttl).min(remaining_budget),
@@ -149,7 +160,10 @@ mod tests {
 
     #[test]
     fn renewal_is_trimmed_so_total_hold_is_never_exceeded() {
-        let l = Limits { max_total_hold: 1000, ..Default::default() };
+        let l = Limits {
+            max_total_hold: 1000,
+            ..Default::default()
+        };
         let g = l.renew(600, 900).unwrap();
         assert_eq!(g.granted, 100, "only 100s of budget remained");
         assert!(g.was_clamped());
@@ -157,10 +171,15 @@ mod tests {
 
     #[test]
     fn renewal_fails_once_the_hold_budget_is_gone() {
-        let l = Limits { max_total_hold: 1000, ..Default::default() };
+        let l = Limits {
+            max_total_hold: 1000,
+            ..Default::default()
+        };
         assert_eq!(
             l.renew(60, 1000),
-            Err(LimitError::HoldExhausted { max_total_hold: 1000 })
+            Err(LimitError::HoldExhausted {
+                max_total_hold: 1000
+            })
         );
     }
 }

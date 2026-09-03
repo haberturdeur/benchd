@@ -80,7 +80,10 @@ impl State {
     /// arrive by host registration (D9), so an unreachable host simply has no
     /// allocatable bench rather than a bench that fails at claim time.
     pub fn new(limits: Limits, vocabulary: benchd_core::tags::Vocabulary) -> Self {
-        let inventory = Inventory { benches: Default::default(), vocabulary };
+        let inventory = Inventory {
+            benches: Default::default(),
+            vocabulary,
+        };
         State {
             leases: LeaseManager::new(inventory, limits),
             hosts: BTreeMap::new(),
@@ -222,7 +225,12 @@ impl State {
         let mut out = Vec::new();
         for effect in effects {
             match effect {
-                Effect::Export { bench, lease, epoch, session } => {
+                Effect::Export {
+                    bench,
+                    lease,
+                    epoch,
+                    session,
+                } => {
                     let Some(host_out) = self.hosts.get(&bench).map(|h| h.out.clone()) else {
                         tracing::warn!(%bench, "export for a bench whose host has gone");
                         continue;
@@ -249,22 +257,43 @@ impl State {
                     self.pending.insert(request, lease);
                     out.push(Outgoing::Host {
                         out: host_out,
-                        msg: ToHost::Export { request, lease, epoch, session, channels },
+                        msg: ToHost::Export {
+                            request,
+                            lease,
+                            epoch,
+                            session,
+                            channels,
+                        },
                     });
                 }
-                Effect::Unexport { bench, lease, epoch } => {
-                    self.channels.retain(|(l, b, _), _| !(*l == lease && *b == bench));
+                Effect::Unexport {
+                    bench,
+                    lease,
+                    epoch,
+                } => {
+                    self.channels
+                        .retain(|(l, b, _), _| !(*l == lease && *b == bench));
                     let Some(host_out) = self.hosts.get(&bench).map(|h| h.out.clone()) else {
                         continue;
                     };
                     let request = self.next_request();
                     out.push(Outgoing::Host {
                         out: host_out,
-                        msg: ToHost::Unexport { request, lease, epoch },
+                        msg: ToHost::Unexport {
+                            request,
+                            lease,
+                            epoch,
+                        },
                     });
                 }
-                Effect::Materialize { lease, session, slots } => {
-                    let Some(conn) = self.client_for(session) else { continue };
+                Effect::Materialize {
+                    lease,
+                    session,
+                    slots,
+                } => {
+                    let Some(conn) = self.client_for(session) else {
+                        continue;
+                    };
                     let epoch = self.lease_epoch(lease);
                     let handles = self.handles_for(&slots, session, lease);
                     let request = self.next_request();
@@ -280,16 +309,29 @@ impl State {
                         },
                     });
                 }
-                Effect::Unmaterialize { lease, session, epoch } => {
-                    let Some(conn) = self.client_for(session) else { continue };
+                Effect::Unmaterialize {
+                    lease,
+                    session,
+                    epoch,
+                } => {
+                    let Some(conn) = self.client_for(session) else {
+                        continue;
+                    };
                     let request = self.next_request();
                     out.push(Outgoing::Client {
                         out: conn,
-                        msg: ToClient::Unmaterialize { request, lease, epoch, session },
+                        msg: ToClient::Unmaterialize {
+                            request,
+                            lease,
+                            epoch,
+                            session,
+                        },
                     });
                 }
                 Effect::Notify { session, event } => {
-                    let Some(conn) = self.client_for(session) else { continue };
+                    let Some(conn) = self.client_for(session) else {
+                        continue;
+                    };
                     // `Granted` is delivered by the claim handler, which knows
                     // the request id to correlate against; there is nothing
                     // unsolicited to push here.
@@ -316,9 +358,15 @@ impl State {
         if self.force_relay {
             return true;
         }
-        let Some(host) = self.hosts.get(bench) else { return false };
-        let Some(conn_id) = self.session_conn.get(&session) else { return false };
-        let Some(client) = self.clients.get(conn_id) else { return false };
+        let Some(host) = self.hosts.get(bench) else {
+            return false;
+        };
+        let Some(conn_id) = self.session_conn.get(&session) else {
+            return false;
+        };
+        let Some(client) = self.clients.get(conn_id) else {
+            return false;
+        };
         host.peer_ip != client.peer_ip
     }
 
@@ -382,7 +430,9 @@ impl State {
             for (name, resource) in &bench.resources {
                 let handle = match resource {
                     benchd_core::model::Resource::Serial { path, .. } if !relay => {
-                        ResourceHandle::Local { path: path.display().to_string() }
+                        ResourceHandle::Local {
+                            path: path.display().to_string(),
+                        }
                     }
                     // Remote: the busid is resolved by the host, which is the
                     // machine that can actually see the device. The client only
@@ -429,7 +479,11 @@ fn notify_to_wire(event: benchd_core::lease::LeaseEvent) -> Option<ToClient> {
     Some(match event {
         LeaseEvent::Granted { .. } => return None,
         LeaseEvent::Failed { lease, detail } => ToClient::Failed { lease, detail },
-        LeaseEvent::Revoking { lease, reason, teardown_at } => ToClient::Revoking {
+        LeaseEvent::Revoking {
+            lease,
+            reason,
+            teardown_at,
+        } => ToClient::Revoking {
             lease,
             reason: match reason {
                 RevokeReason::Expired => "expired".into(),

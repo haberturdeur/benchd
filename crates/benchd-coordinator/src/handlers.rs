@@ -51,7 +51,9 @@ pub async fn serve(shared: Arc<Shared>, socket: TcpStream, peer: SocketAddr) -> 
             .io
             .reunite(write)
             .map_err(|e| anyhow::anyhow!("could not reunite the socket: {e}"))?;
-        Arc::clone(&shared.relay).join(hello, stream, leftover.to_vec()).await;
+        Arc::clone(&shared.relay)
+            .join(hello, stream, leftover.to_vec())
+            .await;
         return Ok(());
     }
 
@@ -73,9 +75,7 @@ pub async fn serve(shared: Arc<Shared>, socket: TcpStream, peer: SocketAddr) -> 
         tracing::warn!(%peer, %err, "unrecognised first message; closing");
         out.send(&ToClient::Error {
             request: RequestId(0),
-            error: format!(
-                "unrecognised message: {err}. Are the binaries the same build?"
-            ),
+            error: format!("unrecognised message: {err}. Are the binaries the same build?"),
             retryable: false,
         });
         return Ok(());
@@ -112,7 +112,11 @@ async fn serve_host(
                 for msg in stale {
                     msg.send();
                 }
-                state.leases.inventory_mut().benches.insert(bench_id.clone(), bench);
+                state
+                    .leases
+                    .inventory_mut()
+                    .benches
+                    .insert(bench_id.clone(), bench);
                 state.hosts.insert(
                     bench_id.clone(),
                     HostConn {
@@ -150,7 +154,11 @@ async fn serve_host(
             }
         };
         // Any message proves liveness, not just an explicit heartbeat.
-        shared.state.lock().await.touch_host(&bench_id, conn_id, now());
+        shared
+            .state
+            .lock()
+            .await
+            .touch_host(&bench_id, conn_id, now());
 
         match msg {
             HostMsg::Heartbeat | HostMsg::Register { .. } => {}
@@ -239,7 +247,11 @@ async fn serve_operator(shared: Arc<Shared>, out: Outbox, msg: OperatorMsg) -> R
                     resources: b.resource_names().iter().map(|s| s.to_string()).collect(),
                 })
                 .collect();
-            let leases = state.leases.leases().map(|l| lease_view(&state, l, t)).collect();
+            let leases = state
+                .leases
+                .leases()
+                .map(|l| lease_view(&state, l, t))
+                .collect();
             ToOperator::State { benches, leases }
         }
         OperatorMsg::ForceRelease { bench, immediate } => {
@@ -318,7 +330,11 @@ async fn serve_client(
         let id = state.next_conn();
         state.clients.insert(
             id,
-            ClientConn { out: out.clone(), peer_ip: peer.ip(), last_seen: now() },
+            ClientConn {
+                out: out.clone(),
+                peer_ip: peer.ip(),
+                last_seen: now(),
+            },
         );
         id
     };
@@ -417,7 +433,11 @@ async fn handle_client(
             let token = state.mint_token(id);
             state.session_conn.insert(id, conn_id);
             tracing::info!(%name, session = %id, "session opened");
-            out.send(&ToClient::SessionOpened { request, session: token, id });
+            out.send(&ToClient::SessionOpened {
+                request,
+                session: token,
+                id,
+            });
             Vec::new()
         }
 
@@ -438,7 +458,11 @@ async fn handle_client(
             outgoing
         }
 
-        ClientMsg::Claim { request, session, claim } => {
+        ClientMsg::Claim {
+            request,
+            session,
+            claim,
+        } => {
             let Some(id) = state.resolve(&session) else {
                 out.send(&unknown_session(request));
                 return Vec::new();
@@ -449,7 +473,11 @@ async fn handle_client(
                     // A malformed tag is the agent's mistake and is fixable in
                     // one turn, so it is reported as not-retryable with the
                     // vocabulary's own did-you-mean text.
-                    out.send(&ToClient::Error { request, error, retryable: false });
+                    out.send(&ToClient::Error {
+                        request,
+                        error,
+                        retryable: false,
+                    });
                     return Vec::new();
                 }
             };
@@ -484,14 +512,22 @@ async fn handle_client(
             }
         }
 
-        ClientMsg::Renew { request, session, lease, extra } => {
+        ClientMsg::Renew {
+            request,
+            session,
+            lease,
+            extra,
+        } => {
             let Some(id) = state.resolve(&session) else {
                 out.send(&unknown_session(request));
                 return Vec::new();
             };
             match state.leases.renew(id, lease, extra, now()) {
                 Ok(renewed) => {
-                    out.send(&ToClient::Renewed { request, expires_at: renewed.expires_at });
+                    out.send(&ToClient::Renewed {
+                        request,
+                        expires_at: renewed.expires_at,
+                    });
                 }
                 Err(err) => out.send(&ToClient::Error {
                     request,
@@ -502,7 +538,11 @@ async fn handle_client(
             Vec::new()
         }
 
-        ClientMsg::Release { request, session, lease } => {
+        ClientMsg::Release {
+            request,
+            session,
+            lease,
+        } => {
             let Some(id) = state.resolve(&session) else {
                 out.send(&unknown_session(request));
                 return Vec::new();
@@ -646,8 +686,8 @@ fn to_claim_request(
 ) -> Result<ClaimRequest, String> {
     let mut slots = std::collections::BTreeMap::new();
     for (name, tags) in &spec.slots {
-        let requirement = Requirement::parse(tags.iter().map(String::as_str))
-            .map_err(|e| e.to_string())?;
+        let requirement =
+            Requirement::parse(tags.iter().map(String::as_str)).map_err(|e| e.to_string())?;
         // Claiming by name is the operator CLI's job, not an agent's (D17).
         // Left open, an agent hardcodes a bench into a test script and the
         // capability matching this whole system rests on stops being used.
@@ -661,12 +701,18 @@ fn to_claim_request(
         // Check against the vocabulary *before* matching, so `soc=esp32s4`
         // comes back as "did you mean soc=esp32s3?" rather than the far less
         // useful "no bench matches" (D10). A typo is then fixable in one turn.
-        vocabulary.check(&requirement.tags).map_err(|e| e.to_string())?;
+        vocabulary
+            .check(&requirement.tags)
+            .map_err(|e| e.to_string())?;
         slots.insert(name.clone(), requirement);
     }
     let request = ClaimRequest {
         slots,
-        distinct: if spec.distinct { Distinct::All } else { Distinct::None },
+        distinct: if spec.distinct {
+            Distinct::All
+        } else {
+            Distinct::None
+        },
         ttl_seconds: spec.ttl,
         reason: spec.reason.clone(),
     };

@@ -40,7 +40,10 @@ async fn write_sysfs(path: impl AsRef<std::path::Path>, value: &str) -> io::Resu
                 "sysfs write timed out; the usbip driver is wedged and needs a module \
                  reload or a reboot"
             );
-            Err(io::Error::new(io::ErrorKind::TimedOut, "sysfs write timed out"))
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "sysfs write timed out",
+            ))
         }
     }
 }
@@ -106,8 +109,7 @@ pub async fn reattach(busid: &str) {
 
 /// Whether any interface of this device has a driver bound.
 async fn has_driver(busid: &str) -> bool {
-    let Ok(mut entries) = tokio::fs::read_dir(format!("/sys/bus/usb/devices/{busid}")).await
-    else {
+    let Ok(mut entries) = tokio::fs::read_dir(format!("/sys/bus/usb/devices/{busid}")).await else {
         return false;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
@@ -117,7 +119,10 @@ async fn has_driver(busid: &str) -> bool {
         if !name.starts_with(busid) || !name.contains(':') {
             continue;
         }
-        if tokio::fs::metadata(entry.path().join("driver")).await.is_ok() {
+        if tokio::fs::metadata(entry.path().join("driver"))
+            .await
+            .is_ok()
+        {
             return true;
         }
     }
@@ -126,7 +131,9 @@ async fn has_driver(busid: &str) -> bool {
 
 /// Whether this device currently presents a serial port.
 pub async fn has_tty(busid: &str) -> bool {
-    tty_under(&PathBuf::from(format!("/sys/bus/usb/devices/{busid}"))).await.is_some()
+    tty_under(&PathBuf::from(format!("/sys/bus/usb/devices/{busid}")))
+        .await
+        .is_some()
 }
 
 /// Every USB device on the system, as `(busid, serial)`.
@@ -193,8 +200,7 @@ pub async fn free_vhci_port(speed: u32) -> io::Result<u32> {
 
     for line in status.lines().skip(1) {
         let mut fields = line.split_whitespace();
-        let (Some(hub), Some(port), Some(state)) =
-            (fields.next(), fields.next(), fields.next())
+        let (Some(hub), Some(port), Some(state)) = (fields.next(), fields.next(), fields.next())
         else {
             continue;
         };
@@ -211,9 +217,7 @@ pub async fn free_vhci_port(speed: u32) -> io::Result<u32> {
 
     Err(io::Error::new(
         io::ErrorKind::WouldBlock,
-        format!(
-            "no free {want} vhci port; every virtual slot for this device speed is in use"
-        ),
+        format!("no free {want} vhci port; every virtual slot for this device speed is in use"),
     ))
 }
 
@@ -230,18 +234,16 @@ fn parse_padded(field: &str) -> Option<u32> {
 /// Attach a connected socket to the local vhci hub, importing the device.
 ///
 /// Consumes the stream for the same reason as [`stub_attach`].
-pub async fn vhci_attach(
-    port: u32,
-    stream: TcpStream,
-    devid: u32,
-    speed: u32,
-) -> io::Result<()> {
+pub async fn vhci_attach(port: u32, stream: TcpStream, devid: u32, speed: u32) -> io::Result<()> {
     let std_stream = stream.into_std()?;
     std_stream.set_nonblocking(false)?;
     let fd = std_stream.as_raw_fd();
 
-    let result =
-        write_sysfs(format!("{VHCI}/attach"), &format!("{port} {fd} {devid} {speed}")).await;
+    let result = write_sysfs(
+        format!("{VHCI}/attach"),
+        &format!("{port} {fd} {devid} {speed}"),
+    )
+    .await;
 
     let _ = std_stream.into_raw_fd();
     result
@@ -321,11 +323,15 @@ async fn vhci_bus(super_speed: bool) -> Option<u32> {
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(digits) = name.strip_prefix("usb") else { continue };
+        let Some(digits) = name.strip_prefix("usb") else {
+            continue;
+        };
         if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
-        let Ok(busnum) = read_num(&entry.path().join("busnum")).await else { continue };
+        let Ok(busnum) = read_num(&entry.path().join("busnum")).await else {
+            continue;
+        };
         let hub_speed = read_num(&entry.path().join("speed")).await.unwrap_or(0);
         buses.push((busnum, hub_speed));
     }

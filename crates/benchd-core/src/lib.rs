@@ -18,9 +18,9 @@ pub mod lease;
 pub mod limits;
 pub mod matcher;
 pub mod model;
-pub mod tags;
 #[cfg(feature = "usbip")]
 pub mod sysfs;
+pub mod tags;
 #[cfg(feature = "usbip")]
 pub mod usbip;
 pub mod wire;
@@ -31,9 +31,7 @@ pub use lease::{
 };
 pub use limits::{GrantedTtl, LimitError, Limits, Secs};
 pub use matcher::{allocate, fit_cost, Allocation, BusyInfo, Failure, NoMatch, SlotDiagnosis};
-pub use model::{
-    Bench, ClaimRequest, Distinct, Inventory, InventoryError, Requirement, Resource,
-};
+pub use model::{Bench, ClaimRequest, Distinct, Inventory, InventoryError, Requirement, Resource};
 pub use tags::{format_tags, parse_tags, Tag, TagError, TagSet, Vocabulary};
 
 /// Convenience wrapper: allocate against a whole inventory, wiring up the tag

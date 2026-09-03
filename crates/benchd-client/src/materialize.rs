@@ -80,7 +80,10 @@ impl Materializer {
         let (read, write) = stream.into_split();
 
         let mut sink = FramedWrite::new(write, LinesCodec::new());
-        let hello = ChannelHello { channel: channel.clone(), side: ChannelSide::Client };
+        let hello = ChannelHello {
+            channel: channel.clone(),
+            side: ChannelSide::Client,
+        };
         sink.send(serde_json::to_string(&hello).map_err(|e| e.to_string())?)
             .await
             .map_err(|e| format!("sending the channel hello: {e}"))?;
@@ -99,18 +102,23 @@ impl Materializer {
             "importing"
         );
 
-        let port = sysfs::free_vhci_port(device.speed).await.map_err(|e| e.to_string())?;
+        let port = sysfs::free_vhci_port(device.speed)
+            .await
+            .map_err(|e| e.to_string())?;
 
         sysfs::vhci_attach(port, stream, device.devid(), device.speed)
             .await
             .map_err(|e| format!("vhci attach on port {port}: {e}"))?;
-        tracing::info!(port, devid = device.devid(), "attached; waiting for enumeration");
+        tracing::info!(
+            port,
+            devid = device.devid(),
+            "attached; waiting for enumeration"
+        );
 
         // Located by vhci port rather than by diffing /dev/serial/by-id: a
         // forwarded device reproduces the *same* by-id name as the one that
         // just vanished locally, so a diff would see nothing at all.
-        match sysfs::wait_for_vhci_tty(port, device.speed, std::time::Duration::from_secs(10))
-            .await
+        match sysfs::wait_for_vhci_tty(port, device.speed, std::time::Duration::from_secs(10)).await
         {
             Some(path) => Ok((port, path)),
             None => {
@@ -151,7 +159,10 @@ impl Materializer {
 
         // Imported devices are kernel state too, and outlive us just as mounts do.
         for port in sysfs::attached_ports().await {
-            tracing::warn!(port, "detaching a stale imported device from a previous run");
+            tracing::warn!(
+                port,
+                "detaching a stale imported device from a previous run"
+            );
             sysfs::vhci_detach(port).await;
         }
         let Ok(mut owners) = tokio::fs::read_dir(&self.root).await else {
@@ -171,7 +182,10 @@ impl Materializer {
     /// Accept an instruction only if it is at least as new as anything we have
     /// already seen for this lease.
     fn fence(&mut self, lease: LeaseId, epoch: benchd_core::lease::Epoch) -> Result<(), Outcome> {
-        let seen = self.seen.entry(lease).or_insert(benchd_core::lease::Epoch(0));
+        let seen = self
+            .seen
+            .entry(lease)
+            .or_insert(benchd_core::lease::Epoch(0));
         if epoch < *seen {
             tracing::warn!(%lease, ?epoch, ?seen, "dropping a stale instruction");
             return Err(Outcome::Stale { seen: *seen });
@@ -223,9 +237,7 @@ impl Materializer {
                             Ok(p) => p,
                             Err(err) => {
                                 return Outcome::Failed {
-                                    detail: format!(
-                                        "{slot}/{name}: {path} is not present ({err})"
-                                    ),
+                                    detail: format!("{slot}/{name}: {path} is not present ({err})"),
                                 };
                             }
                         };
@@ -298,12 +310,17 @@ impl Materializer {
             for (_, dest) in &plan {
                 match previous_owner(dest).await {
                     Some(prev) => {
-                        self.restore.entry(lease).or_default().push((dest.clone(), prev));
+                        self.restore
+                            .entry(lease)
+                            .or_default()
+                            .push((dest.clone(), prev));
                         if let Err(err) = chown(dest, uid).await {
                             tracing::warn!(path = %dest.display(), ?err, "could not hand the device to the agent");
                         }
                     }
-                    None => tracing::warn!(path = %dest.display(), "could not read device ownership"),
+                    None => {
+                        tracing::warn!(path = %dest.display(), "could not read device ownership")
+                    }
                 }
             }
         }
@@ -339,7 +356,10 @@ impl Materializer {
         // Idempotent: the reaper races voluntary releases, and neither path may
         // fail. Fall back to the computed path so a restarted daemon can still
         // clean up a lease it does not remember.
-        let dir = self.active.remove(&lease).unwrap_or_else(|| self.lease_dir(owner, lease));
+        let dir = self
+            .active
+            .remove(&lease)
+            .unwrap_or_else(|| self.lease_dir(owner, lease));
         unmount_tree(&dir).await;
         // Detach after unmounting: the mount is what the agent holds, and the
         // vhci port is what the kernel holds.
@@ -370,7 +390,9 @@ async fn bind_mount(root: &Path, source: &Path, dest: &Path) -> Result<(), Strin
     // The mount target must exist and be file-like; a device node is mounted
     // over a plain file perfectly happily.
     if tokio::fs::metadata(dest).await.is_err() {
-        tokio::fs::write(dest, b"").await.map_err(|e| format!("touch {}: {e}", dest.display()))?;
+        tokio::fs::write(dest, b"")
+            .await
+            .map_err(|e| format!("touch {}: {e}", dest.display()))?;
     }
 
     let status = tokio::process::Command::new("mount")
@@ -428,7 +450,10 @@ pub fn resource_path(
     slot: &str,
     resource: &str,
 ) -> PathBuf {
-    root.join(owner).join(lease.to_string()).join(slot).join(resource)
+    root.join(owner)
+        .join(lease.to_string())
+        .join(slot)
+        .join(resource)
 }
 
 /// Sanitise an agent's declared name into a directory component.
@@ -458,7 +483,6 @@ pub fn owner_dir(session: SessionId, name: &str) -> String {
     }
 }
 
-
 async fn chown(path: &Path, uid: u32) -> std::io::Result<()> {
     let gid = previous_owner(path).await.map(|(_, g)| g).unwrap_or(0);
     chown_gid(path, uid, gid).await
@@ -466,15 +490,10 @@ async fn chown(path: &Path, uid: u32) -> std::io::Result<()> {
 
 async fn chown_gid(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        std::os::unix::fs::chown(&path, Some(uid), Some(gid))
-    })
-    .await
-    .map_err(std::io::Error::other)?
+    tokio::task::spawn_blocking(move || std::os::unix::fs::chown(&path, Some(uid), Some(gid)))
+        .await
+        .map_err(std::io::Error::other)?
 }
-
-
-
 
 /// The uid/gid a device node currently has.
 async fn previous_owner(path: &Path) -> Option<(u32, u32)> {
@@ -497,7 +516,10 @@ mod tests {
             assert!(!dir.contains('/'), "{hostile:?} produced {dir:?}");
             assert_ne!(dir, "..", "{hostile:?} produced the parent directory");
             assert_ne!(dir, ".", "{hostile:?} produced the current directory");
-            assert!(benchd_core::model::valid_component(&dir), "{hostile:?} -> {dir:?}");
+            assert!(
+                benchd_core::model::valid_component(&dir),
+                "{hostile:?} -> {dir:?}"
+            );
         }
     }
 

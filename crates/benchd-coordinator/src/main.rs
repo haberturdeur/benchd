@@ -58,7 +58,10 @@ pub struct Shared {
 /// Coarse wall-clock seconds. The lease machine takes time as a parameter, so
 /// this is the only place a clock is read.
 pub fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[tokio::main]
@@ -74,8 +77,8 @@ async fn main() -> Result<()> {
 
     let text = std::fs::read_to_string(&args.config)
         .with_context(|| format!("failed to read {}", args.config))?;
-    let raw: toml::Value = toml::from_str(&text)
-        .with_context(|| format!("failed to parse {}", args.config))?;
+    let raw: toml::Value =
+        toml::from_str(&text).with_context(|| format!("failed to parse {}", args.config))?;
 
     let limits = raw
         .get("limits")
@@ -128,7 +131,12 @@ async fn main() -> Result<()> {
                     // and its leases end. A live TCP socket is not evidence:
                     // the process may be wedged, or the machine asleep.
                     let silent = state.silent_hosts(now(), timeout);
-                    tracing::debug!(hosts = state.hosts.len(), silent = silent.len(), timeout, "liveness check");
+                    tracing::debug!(
+                        hosts = state.hosts.len(),
+                        silent = silent.len(),
+                        timeout,
+                        "liveness check"
+                    );
                     for bench in silent {
                         tracing::warn!(%bench, "host has gone silent; withdrawing its bench");
                         state.hosts.remove(&bench);
