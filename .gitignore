@@ -1,5 +1,10 @@
 target/
 
+# Editor and agent-harness config: machine-local paths, not project state.
+.cursor/
+.vscode/
+.idea/
+
 # Python prototype leftovers (the prototype lives in git history only)
 __pycache__/
 *.py[cod]
