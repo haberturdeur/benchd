@@ -109,12 +109,16 @@ impl Harness {
             .expect("spawn coordinator");
 
         // Wait for it to accept connections rather than sleeping blindly.
+        let mut harness = Harness { coordinator, port, _dir: dir };
         for _ in 0..100 {
             if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return Harness { coordinator, port, _dir: dir };
+                return harness;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        // Drop reaps the child, so the panic does not leak a coordinator.
+        let _ = harness.coordinator.kill();
+        let _ = harness.coordinator.wait();
         panic!("coordinator never started listening on {port}");
     }
 
