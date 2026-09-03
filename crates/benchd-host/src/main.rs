@@ -59,8 +59,35 @@ struct BenchConfig {
 struct RawResource {
     #[serde(default = "serial")]
     kind: String,
+    /// Preferred: names the physical port, so swapping the board in it needs no
+    /// config change.
+    by_path: Option<String>,
+    /// Alternative: names one specific chip.
     by_id: Option<String>,
+    /// The USB serial expected in this position, if it matters.
+    serial: Option<String>,
     busid: Option<String>,
+}
+
+/// The USB serial number of the device behind a `/dev/tty*` node.
+///
+/// Walks up from the tty until it finds the USB device that carries `serial`.
+/// The depth is not fixed: a CDC-ACM tty hangs directly off the interface,
+/// while a USB-serial bridge adds a `usb-serial` port node in between, so
+/// assuming a single parent works for ESP32s and silently fails for CP2102s.
+fn usb_serial_of(tty: &std::path::Path) -> Option<String> {
+    let name = tty.file_name()?.to_str()?;
+    let mut dir = std::fs::canonicalize(format!("/sys/class/tty/{name}/device")).ok()?;
+    for _ in 0..6 {
+        if let Ok(serial) = std::fs::read_to_string(dir.join("serial")) {
+            let serial = serial.trim();
+            if !serial.is_empty() {
+                return Some(serial.to_string());
+            }
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
 }
 
 fn serial() -> String {
@@ -85,19 +112,49 @@ impl BenchConfig {
         for (name, raw) in &self.resources {
             let resource = match raw.kind.as_str() {
                 "serial" => {
-                    let by_id = raw
-                        .by_id
+                    let declared = raw
+                        .by_path
                         .as_ref()
-                        .with_context(|| format!("resource {name:?} needs by_id"))?;
-                    let path = std::path::PathBuf::from(by_id);
+                        .or(raw.by_id.as_ref())
+                        .with_context(|| {
+                            format!("resource {name:?} needs by_path (preferred) or by_id")
+                        })?;
+                    let path = std::path::PathBuf::from(declared);
                     let resolved = std::fs::canonicalize(&path).with_context(|| {
                         format!(
-                            "resource {name:?}: {by_id} is not present \
-                             (board unplugged, or a stale by-id path?)"
+                            "resource {name:?}: {declared} is not present \
+                             (board unplugged, or a stale path?)"
                         )
                     })?;
-                    tracing::info!(%name, path = %resolved.display(), "resource present");
-                    Resource::Serial { by_id: path }
+
+                    // Read the chip's own serial, and check it against the one
+                    // declared for this position if there is one. by-path is
+                    // stable across a board swap, which is what makes it the
+                    // right way to name a bench — and also what makes a swap
+                    // silent, so the tags can end up describing hardware that is
+                    // no longer there.
+                    let observed = usb_serial_of(&resolved);
+                    if let Some(want) = raw.serial.as_deref() {
+                        match observed.as_deref() {
+                            Some(got) if got.eq_ignore_ascii_case(want) => {}
+                            Some(got) => anyhow::bail!(
+                                "resource {name:?}: expected the board with serial {want} in \
+                                 this position, found {got}. Either the board was swapped (update \
+                                 this bench's serial and check its tags still describe the \
+                                 hardware) or the cable moved."
+                            ),
+                            None => anyhow::bail!(
+                                "resource {name:?}: declares serial {want} but the device's \
+                                 serial could not be read"
+                            ),
+                        }
+                    }
+                    tracing::info!(
+                        %name, path = %resolved.display(),
+                        serial = observed.as_deref().unwrap_or("unknown"),
+                        "resource present"
+                    );
+                    Resource::Serial { path, serial: observed }
                 }
                 "usb" => {
                     let busid = raw
@@ -149,7 +206,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .filter_map(|(name, r)| {
                     r.by_id.as_ref().map(|p| {
-                        (name.clone(), Resource::Serial { by_id: std::path::PathBuf::from(p) })
+                        (name.clone(), Resource::Serial { path: std::path::PathBuf::from(p), serial: None })
                     })
                 })
                 .collect(),
@@ -224,11 +281,11 @@ async fn watch_hardware(spec: BenchSpec, poll_seconds: u64) -> (String, String) 
     loop {
         tokio::time::sleep(Duration::from_secs(poll_seconds.max(1))).await;
         for (name, resource) in &spec.resources {
-            if let Resource::Serial { by_id } = resource {
-                if tokio::fs::metadata(by_id).await.is_err() {
+            if let Resource::Serial { path, .. } = resource {
+                if tokio::fs::metadata(path).await.is_err() {
                     return (
                         name.clone(),
-                        format!("{} is no longer present", by_id.display()),
+                        format!("{} is no longer present", path.display()),
                     );
                 }
             }

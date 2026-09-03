@@ -178,8 +178,8 @@ impl State {
             );
         }
         for (name, resource) in &spec.resources {
-            if let benchd_core::model::Resource::Serial { by_id } = resource {
-                benchd_core::model::valid_device_path(by_id)
+            if let benchd_core::model::Resource::Serial { path, .. } = resource {
+                benchd_core::model::valid_device_path(path)
                     .map_err(|e| format!("resource {name:?}: {e}"))?;
             }
         }
@@ -381,8 +381,8 @@ impl State {
             let mut resources = BTreeMap::new();
             for (name, resource) in &bench.resources {
                 let handle = match resource {
-                    benchd_core::model::Resource::Serial { by_id } if !relay => {
-                        ResourceHandle::Local { path: by_id.display().to_string() }
+                    benchd_core::model::Resource::Serial { path, .. } if !relay => {
+                        ResourceHandle::Local { path: path.display().to_string() }
                     }
                     // Remote: the busid is resolved by the host, which is the
                     // machine that can actually see the device. The client only

@@ -71,7 +71,7 @@ impl Exports {
             .filter_map(|(name, r)| {
                 let busid = match r {
                     Resource::Usb { busid } => Some(busid.clone()),
-                    Resource::Serial { by_id } => busid_for_tty(by_id),
+                    Resource::Serial { path, .. } => busid_for_tty(path),
                 }?;
                 Some((name.clone(), busid))
             })
@@ -260,7 +260,7 @@ pub async fn recover_orphans(spec: &BenchSpec) {
         .resources
         .values()
         .filter_map(|r| match r {
-            Resource::Serial { by_id } => Some(by_id.to_string_lossy().into_owned()),
+            Resource::Serial { path, .. } => Some(path.to_string_lossy().into_owned()),
             Resource::Usb { .. } => None,
         })
         .collect();

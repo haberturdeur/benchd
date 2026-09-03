@@ -29,12 +29,31 @@ pub enum InventoryError {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Resource {
-    /// A USB serial device, identified by its stable `/dev/serial/by-id` path.
+    /// A USB serial device, named by a stable path under `/dev/serial/`.
     ///
-    /// We key on by-id rather than `ttyUSB0` because kernel indices renumber on
-    /// replug, and an agent handed the wrong board mid-session is the exact
-    /// failure this system exists to prevent.
-    Serial { by_id: PathBuf },
+    /// Never `ttyUSB0`: kernel indices renumber on replug, and an agent handed
+    /// the wrong board mid-session is the exact failure this system exists to
+    /// prevent.
+    ///
+    /// Two stable names exist and they mean different things:
+    ///
+    /// * `by-path` identifies a **physical position** — this port on this hub.
+    ///   Whatever is plugged in there is the bench.
+    /// * `by-id` identifies a **specific chip**, by vendor, product and serial.
+    ///
+    /// `by-path` is the better default for a lab, because a bench *is* a
+    /// position: swap a dead board for a fresh one and nothing needs editing.
+    /// `by-id` breaks loudly on a swap, which is right only when a particular
+    /// board matters more than the slot it sits in. Either is accepted.
+    ///
+    /// `serial` is the USB serial number of the chip that is *expected* in that
+    /// position — for an ESP32 that is its MAC. Position and identity answer
+    /// different questions and a bench wants both: the path says which slot,
+    /// the serial says whether the thing in it is still the thing the tags
+    /// describe. Declare it and a silent board swap is refused at registration
+    /// instead of handing an agent an ESP32-C3 that every tag calls an S3.
+    /// Leave it out and whatever is in the slot is accepted.
+    Serial { path: PathBuf, serial: Option<String> },
     /// A whole USB device, for USB/IP export to a remote client. Carries the
     /// bus id (`1-2.3`) that `usbip bind` needs. Not handled by the local
     /// bind-mount backend.
@@ -55,7 +74,7 @@ impl Resource {
     /// Resolve a serial resource to its current `/dev/ttyX` node.
     pub fn resolve(&self) -> Option<PathBuf> {
         match self {
-            Resource::Serial { by_id, .. } => std::fs::canonicalize(by_id).ok(),
+            Resource::Serial { path, .. } => std::fs::canonicalize(path).ok(),
             Resource::Usb { .. } => None,
         }
     }
@@ -312,7 +331,13 @@ fn default_true() -> bool {
 struct RawResource {
     #[serde(default = "default_kind")]
     kind: String,
+    /// Preferred: identifies the physical port, so swapping the board in it
+    /// needs no config change.
+    by_path: Option<PathBuf>,
+    /// Alternative: identifies one specific chip.
     by_id: Option<PathBuf>,
+    /// The USB serial number expected in this position, if it matters.
+    serial: Option<String>,
     busid: Option<String>,
 }
 
@@ -375,10 +400,16 @@ impl RawInventory {
             for (res_name, res) in body.resources {
                 let resource = match res.kind.as_str() {
                     "serial" => Resource::Serial {
-                        by_id: res.by_id.ok_or_else(|| InventoryError::Bench {
-                            bench: id.clone(),
-                            reason: format!("serial resource {res_name:?} needs 'by_id'"),
+                        path: res.by_path.or(res.by_id).ok_or_else(|| {
+                            InventoryError::Bench {
+                                bench: id.clone(),
+                                reason: format!(
+                                    "serial resource {res_name:?} needs 'by_path' \
+                                     (preferred) or 'by_id'"
+                                ),
+                            }
                         })?,
+                        serial: res.serial,
                     },
                     "usb" => Resource::Usb {
                         busid: res.busid.ok_or_else(|| InventoryError::Bench {

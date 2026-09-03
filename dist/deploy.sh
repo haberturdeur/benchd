@@ -16,4 +16,19 @@ for b in $BINS; do
   c=$(sha256sum "/usr/local/bin/$b"  | cut -d' ' -f1)
   [ "$a" = "$c" ] || { echo "MISMATCH: /usr/local/bin/$b is not the binary just built"; exit 1; }
 done
+# Restart whatever is running, or the verification above is worthless: six
+# separate debugging dead ends in this project were a *running process* from an
+# older build, twice after this script had already confirmed the files on disk.
+UNITS=$(systemctl list-units --plain --no-legend 'benchd-*' 2>/dev/null | awk '{print $1}')
+if [ -n "$UNITS" ]; then
+  # Coordinator first: hosts and clients reconnect to it.
+  sudo systemctl restart benchd-coordinator 2>/dev/null || true
+  sleep 1
+  for u in $UNITS; do
+    case "$u" in benchd-coordinator.service) continue;; esac
+    sudo systemctl restart "$u" 2>/dev/null || true
+  done
+  echo "restarted: $(echo $UNITS | tr '\n' ' ')"
+fi
+
 echo "deployed and verified: $BINS"

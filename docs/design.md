@@ -44,7 +44,7 @@ Agents need exclusive, time-bounded custody of hardware, and that custody must b
 
 | Concept | Definition |
 |---|---|
-| **Resource** | One physical thing: a serial device (by `/dev/serial/by-id` path), a USB device, a relay, a probe. |
+| **Resource** | One physical thing: a serial device, a USB device, a relay, a probe. Named by **position** (`by-path`) with the **serial** of the chip expected there — see D20. |
 | **Bench** | Unit of exclusion *and* ownership. A named set of resources — possibly several boards — always held together. Lives on exactly one host. |
 | **Tag** | A `key=value` capability fact about a bench. |
 | **Slot** | A named role in a claim (`dut`, `peer`), filled by one whole bench. |
@@ -347,6 +347,31 @@ privilege lives in the daemon.
 *Rejected:* serving MCP over local HTTP so one daemon handles every agent. It works
 (`rmcp` supports it) but pushes per-agent identity into a header the harness must set,
 which is more fragile than a process boundary that already exists.
+
+### D20. A bench names a position, and records what should be in it
+
+A serial resource is named by its `/dev/serial/by-path` entry, and optionally
+carries the USB `serial` of the chip expected in that position.
+
+*Why position:* a bench **is** a physical slot — a port on a hub, with a board
+cabled into it. `by-path` is stable across swapping that board, so replacing a
+dead one needs no config edit. `by-id` names a specific chip instead, and breaks
+loudly on a swap, which is right only when a particular board matters more than
+the slot. Never `ttyUSB0`: kernel indices renumber on replug and hand an agent
+the wrong board.
+
+*Why also the serial:* position stability is exactly what makes a swap silent,
+and the tags describe the **chip**, not the slot. Observed in practice on this
+lab: the same port held three different chips over one session while its config
+kept asserting `soc=esp32s3`, so agents asking for an S3 were handed a C3 and a
+P4 — the precise failure tags exist to prevent. With a serial declared, a swap is
+refused at registration naming both serials and pointing at the tags; without
+one, whatever is in the slot is accepted.
+
+*Not chip-ID probing:* reading the ROM banner would give ground truth, but it
+requires resetting the board, which is not something to do to hardware at
+registration, and native-USB parts re-enumerate when reset. A declared serial
+costs one config line and makes the drift loud, which is enough.
 
 ### D19. Identity is a session token; the name is only a label
 
