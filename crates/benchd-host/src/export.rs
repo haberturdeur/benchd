@@ -65,6 +65,11 @@ impl Exports {
     /// device here, so a bench does not have to be written twice to work both
     /// locally and remotely.
     fn busids(&self) -> Vec<(String, String)> {
+        busids_for(&self.spec).into_iter().collect()
+    }
+
+    #[allow(dead_code)]
+    fn unused_busids(&self) -> Vec<(String, String)> {
         self.spec
             .resources
             .iter()
@@ -296,16 +301,48 @@ pub async fn recover_orphans(spec: &BenchSpec) {
     }
 }
 
-/// Walk from a `/dev/serial/by-id` symlink up to the USB device that owns it.
+/// Every USB busid this bench can export, by resource name.
+///
+/// Must be resolved before anything is exported: the mapping goes through the
+/// tty, and exporting removes it.
+pub fn busids_for(spec: &BenchSpec) -> BTreeMap<String, String> {
+    spec.resources
+        .iter()
+        .filter_map(|(name, r)| {
+            let busid = match r {
+                Resource::Usb { busid } => Some(busid.clone()),
+                Resource::Serial { path, .. } => busid_for_tty(path),
+            }?;
+            Some((name.clone(), busid))
+        })
+        .collect()
+}
+
+/// Walk from a `/dev/serial` symlink up to the USB device that owns it.
 ///
 /// `/sys/class/tty/ttyACM0/device` is the *interface* (`1-2:1.0`); the device is
 /// its parent, and the busid is the part before the colon.
-fn busid_for_tty(by_id: &std::path::Path) -> Option<String> {
-    let tty = std::fs::canonicalize(by_id).ok()?;
+fn busid_for_tty(path: &std::path::Path) -> Option<String> {
+    let tty = std::fs::canonicalize(path).ok()?;
     let name = tty.file_name()?.to_str()?;
-    let link = std::fs::read_link(format!("/sys/class/tty/{name}/device")).ok()?;
-    let interface = link.file_name()?.to_str()?;
-    interface.split(':').next().map(str::to_string)
+    let mut dir = std::fs::canonicalize(format!("/sys/class/tty/{name}/device")).ok()?;
+
+    // Walk up until we reach the USB *device*, identified by carrying `busnum`.
+    //
+    // The depth is not fixed. A CDC-ACM tty hangs off the interface, one level
+    // below the device; a USB-serial bridge inserts a `usb-serial` port node, so
+    // the device is two levels up. Assuming one level resolved ESP32s correctly
+    // and returned nothing for CP2102s — which made the liveness watcher fall
+    // back to polling the tty, and a tty vanishes the moment the bench is
+    // exported for a remote lease, so every relayed lease on such a bench was
+    // torn down within seconds as "device lost".
+    for _ in 0..6 {
+        if dir.join("busnum").exists() {
+            return dir.file_name()?.to_str().map(str::to_string);
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
 }
 
 /// Read a bound device's descriptors out of sysfs.

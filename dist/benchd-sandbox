@@ -71,13 +71,31 @@ fi
 #
 # Resolved from the bench definitions on this machine. A device that is not a
 # bench resource is none of benchd's business and stays visible.
+# A resource may be named by position (by_path, preferred) or by chip (by_id).
+# Matching only one of them silently hid nothing the day the benches moved to
+# by_path — the sandbox reported "hidden: none" and every board was visible to
+# every agent. Match both, and count what we expected to find.
 declare -A BENCH_DEV=()
+DECLARED=0
 if [ -d "$BENCHES" ]; then
-  while IFS= read -r byid; do
-    [ -e "$byid" ] || continue
-    real=$(readlink -f "$byid") || continue
+  while IFS= read -r decl; do
+    DECLARED=$((DECLARED + 1))
+    [ -e "$decl" ] || continue
+    real=$(readlink -f "$decl") || continue
     BENCH_DEV["$real"]=1
-  done < <(grep -ho 'by_id *= *"[^"]*"' "$BENCHES"/*.toml 2>/dev/null | sed 's/.*"\(.*\)"/\1/')
+  done < <(grep -ho '\(by_path\|by_id\) *= *"[^"]*"' "$BENCHES"/*.toml 2>/dev/null \
+           | sed 's/.*"\(.*\)"/\1/')
+fi
+
+# Fail closed. If benches declare devices but none resolved, something is out of
+# step — a renamed key, a moved config, an unplugged board — and the safe answer
+# is to hide every serial device rather than expose the lab. A security control
+# that silently degrades to "allow everything" is worse than none.
+FAIL_CLOSED=0
+if [ "$DECLARED" -gt 0 ] && [ "${#BENCH_DEV[@]}" -eq 0 ]; then
+  echo "benchd-sandbox: $DECLARED bench device(s) declared but none resolved;" >&2
+  echo "                hiding ALL serial devices rather than guessing." >&2
+  FAIL_CLOSED=1
 fi
 
 ALLOW=()
@@ -85,7 +103,7 @@ HIDDEN=()
 for dev in /dev/ttyUSB* /dev/ttyACM* /dev/ttyS*; do
   [ -e "$dev" ] || continue
   real=$(readlink -f "$dev")
-  if [ -n "${BENCH_DEV[$real]:-}" ]; then
+  if [ -n "${BENCH_DEV[$real]:-}" ] || [ "$FAIL_CLOSED" = 1 ]; then
     HIDDEN+=("$dev")
   else
     ALLOW+=(--dev-bind "$dev" "$dev")

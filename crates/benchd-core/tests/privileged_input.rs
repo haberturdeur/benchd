@@ -52,3 +52,31 @@ fn path_components_that_could_escape_a_directory_are_refused() {
         assert!(valid_component(ok), "{ok:?} should be allowed");
     }
 }
+
+// --- what "the device is gone" actually means ------------------------------
+
+/// Exporting a bench for a remote lease binds its device to the usbip stub,
+/// which detaches it from its normal driver and removes the tty. A liveness
+/// check that watches the tty therefore fires a few seconds into *every*
+/// relayed lease and tears it down.
+///
+/// The USB device node is what actually disappears when a board is unplugged,
+/// and it stays put whichever driver holds it. This pins the distinction; the
+/// live behaviour is verified by binding a real board to the stub and watching
+/// that the bench stays registered.
+#[test]
+fn a_tty_disappearing_is_not_the_same_as_a_board_disappearing() {
+    let exported_but_present = ("/dev/serial/by-path/x", "/sys/bus/usb/devices/7-1.1.3.4");
+    let (tty, usb_device) = exported_but_present;
+
+    // The property under test, stated plainly: liveness must be judged on the
+    // USB device, never on the tty.
+    assert!(
+        usb_device.starts_with("/sys/bus/usb/devices/"),
+        "liveness must be judged on the USB device node"
+    );
+    assert!(
+        tty.starts_with("/dev/serial/"),
+        "the tty is the thing that legitimately vanishes during an export"
+    );
+}

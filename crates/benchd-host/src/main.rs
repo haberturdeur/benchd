@@ -277,17 +277,43 @@ async fn wait_for_hardware(config: &BenchConfig, poll_seconds: u64) -> BenchSpec
 /// co-located export. Every claim then picked the dead bench and failed on the
 /// client, and the capability was unusable until someone restarted the host by
 /// hand — even with another matching bench free.
-async fn watch_hardware(spec: BenchSpec, poll_seconds: u64) -> (String, String) {
+async fn watch_hardware(
+    spec: BenchSpec,
+    busids: BTreeMap<String, String>,
+    poll_seconds: u64,
+) -> (String, String) {
     loop {
         tokio::time::sleep(Duration::from_secs(poll_seconds.max(1))).await;
         for (name, resource) in &spec.resources {
-            if let Resource::Serial { path, .. } = resource {
-                if tokio::fs::metadata(path).await.is_err() {
-                    return (
-                        name.clone(),
-                        format!("{} is no longer present", path.display()),
-                    );
+            let gone = match resource {
+                // Watch the USB device, not the tty.
+                //
+                // Exporting a bench for a remote lease binds its device to the
+                // usbip stub, which detaches it from cdc_acm and makes the tty —
+                // and the by-path symlink pointing at it — disappear. Polling
+                // the tty therefore reported "device lost" a few seconds into
+                // every relayed lease and tore it down. The USB device node
+                // stays put whichever driver holds it, and vanishes only when
+                // the board actually does.
+                Resource::Serial { path, .. } => match busids.get(name) {
+                    Some(busid) => {
+                        tokio::fs::metadata(format!("/sys/bus/usb/devices/{busid}"))
+                            .await
+                            .is_err()
+                    }
+                    // No busid resolved (a hub-less device, an odd topology):
+                    // fall back to the tty, which is still right when nothing
+                    // is exported.
+                    None => tokio::fs::metadata(path).await.is_err(),
+                },
+                Resource::Usb { busid } => {
+                    tokio::fs::metadata(format!("/sys/bus/usb/devices/{busid}"))
+                        .await
+                        .is_err()
                 }
+            };
+            if gone {
+                return (name.clone(), "the USB device is no longer attached".to_string());
             }
         }
     }
@@ -321,7 +347,10 @@ async fn run(args: &Args, spec: &BenchSpec, exports: &mut Exports) -> Result<()>
         })
     };
 
-    let mut watcher = Box::pin(watch_hardware(spec.clone(), args.device_poll_seconds));
+    // Resolved while the ttys still exist, i.e. before anything is exported.
+    let busids = crate::export::busids_for(spec);
+    let mut watcher =
+        Box::pin(watch_hardware(spec.clone(), busids, args.device_poll_seconds));
 
     let result = loop {
         tokio::select! {
