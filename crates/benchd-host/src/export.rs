@@ -9,12 +9,20 @@
 //! stub-bound, with no tty — for the whole life of this process, so there is no
 //! local inode for a same-machine client to bind-mount even in principle.
 //!
+//! Nothing here changes which driver owns a device. [`crate::hide`] binds the
+//! stub at startup and holds that binding until the process ends, so a lease
+//! only ever attaches a socket to a device that is already bound, and ending
+//! one only ever takes that socket away. Two owners of one binding is what made
+//! the first lease to end give its board back to `cdc_acm`, tty and all, with
+//! nothing left that would hide it again.
+//!
 //! Everything is **epoch-fenced and idempotent**. A delayed instruction for a
 //! superseded lease must be dropped, not obeyed: obeying it would hand live
 //! hardware to an agent whose lease is gone (D7).
 
 use std::collections::BTreeMap;
 
+use anyhow::{Context, Result};
 use benchd_core::lease::{Epoch, LeaseId, SessionId};
 use benchd_core::model::Resource;
 use benchd_core::sysfs;
@@ -61,16 +69,24 @@ impl Exports {
         }
     }
 
-    /// Undo anything a previous incarnation of this process left behind.
+    /// Drop a socket a previous incarnation of this process left attached.
     ///
     /// The kernel keeps its own reference to a handed-over socket, so an export
     /// outlives the process that made it. Without this, a restart would leave
     /// hardware reachable by an agent whose lease no longer exists (D6).
+    ///
+    /// It looks for a socket rather than for a binding, and that is the whole
+    /// distinction: by the time we get here every one of this bench's devices is
+    /// bound to the stub, because hiding just bound them. Testing for the
+    /// binding instead released every device microseconds after hiding it. What
+    /// can genuinely survive is a socket on a device that `hide` *adopted* — it
+    /// leaves an already-bound device alone, so a host killed mid-lease whose
+    /// record could not be replayed comes back with the export still live.
     pub async fn clear_stale(&mut self) {
         for (_, busid) in self.busids() {
-            if sysfs::is_bound(&busid) {
+            if sysfs::stub_has_socket(&busid).await {
                 tracing::warn!(%busid, "clearing a stale export from a previous run");
-                sysfs::unbind(&busid).await;
+                sysfs::stub_detach(&busid).await;
             }
         }
     }
@@ -108,12 +124,10 @@ impl Exports {
 
         let busids = self.busids();
         if busids.is_empty() {
+            // Registration resolves every resource to a busid and refuses the
+            // bench when it cannot, so this is a guard rather than a path.
             return Outcome::Failed {
-                detail: format!(
-                    "bench {} has no USB device to export remotely \
-                     (a serial resource must resolve to a USB device)",
-                    self.spec.id
-                ),
+                detail: format!("bench {} has no USB device to export", self.spec.id),
             };
         }
 
@@ -138,41 +152,41 @@ impl Exports {
                 };
             };
 
-            if let Err(err) = sysfs::bind(busid).await {
+            // The device is bound already — hiding did it at startup and holds
+            // that binding for the life of this process — so exporting has
+            // nothing to bind. If it is somehow not bound then this bench is
+            // not hidden, and binding it here would take back an ownership
+            // hiding never gave up: the next lease to end would hand the board
+            // to `cdc_acm` and put a tty on this machine for good.
+            if !sysfs::is_bound(busid) {
                 self.tear_down(&exported).await;
-                // `bind` can fail after detaching the device from its normal
-                // driver, so the busid it was working on has to be cleaned up
-                // too — otherwise the board vanishes from the machine until the
-                // host process restarts.
-                sysfs::unbind(busid).await;
                 return Outcome::Failed {
-                    detail: format!("usbip bind {busid}: {err}"),
+                    detail: format!(
+                        "{busid} is not bound to the usbip stub, so resource {resource:?} is \
+                         not hidden and must not be exported"
+                    ),
                 };
             }
 
-            // From here the device IS bound, so every failure path below must
-            // include this busid in the teardown, not just the ones that
-            // already succeeded.
-            let mut bound = exported.clone();
-            bound.push(busid.clone());
+            // Detaching a device that has no socket attached is a no-op, so a
+            // busid can join the teardown list before there is anything on it
+            // to take away.
+            exported.push(busid.clone());
 
             let device = match describe(busid).await {
                 Ok(device) => device,
                 Err(err) => {
-                    self.tear_down(&bound).await;
+                    self.tear_down(&exported).await;
                     return Outcome::Failed {
                         detail: format!("reading {busid}: {err}"),
                     };
                 }
             };
-            match self.serve_channel(&key, device).await {
-                Ok(()) => exported.push(busid.clone()),
-                Err(err) => {
-                    self.tear_down(&bound).await;
-                    return Outcome::Failed {
-                        detail: format!("exporting {busid}: {err}"),
-                    };
-                }
+            if let Err(err) = self.serve_channel(&key, device).await {
+                self.tear_down(&exported).await;
+                return Outcome::Failed {
+                    detail: format!("exporting {busid}: {err}"),
+                };
             }
         }
 
@@ -224,9 +238,17 @@ impl Exports {
         Ok(())
     }
 
+    /// Take back every socket handed out for one lease.
+    ///
+    /// Mandatory rather than tidy, and idempotent for the same reason: the
+    /// kernel holds its own reference to a handed-over socket, and the lease
+    /// reaper races voluntary releases, so this may run twice and may not fail.
+    /// It leaves the devices bound — that binding belongs to hiding, and giving
+    /// it back here would put a tty on this machine for a board nothing is
+    /// going to hide again.
     async fn tear_down(&self, busids: &[String]) {
         for busid in busids {
-            sysfs::unbind(busid).await;
+            sysfs::stub_detach(busid).await;
         }
     }
 
@@ -312,17 +334,24 @@ pub async fn recover_orphans(spec: &BenchSpec) {
                 %busid, %serial,
                 "this bench's device was left bound to the usbip stub; releasing it"
             );
-            sysfs::unbind(&busid).await;
+            if let Err(detail) = sysfs::unbind(&busid).await {
+                tracing::error!(%busid, %detail, "could not release this device");
+                continue;
+            }
         } else if !sysfs::has_tty(&busid).await {
             tracing::warn!(
                 %busid, %serial,
                 "this bench's device has no driver; re-probing it"
             );
-            sysfs::reattach(&busid).await;
+            if !sysfs::reattach(&busid).await {
+                continue;
+            }
         } else {
             continue;
         }
         // udev has to recreate the device node before anything resolves it.
+        // There is nothing to wait for when the device did not come back, and
+        // both calls above have already said so.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     }
 }
@@ -331,38 +360,60 @@ pub async fn recover_orphans(spec: &BenchSpec) {
 ///
 /// Must be resolved before anything is exported: the mapping goes through the
 /// tty, and exporting removes it.
-pub fn busids_for(spec: &BenchSpec) -> BTreeMap<String, String> {
-    spec.resources
-        .iter()
-        .filter_map(|(name, r)| {
-            let busid = match r {
-                Resource::Usb { busid, .. } => Some(busid.clone()),
-                Resource::Serial { path, .. } => busid_for_tty(path),
-            }?;
-            Some((name.clone(), busid))
-        })
-        .collect()
+///
+/// Every resource must resolve, and one that does not fails the whole bench.
+/// This map is exactly what hiding hides, so a resource quietly missing from it
+/// is a board left with a live tty on a bench that has just reported itself
+/// hidden — and a map that comes out empty gives a bench which registers,
+/// matches every claim, fails all of them, and goes on absorbing them.
+pub fn busids_for(spec: &BenchSpec) -> Result<BTreeMap<String, String>> {
+    if spec.resources.is_empty() {
+        anyhow::bail!(
+            "bench {} declares no resources, so there is nothing to hide or to lease",
+            spec.id
+        );
+    }
+    let mut busids = BTreeMap::new();
+    for (name, resource) in &spec.resources {
+        let busid = match resource {
+            Resource::Usb { busid, .. } => busid.clone(),
+            Resource::Serial { path, .. } => busid_for_tty(path)
+                .with_context(|| format!("resource {name:?} has no USB device to hide"))?,
+        };
+        busids.insert(name.clone(), busid);
+    }
+    Ok(busids)
 }
 
 /// Walk from a `/dev/serial` symlink up to the USB device that owns it.
 ///
 /// `/sys/class/tty/ttyACM0/device` is the *interface* (`1-2:1.0`); the device is
 /// its parent, and the busid is the part before the colon.
-fn busid_for_tty(path: &std::path::Path) -> Option<String> {
-    let tty = std::fs::canonicalize(path).ok()?;
-    let dir = sysfs::usb_device_of_tty(&tty)?;
+fn busid_for_tty(path: &std::path::Path) -> Result<String> {
+    let tty = std::fs::canonicalize(path)
+        .with_context(|| format!("{} is not present", path.display()))?;
+    let dir = sysfs::usb_device_of_tty(&tty).with_context(|| {
+        format!(
+            "{} is {}, which no USB device owns",
+            path.display(),
+            tty.display()
+        )
+    })?;
     // Registration refuses a forwarded device already, so reaching here means
     // one appeared under a name this bench had resolved. Nothing good can be
     // done with it: binding the stub to a virtual device would leave the real
-    // board untouched, so treat it as no busid at all.
+    // board untouched and visible, which is why this is fatal rather than a
+    // resource silently dropped from the map.
     if sysfs::is_forwarded(&dir) {
-        tracing::warn!(
-            path = %path.display(),
-            "this resource resolves to a device forwarded over USB/IP, not to local hardware"
+        anyhow::bail!(
+            "{} resolves to a device forwarded in over USB/IP, not to local hardware",
+            path.display()
         );
-        return None;
     }
-    dir.file_name()?.to_str().map(str::to_string)
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .with_context(|| format!("{} has no readable bus id", dir.display()))
 }
 
 /// Read a bound device's descriptors out of sysfs.
@@ -387,7 +438,10 @@ async fn describe(busid: &str) -> std::io::Result<UsbDevice> {
         busid: busid.to_string(),
         busnum: dec(&field(&base, "busnum").await?),
         devnum: dec(&field(&base, "devnum").await?),
-        // usb_device_speed: 1 = low, 2 = full, 3 = high, 5 = super.
+        // usb_device_speed: 1 = low, 2 = full, 3 = high, 5 = super, 6 = super
+        // plus. The client reserves a vhci port from this number, and the
+        // kernel puts anything from 5 up on the super-speed hub, so the two
+        // faster speeds must stay distinct from the rest.
         speed: match speed_text.as_str() {
             "1.5" => 1,
             "12" => 2,
@@ -408,4 +462,84 @@ async fn describe(busid: &str) -> std::io::Result<UsbDevice> {
         b_num_configurations: dec(&field(&base, "bNumConfigurations").await.unwrap_or_default()),
         b_num_interfaces: dec(&field(&base, "bNumInterfaces").await.unwrap_or_default()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::busids_for;
+    use benchd_core::model::{Resource, UsbNode};
+    use benchd_core::wire::BenchSpec;
+    use std::collections::BTreeMap;
+
+    fn spec(resources: BTreeMap<String, Resource>) -> BenchSpec {
+        BenchSpec {
+            id: "esp32s3-sdmux".into(),
+            description: String::new(),
+            docs: String::new(),
+            tags: Vec::new(),
+            resources,
+        }
+    }
+
+    fn sdmux() -> (String, Resource) {
+        (
+            "sdmux".into(),
+            Resource::Usb {
+                busid: "3-1.1".into(),
+                node: UsbNode::Scsi,
+            },
+        )
+    }
+
+    /// The map is what hiding hides, so a resource that falls out of it is a
+    /// board left with a live tty on a bench reporting itself hidden. Dropping
+    /// it silently is what made that possible; the error has to name it, or
+    /// nobody can tell which of three boards is still exposed.
+    #[test]
+    fn a_resource_that_resolves_to_no_device_fails_the_whole_bench() {
+        let mut resources = BTreeMap::new();
+        let (name, resource) = sdmux();
+        resources.insert(name, resource);
+        resources.insert(
+            "console".into(),
+            Resource::Serial {
+                path: "/nonexistent/by-path/platform-xhci-hcd.0-usb-0:2:1.0".into(),
+                serial: None,
+                interface: None,
+            },
+        );
+
+        let err = busids_for(&spec(resources)).expect_err("an unresolvable resource is fatal");
+        let err = format!("{err:#}");
+        assert!(err.contains("console"), "{err}");
+    }
+
+    /// The degenerate bench: nothing to hide, so nothing to lease either. It
+    /// used to register, log itself hidden with zero devices, and then swallow
+    /// every claim that matched its tags.
+    #[test]
+    fn a_bench_with_no_resources_is_refused() {
+        let err = busids_for(&spec(BTreeMap::new())).expect_err("nothing to hide is fatal");
+        assert!(format!("{err:#}").contains("no resources"), "{err}");
+    }
+
+    /// Two resources on one device keep both names and one busid: the SCSI node
+    /// switches a USB-SD-Mux and the block node holds its card.
+    #[test]
+    fn resources_named_by_busid_need_no_tty_to_resolve() {
+        let mut resources = BTreeMap::new();
+        let (name, resource) = sdmux();
+        resources.insert(name, resource);
+        resources.insert(
+            "sdcard".into(),
+            Resource::Usb {
+                busid: "3-1.1".into(),
+                node: UsbNode::Block,
+            },
+        );
+
+        let busids = busids_for(&spec(resources)).expect("busids resolve on their own");
+        assert_eq!(busids.get("sdmux").map(String::as_str), Some("3-1.1"));
+        assert_eq!(busids.get("sdcard").map(String::as_str), Some("3-1.1"));
+    }
 }

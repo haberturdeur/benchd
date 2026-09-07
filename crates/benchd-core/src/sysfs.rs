@@ -72,24 +72,82 @@ pub async fn bind(busid: &str) -> io::Result<()> {
     write_sysfs(format!("{STUB}/bind"), busid).await
 }
 
-pub async fn unbind(busid: &str) {
+/// Take a device off the stub and give it back to its normal driver, saying
+/// whether that actually happened and why not.
+///
+/// The answer is not advisory. Every write here can time out on a wedged usbip
+/// driver, and a caller that treats a failed release as a success — deleting
+/// the record that names the device as it goes — leaves a board stub-bound with
+/// no tty and nothing left that could find it again: resolving a serial
+/// resource needs the very tty it no longer has.
+///
+/// The reason comes back to the caller rather than being logged here, so that
+/// it lands in the log of whatever was trying to release the device and under
+/// that crate's log target.
+pub async fn unbind(busid: &str) -> Result<(), String> {
     // Stop the kernel pumping first, then release the device. The reverse order
-    // leaves a live socket attached to a device we no longer own.
+    // leaves a live socket attached to a device we no longer own. A stub with no
+    // socket attached rejects this write, which is not a failure.
     let _ = write_sysfs(stub_path(busid).join("usbip_sockfd"), "-1").await;
-    let _ = write_sysfs(format!("{STUB}/unbind"), busid).await;
+    let unbound = write_sysfs(format!("{STUB}/unbind"), busid).await;
     // Dropped even when the board is gone: the entry is what makes the stub
     // claim a device the moment it appears, so leaving it behind means a
-    // replugged board comes back with no tty and cannot be resolved.
-    let _ = write_sysfs(format!("{STUB}/match_busid"), &format!("del {busid}")).await;
+    // replugged board comes back with no tty and cannot be resolved. For a
+    // device that has already vanished this is the only write whose result
+    // means anything, because there is nothing left to observe.
+    let forgotten = write_sysfs(format!("{STUB}/match_busid"), &format!("del {busid}")).await;
+
+    // Asked of the stub rather than inferred from the write, which reports
+    // `ENODEV` for a board that is simply no longer plugged in.
+    if is_bound(busid) {
+        return Err(match unbound {
+            Err(err) => format!("still bound to the usbip stub: {err}"),
+            Ok(()) => "still bound to the usbip stub".to_string(),
+        });
+    }
+    if let Err(err) = forgotten {
+        return Err(format!("its match_busid entry is still there: {err}"));
+    }
     // Nothing to probe for a device that is no longer plugged in, and
     // `reattach` would spend its whole retry budget failing before logging an
     // error about a board that is simply absent.
     if tokio::fs::metadata(format!("/sys/bus/usb/devices/{busid}"))
         .await
         .is_ok()
+        && !reattach(busid).await
     {
-        reattach(busid).await;
+        return Err("no driver claimed it, so it still has no tty".to_string());
     }
+    Ok(())
+}
+
+/// End an export: stop the kernel pumping, and leave the device on the stub.
+///
+/// A bench's devices are bound to the stub before any lease exists and stay
+/// bound after the last one ends, so ending a lease has to touch the socket and
+/// nothing else. [`unbind`] here would hand the board back to `cdc_acm`, put a
+/// tty on the one machine the bench is hidden from, and leave nothing that ever
+/// hides it again.
+///
+/// Idempotent, because a retried teardown and the lease reaper race each other:
+/// the kernel rejects `-1` when no socket is attached, which is exactly the
+/// state the second caller finds.
+pub async fn stub_detach(busid: &str) {
+    let _ = write_sysfs(stub_path(busid).join("usbip_sockfd"), "-1").await;
+}
+
+/// Whether the stub is currently pumping a socket for this device.
+///
+/// `usbip_status` is the stub's own view: 1 is bound and idle, 2 is a live
+/// export. Telling those apart is how a starting host recognises a binding it
+/// adopted from an incarnation that died mid-lease, as opposed to one it made
+/// itself a moment ago.
+pub async fn stub_has_socket(busid: &str) -> bool {
+    /// `SDEV_ST_USED`.
+    const USED: &str = "2";
+    tokio::fs::read_to_string(stub_path(busid).join("usbip_status"))
+        .await
+        .is_ok_and(|status| status.trim() == USED)
 }
 
 /// Put a device back under its normal driver.
@@ -100,7 +158,7 @@ pub async fn unbind(busid: &str) {
 /// invisible to everything that looks it up by `/dev/serial/by-id`. A board in
 /// that state stays dead until someone finds it by hand, so it is worth several
 /// seconds of patience here.
-pub async fn reattach(busid: &str) {
+pub async fn reattach(busid: &str) -> bool {
     for attempt in 0..6 {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -110,7 +168,7 @@ pub async fn reattach(busid: &str) {
             if attempt > 0 {
                 tracing::info!(%busid, attempt, "device returned to its normal driver");
             }
-            return;
+            return true;
         }
     }
     tracing::error!(
@@ -118,6 +176,7 @@ pub async fn reattach(busid: &str) {
         "device is left with no driver; it will have no tty until it is re-probed \
          or replugged"
     );
+    false
 }
 
 /// Whether any interface of this device has a driver bound.
@@ -290,7 +349,11 @@ pub async fn stub_attach(busid: &str, stream: TcpStream) -> io::Result<()> {
 /// the end of the hs range — so a single device always succeeded and a second
 /// one sometimes did not.
 pub async fn free_vhci_port(speed: u32) -> io::Result<u32> {
-    let want = if speed >= 5 { "ss" } else { "hs" };
+    let want = if on_super_speed_hub(speed) {
+        "ss"
+    } else {
+        "hs"
+    };
     let status = tokio::fs::read_to_string(format!("{VHCI}/status")).await?;
 
     for line in status.lines().skip(1) {
@@ -314,6 +377,46 @@ pub async fn free_vhci_port(speed: u32) -> io::Result<u32> {
         io::ErrorKind::WouldBlock,
         format!("no free {want} vhci port; every virtual slot for this device speed is in use"),
     ))
+}
+
+/// Which of vhci's two root hubs the kernel will attach a device of this speed
+/// to.
+///
+/// `attach_store` chooses the super-speed hub for `speed >= USB_SPEED_SUPER`,
+/// so SuperSpeed (5) and SuperSpeed-Plus (6) both land there. Every caller asks
+/// here rather than testing the speed itself: reserving a port on one hub and
+/// then looking for the device on the other costs a ten-second timeout and
+/// reports itself as a missing driver.
+fn on_super_speed_hub(speed: u32) -> bool {
+    speed >= 5
+}
+
+/// How wide each of vhci's two root hubs is, according to the `status` table.
+///
+/// `VHCI_HC_PORTS` is a kernel config option, so eight is a default rather than
+/// a promise. The table gives the real number away: it lists every port of the
+/// high-speed hub and then every port of the super-speed one under a single
+/// numbering, so the first `ss` row is numbered exactly as many ports in as the
+/// high-speed hub is wide.
+fn ports_per_hub(status: &str) -> u32 {
+    /// `VHCI_HC_PORTS` when the kernel was built without an override.
+    const DEFAULT: u32 = 8;
+    status
+        .lines()
+        .skip(1)
+        .find(|line| line.split_whitespace().next() == Some("ss"))
+        .and_then(|line| parse_padded(line.split_whitespace().nth(1)?))
+        .filter(|width| *width > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// The root-hub port a global `status` port number refers to.
+///
+/// The kernel converts the other way with `port % VHCI_HC_PORTS` and picks the
+/// hub from the speed it was given, so super-speed port 8 is rhport 0 of the
+/// super-speed hub — not a ninth port of anything.
+fn rhport_of(port: u32, status: &str) -> u32 {
+    port % ports_per_hub(status)
 }
 
 /// Parse a zero-padded sysfs field such as `0008` or `004`.
@@ -382,21 +485,31 @@ pub async fn attached_ports() -> Vec<u32> {
 /// `/dev/sda` of its own. The port tells the truth.
 ///
 /// vhci exposes two root hubs, high speed and super speed. A device on rhport
-/// `p` of a hub whose bus is `b` enumerates as `b-(p+1)`.
+/// `p` of a hub whose bus is `b` enumerates as `b-(p+1)` — and `port` is the
+/// *global* number from the `status` table, which numbers both hubs in one
+/// range, so it has to be reduced to an rhport first. Using it directly is
+/// right by coincidence for high-speed ports, since those come first and the
+/// two numbers agree; for a super-speed port it looks for a `<bus>-9` that an
+/// eight-port hub cannot have, so every USB 3 import waited out its timeout and
+/// was reported as a missing driver.
 pub async fn wait_for_vhci_node(
     port: u32,
     speed: u32,
     want: WantedNode,
     timeout: std::time::Duration,
 ) -> Option<PathBuf> {
-    let super_speed = speed >= 5;
+    let super_speed = on_super_speed_hub(speed);
+    let status = tokio::fs::read_to_string(format!("{VHCI}/status"))
+        .await
+        .unwrap_or_default();
+    let rhport = rhport_of(port, &status);
     let deadline = tokio::time::Instant::now() + timeout;
 
     while tokio::time::Instant::now() < deadline {
         if let Some(bus) = vhci_bus(super_speed).await {
             let device = PathBuf::from(VHCI)
                 .join(format!("usb{bus}"))
-                .join(format!("{bus}-{}", port + 1));
+                .join(format!("{bus}-{}", rhport + 1));
             if let Some(name) = node_under(&device, want).await {
                 // sysfs gains the node before udev creates it under /dev, so a
                 // name with nothing behind it yet just means "not ready"; the
@@ -562,7 +675,9 @@ async fn class_node_under(device: &std::path::Path, class: &str) -> Option<std::
 
 #[cfg(test)]
 mod tests {
-    use super::{is_forwarded, node_under, parse_padded};
+    use super::{
+        is_forwarded, node_under, on_super_speed_hub, parse_padded, ports_per_hub, rhport_of,
+    };
     use crate::wire::WantedNode;
     use std::path::Path;
 
@@ -705,6 +820,48 @@ ss  0008 004 000 00000000 000000 0-0";
         // so one device always worked and a second one sometimes did not.
         assert_eq!(first_free("hs"), Some(2));
         assert_eq!(first_free("ss"), Some(8));
+    }
+
+    /// The number in the table is not the number the hub uses.
+    #[test]
+    fn the_first_superspeed_port_is_rhport_zero_of_its_own_hub() {
+        // The kernel converts back with `port % VHCI_HC_PORTS` and picks the
+        // hub from the speed, so global port 8 addresses the *first* port of
+        // the ss hub and its device enumerates as `<bus>-1`. Looking for
+        // `<bus>-9` finds nothing, ever, and presents as a missing driver ten
+        // seconds later.
+        assert_eq!(ports_per_hub(STATUS), 8);
+        assert_eq!(rhport_of(first_free("ss").unwrap(), STATUS), 0);
+        // High speed comes first in the table, so there the two agree.
+        assert_eq!(rhport_of(first_free("hs").unwrap(), STATUS), 2);
+    }
+
+    /// `VHCI_HC_PORTS` is a kernel config option, and the table says what it
+    /// was built with rather than leaving it to be guessed.
+    #[test]
+    fn a_narrower_hub_is_read_from_the_table_not_assumed() {
+        let narrow = "\
+hub port sta spd dev      sockfd local_busid
+hs  0000 006 002 0007003b 000012 9-1
+hs  0001 004 000 00000000 000000 0-0
+ss  0002 004 000 00000000 000000 0-0
+ss  0003 004 000 00000000 000000 0-0";
+        assert_eq!(ports_per_hub(narrow), 2);
+        assert_eq!(rhport_of(3, narrow), 1);
+        // An unreadable table falls back to the kernel's own default.
+        assert_eq!(ports_per_hub(""), 8);
+    }
+
+    /// Both hubs are chosen by the same rule the kernel uses.
+    #[test]
+    fn superspeed_plus_belongs_to_the_superspeed_hub() {
+        // `attach_store` takes the ss hub for `speed >= USB_SPEED_SUPER`, so a
+        // 10 Gbps device goes there too. Deciding otherwise in one place and
+        // not the other reserves a port on one hub and waits for the device on
+        // the other.
+        assert!(on_super_speed_hub(5));
+        assert!(on_super_speed_hub(6));
+        assert!(!on_super_speed_hub(3));
     }
 
     #[test]

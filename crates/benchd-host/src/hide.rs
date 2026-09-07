@@ -7,9 +7,16 @@
 //! or a sandbox can give, because there is no object left to guard.
 //!
 //! So a host hides every device its bench declares, for its whole lifetime, and
-//! gives one up only for the duration of a lease and only over USB/IP. This is
+//! reaches it only over USB/IP and only for the duration of a lease. This is
 //! what lets the client side stop caring about sandboxes: an agent that ignores
 //! the skill and reaches for `/dev/ttyUSB0` finds nothing there, on any machine.
+//!
+//! **This is the only place in the workspace that changes which driver owns a
+//! device.** A lease attaches a socket to a device that is already bound and
+//! ending one takes that socket away again, so a device changes driver twice in
+//! a host's life and both times in this file. When exporting owned the binding
+//! too, the first lease to end gave its board back to `cdc_acm` — tty and all —
+//! and nothing existed that would ever hide it again.
 //!
 //! **The busids are written to disk before they are bound, never after.** A
 //! stub binding is kernel state that outlives the process which made it, so a
@@ -32,31 +39,53 @@ pub fn state_path(dir: &Path, bench: &str) -> PathBuf {
     dir.join(format!("{bench}.busids"))
 }
 
-/// Release every device named in `state`, then forget it.
+/// Release every device named in `state`, and forget the ones that came back.
 ///
 /// Must run before the bench is resolved, because resolution goes through the
 /// tty and a hidden device has none. Without it a host killed while hiding
 /// could never start again: it would wait forever for hardware it had itself
 /// made invisible.
+///
+/// A device that did *not* come back keeps its line in the record. Deleting it
+/// would leave a board stub-bound with nothing naming it, and there is no way
+/// back from that by hand or otherwise: resolving a serial resource needs the
+/// tty the device no longer has.
 pub async fn release_recorded(state: &Path) {
     let Ok(text) = tokio::fs::read_to_string(state).await else {
         return;
     };
+    let mut still_hidden = Vec::new();
     for busid in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         tracing::warn!(%busid, "releasing a device hidden by a previous run");
-        sysfs::unbind(busid).await;
+        if let Err(detail) = sysfs::unbind(busid).await {
+            tracing::error!(%busid, %detail, "this device is still hidden and has no tty");
+            still_hidden.push(busid.to_string());
+        }
     }
-    forget(state).await;
+    keep(state, &still_hidden).await;
 }
 
-async fn forget(state: &Path) {
-    if let Err(err) = tokio::fs::remove_file(state).await {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(
-                path = %state.display(), ?err,
-                "could not remove the record of hidden devices"
-            );
-        }
+/// Write down what is hidden, or remove the record when nothing is.
+async fn record(state: &Path, busids: &[String]) -> std::io::Result<()> {
+    if busids.is_empty() {
+        return match tokio::fs::remove_file(state).await {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+            _ => Ok(()),
+        };
+    }
+    if let Some(dir) = state.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    tokio::fs::write(state, busids.join("\n")).await
+}
+
+/// [`record`], for the paths that can only complain about failing.
+async fn keep(state: &Path, busids: &[String]) {
+    if let Err(err) = record(state, busids).await {
+        tracing::warn!(
+            path = %state.display(), ?err,
+            "could not update the record of hidden devices"
+        );
     }
 }
 
@@ -82,12 +111,14 @@ impl Hidden {
             .into_iter()
             .collect();
 
-        if let Some(dir) = state.parent() {
-            tokio::fs::create_dir_all(dir)
-                .await
-                .map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        // A bench with nothing to hide is not a hidden bench. Registration
+        // refuses one already; saying so here as well keeps the security
+        // boundary from ever reporting success over an empty list.
+        if busids.is_empty() {
+            return Err("this bench resolved no devices, so there is nothing to hide".into());
         }
-        tokio::fs::write(&state, busids.join("\n"))
+
+        record(&state, &busids)
             .await
             .map_err(|e| format!("recording hidden devices in {}: {e}", state.display()))?;
 
@@ -115,14 +146,69 @@ impl Hidden {
     }
 
     /// Give every device back to its normal driver.
+    ///
+    /// Reports success only when every device actually came back. The sysfs
+    /// writes can time out on a wedged usbip driver, and announcing a release
+    /// that did not happen — while deleting the record naming the boards it did
+    /// not happen to — is how a bench becomes unrecoverable: a stub-bound
+    /// device has no tty, and a serial resource cannot be resolved without one.
     pub async fn release(self) {
+        let mut still_hidden = Vec::new();
         for busid in &self.busids {
-            sysfs::unbind(busid).await;
+            if let Err(detail) = sysfs::unbind(busid).await {
+                tracing::error!(%busid, %detail, "could not give this device back");
+                still_hidden.push(busid.clone());
+            }
         }
-        forget(&self.state).await;
-        tracing::info!(
-            devices = self.busids.len(),
-            "bench released; its devices are back on their normal drivers"
+        keep(&self.state, &still_hidden).await;
+        if still_hidden.is_empty() {
+            tracing::info!(
+                devices = self.busids.len(),
+                "bench released; its devices are back on their normal drivers"
+            );
+        } else {
+            tracing::error!(
+                devices = still_hidden.len(),
+                busids = %still_hidden.join(" "),
+                path = %self.state.display(),
+                "these devices are still bound to the usbip stub and have no tty; they stay \
+                 recorded so the next start can try again"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{record, state_path};
+
+    /// The record is the only thing that names a hidden device, so a release
+    /// that did not happen must leave it behind. Deleting it while the boards
+    /// were still stub-bound made them unrecoverable: nothing named them, and
+    /// resolving a serial resource needs the tty they no longer had.
+    #[tokio::test]
+    async fn a_device_that_did_not_come_back_keeps_its_line_in_the_record() {
+        let dir = std::env::temp_dir().join(format!("benchd-hide-{}", std::process::id()));
+        let state = state_path(&dir, "esp32s3-a");
+
+        let hidden = ["1-2".to_string(), "3-1.1".to_string()];
+        record(&state, &hidden).await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(&state).await.unwrap(),
+            "1-2\n3-1.1"
         );
+
+        // One came back, one did not.
+        record(&state, &hidden[1..]).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(&state).await.unwrap(), "3-1.1");
+
+        // Everything is back: nothing left to remember, and forgetting twice is
+        // not a failure — `--release-all` runs on a bench that may have been
+        // released already.
+        record(&state, &[]).await.unwrap();
+        assert!(!state.exists());
+        record(&state, &[]).await.unwrap();
+
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
     }
 }
