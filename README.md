@@ -29,6 +29,8 @@ benches forwarded over USB/IP.
 | Host daemon (one per bench) | done |
 | Client daemon + bind-mount materialiser | done |
 | MCP shim (5 tools) | done |
+| `benchd lease`, the hand-held CLI | done, tested |
+| One binary, six subcommands | done |
 | Skill | done |
 | USB/IP remote benches | done — verified across a real network between two machines |
 | Multi-board benches | done, tested |
@@ -36,7 +38,7 @@ benches forwarded over USB/IP.
 | Wire messages (serde enums, JSON lines) | specified |
 
 **Read [`docs/design.md`](docs/design.md) first.** It is authoritative: when the code
-and the design doc disagree, the doc wins. It records 19 numbered decisions with the
+and the design doc disagree, the doc wins. It records 26 numbered decisions with the
 alternatives that were rejected and why.
 
 ## Design in one paragraph
@@ -47,8 +49,12 @@ The **coordinator** is the single authority for inventory, matching, limits and 
 state, and the only component that listens. The **client** is a privileged daemon on
 each agent machine that materialises device nodes into agent sandboxes, fronted by a
 thin per-agent MCP shim. Benches carry `key=value` capability tags from a closed
-vocabulary, expanded through an implication graph (`soc=esp32s3` implies
-`family=esp32`, `jtag=builtin`, …). A **claim** names one or more **slots**, satisfied
+vocabulary. What a board *is* expands through an implication graph (`soc=esp32s3`
+implies `family=esp32`, `arch=xtensa`, …); how it is *wired* (`console=`, `jtag=`) is
+declared per bench, because no chip identity can know which socket the cable is in.
+Values may name a specific part without the vocabulary enumerating parts:
+`peripheral=accel[mpu6050]` matches a request for either the category or the exact chip.
+A **claim** names one or more **slots**, satisfied
 atomically or not at all, possibly from benches on different hosts; among adequate
 benches the matcher picks the *least capable* one, scored by the scarcity it would
 waste. A granted claim is a **lease** with a mandatory explicit TTL, renewable only by
@@ -68,20 +74,28 @@ boundary belongs to the network, not the application.
 ## Layout
 
 ```
-docs/design.md                    the design, 19 decisions, and open questions
-dist/install.sh                   build, install binaries and systemd units
+docs/design.md                    the design, 26 decisions, and open questions
+dist/install.sh                   build, install the binary and systemd units
 skill/benchd/SKILL.md             the agent-facing skill
+crates/benchd/                    the one binary: a subcommand per component
 crates/benchd-core/               pure: tags, model, matcher, limits, lease, wire
   tests/matcher.rs                behavioural spec + property test vs a brute-force oracle
   tests/lease.rs                  lease lifecycle spec
   tests/failure_paths.rs          what happens when things go wrong
 crates/benchd-coordinator/        the only listener; matching, limits, lease state
+  src/operator.rs                 benches / leases / release
 crates/benchd-host/               one process per bench; owns the hardware
 crates/benchd-client/             privileged: materialises device nodes
+  src/lease.rs                    hold a bench by hand (unprivileged)
 crates/benchd-mcp/                per-agent stdio shim, five tools
 examples/coordinator.toml         limits + the central vocabulary
 examples/bench-*.toml             one file per bench, lives with the hardware
 ```
+
+Each component is a library crate; `crates/benchd` is a dispatcher over them and the
+only thing that ships. Six binaries meant six versions to keep in step across a lab's
+worth of machines, and that is what went wrong; one artefact cannot be half-upgraded
+(D26).
 
 `benchd-core` is pure: no I/O, no clock, no sockets. Time is a parameter and decisions
 come out as `Effect`s, so the whole lifecycle is testable without daemons or hardware.
@@ -89,17 +103,20 @@ come out as `Effect`s, so the whole lifecycle is testable without daemons or har
 ## Install
 
 ```sh
-dist/install.sh          # first time: binaries, config, systemd units
+dist/install.sh          # first time: the binary, config, systemd units
 dist/deploy.sh           # thereafter: rebuild, install, verify checksums
 sudo systemctl enable --now benchd-coordinator benchd-clientd
 sudo systemctl enable --now benchd-host@esp32s3-a      # one per bench
 ```
 
+The unit names are unchanged; each now runs `benchd coordinator`, `benchd client` or
+`benchd host`. A machine installs the same binary whichever of them it runs.
+
 To also use a shared lab server, give the client both — in preference order, so your own
 boards are tried first:
 
 ```sh
-benchd-clientd --coordinator local=127.0.0.1:4711 --coordinator lab=lab.example:4711
+benchd client --coordinator local=127.0.0.1:4711 --coordinator lab=lab.example:4711
 ```
 
 Run agents sandboxed, so a lease is enforced rather than advisory:
@@ -111,9 +128,25 @@ benchd-sandbox -- pi        # lab boards are absent from /dev until claimed
 Then point an agent at it:
 
 ```json
-{"mcpServers": {"benchd": {"command": "/usr/local/bin/benchd-mcp",
+{"mcpServers": {"benchd": {"command": "/usr/local/bin/benchd", "args": ["mcp"],
                            "env": {"BENCHD_IDENTITY": "agent-3"}}}}
 ```
+
+## Holding a bench by hand
+
+Bringing up a board, checking that a bench is wired the way its notes claim, or just
+using the hardware yourself. `benchd lease` claims by capability exactly as an agent
+does — it cannot name a bench either — and holds the lease for as long as it runs:
+
+```sh
+benchd lease sdmux=usb --ttl 30m        # hold it, print the paths, wait for Ctrl-C
+benchd lease soc=esp32s3 -- zsh         # a shell with $LAB_DUT_* already set
+benchd lease soc=esp32s3 --slot peer:soc=esp32c3
+```
+
+Quitting, being killed, or losing the terminal all hand the hardware straight back,
+because the socket connection *is* the session. The TTL is the backstop for when even
+that fails.
 
 ## Build
 

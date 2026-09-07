@@ -1,0 +1,26 @@
+# A device with two serial ports, which is what `interface` in the by_path is
+# for: the FT2232H on a WROVER-KIT is a JTAG probe on channel A and the console
+# on channel B, and there is nothing to tell them apart but the interface
+# number. by_id would name the chip, which is the same chip for both.
+
+id          = "esp32-wroverkit"
+description = "ESP32 WROVER-KIT: classic ESP32, on-board FT2232H JTAG probe"
+
+# No psram= or flash=: a WROVER module has PSRAM, but nobody has read the size
+# off this board, and a guessed tag is worse than a missing one (D10).
+tags = ["soc=esp32", "console=uart", "jtag=external", "peripheral=sdcard"]
+
+docs = """
+The single USB cable is an on-board FT2232H presenting two channels.
+
+- **Channel B** is the UART console, and is what `$LAB_DUT_CONSOLE` points at.
+  Being a bridge rather than the SoC's own USB, it survives a reset.
+- **Channel A** is the JTAG probe. It has no path of its own: OpenOCD reaches it
+  through libusb, which scans `/dev/bus/usb`, so it is simply there once the
+  lease is up. `openocd -f board/esp32-wrover-kit-3.3v.cfg`.
+"""
+
+# `:1.1` is interface 1, which is channel B.
+[resources.console]
+kind    = "serial"
+by_path = "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:1:1.1-port0"

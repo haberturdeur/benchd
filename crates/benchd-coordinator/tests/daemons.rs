@@ -4,11 +4,10 @@
 //! gap between unit-tested pure logic and hand-run happy-path checks. Nothing
 //! automated had ever sent a hostile message to a running coordinator.
 //!
-//! These spawn actual `benchd-coordinator` and `benchd-host` processes on a
-//! throwaway port with a temporary inventory, and speak the wire protocol
-//! directly — the same way an attacker would. They deliberately do *not* start
-//! `benchd-clientd`, because that needs root; the assertions here are about what
-//! the coordinator refuses to pass on.
+//! These spawn a real `benchd coordinator` on a throwaway port with a temporary
+//! inventory, and speak the wire protocol directly — the same way an attacker
+//! would. They deliberately do *not* start `benchd client`, because that needs
+//! root; the assertions here are about what the coordinator refuses to pass on.
 //!
 //! Ignored by default so `cargo test` stays hermetic and fast, and **serial**:
 //!
@@ -80,14 +79,15 @@ description = "ESP32-S3"
 [tags.psram.values.octal]
 "#;
 
-fn binary(name: &str) -> std::path::PathBuf {
-    // target/<profile>/deps/<test binary> -> target/<profile>/<name>
+/// The one binary everything now ships as.
+fn binary() -> std::path::PathBuf {
+    // target/<profile>/deps/<test binary> -> target/<profile>/benchd
     let mut dir = std::env::current_exe().expect("current_exe");
     dir.pop();
     if dir.ends_with("deps") {
         dir.pop();
     }
-    let path = dir.join(name);
+    let path = dir.join("benchd");
     assert!(
         path.exists(),
         "{} not built; run `cargo build` first",
@@ -102,34 +102,51 @@ impl Harness {
         let config = dir.path().join("coordinator.toml");
         std::fs::write(&config, CONFIG).expect("write config");
 
-        // A port derived from the pid, so concurrent runs do not collide.
-        let port = 24_000 + (std::process::id() % 2_000) as u16;
-        let coordinator = Command::new(binary("benchd-coordinator"))
+        // Port 0, and let the kernel choose. Every test in this file starts its
+        // own coordinator and they run in parallel, so a port derived from
+        // anything the process shares — the pid, a constant — has them fighting
+        // over one socket: the losers fail to bind and their tests then talk to
+        // a coordinator belonging to some other test, or to nothing at all.
+        // `--report-address` exists for this.
+        let address = dir.path().join("address");
+        let coordinator = Command::new(binary())
+            .arg("coordinator")
             .arg("--config")
             .arg(&config)
             .arg("--listen")
-            .arg(format!("127.0.0.1:{port}"))
+            .arg("127.0.0.1:0")
+            .arg("--report-address")
+            .arg(&address)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn coordinator");
 
-        // Wait for it to accept connections rather than sleeping blindly.
         let mut harness = Harness {
             coordinator,
-            port,
+            port: 0,
             _dir: dir,
         };
+
+        // Wait for it to accept connections rather than sleeping blindly. The
+        // file appears only once the listener is bound, and its contents are
+        // written before the first accept.
         for _ in 0..100 {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return harness;
+            if let Some(port) = std::fs::read_to_string(&address)
+                .ok()
+                .and_then(|text| text.trim().rsplit(':').next()?.parse::<u16>().ok())
+            {
+                if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    harness.port = port;
+                    return harness;
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         // Drop reaps the child, so the panic does not leak a coordinator.
         let _ = harness.coordinator.kill();
         let _ = harness.coordinator.wait();
-        panic!("coordinator never started listening on {port}");
+        panic!("coordinator never reported a listening address");
     }
 
     /// Send one line and read one line back.
@@ -253,7 +270,156 @@ fn a_failed_registration_does_not_destroy_the_bench_already_there() {
     );
 }
 
+#[test]
+#[ignore = "spawns daemons"]
+fn a_host_cannot_push_a_datasheet_into_every_agents_context() {
+    let h = Harness::start("bigdocs");
+    let docs = "x".repeat(9000);
+    let reply = h.exchange(&format!(
+        r#"{{"msg":"register","bench":{{"id":"verbose","description":"","docs":"{docs}","tags":["soc=esp32s3"],"resources":{{"console":{{"kind":"serial","path":"/dev/null"}}}}}}}}"#
+    ));
+    assert!(reply.contains("rejected"), "{reply}");
+    assert!(reply.contains("over the"), "{reply}");
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn two_resources_on_one_device_share_a_single_channel() {
+    // A USB-SD-Mux is switched through its SCSI node and written through its
+    // block node, but USB/IP forwards whole devices — so one busid must produce
+    // one export. Minting a channel per resource left the second with nobody to
+    // pair with in the relay, and the client waited out its timeout on an import
+    // the host was never asked to make.
+    let h = Harness::start("shared-busid");
+
+    let host = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
+    host.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    let mut hw = host.try_clone().expect("clone");
+    let mut hr = BufReader::new(host);
+    writeln!(
+        hw,
+        r#"{{"msg":"register","bench":{{"id":"muxed","description":"","tags":["soc=esp32s3"],"resources":{{"sdmux":{{"kind":"usb","busid":"3-1.1","node":"scsi"}},"sdcard":{{"kind":"usb","busid":"3-1.1","node":"block"}}}}}}}}"#
+    )
+    .expect("write");
+    hw.flush().expect("flush");
+    let mut reply = String::new();
+    hr.read_line(&mut reply).expect("read");
+    assert!(reply.contains("registered"), "{reply}");
+
+    let stream = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    let mut w = stream.try_clone().unwrap();
+    let mut r = BufReader::new(stream);
+
+    writeln!(
+        w,
+        r#"{{"msg":"open_session","request":1,"name":"agent-1"}}"#
+    )
+    .unwrap();
+    w.flush().unwrap();
+    let mut line = String::new();
+    r.read_line(&mut line).unwrap();
+    let token = line
+        .split("\"session\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("token")
+        .to_string();
+
+    line.clear();
+    writeln!(
+        w,
+        r#"{{"msg":"claim","request":2,"session":"{token}","claim":{{"slots":{{"dut":["soc=esp32s3"]}},"ttl":60}}}}"#
+    )
+    .unwrap();
+    w.flush().unwrap();
+    r.read_line(&mut line).unwrap();
+    assert!(line.contains("granted"), "{line}");
+
+    // The export the host is told to perform.
+    let mut export = String::new();
+    hr.read_line(&mut export).expect("export");
+    assert!(export.contains("\"msg\":\"export\""), "{export}");
+
+    let channels: Vec<&str> = ["sdmux", "sdcard"]
+        .iter()
+        .map(|name| {
+            export
+                .split(&format!("\"{name}\":\""))
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or_else(|| panic!("no channel for {name} in {export}"))
+        })
+        .collect();
+    assert_eq!(
+        channels[0], channels[1],
+        "both nodes of one device must ride one channel: {export}"
+    );
+}
+
 // --- the agent-facing surface ----------------------------------------------
+
+#[test]
+#[ignore = "spawns daemons"]
+fn a_grant_carries_the_benchs_wiring_notes() {
+    // The pinout is only knowable from the bench config, and only the holder of
+    // the lease is entitled to it, so grant time is the one place it can be
+    // delivered.
+    let h = Harness::start("docs");
+
+    let host = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
+    let mut hw = host.try_clone().expect("clone");
+    writeln!(
+        hw,
+        r#"{{"msg":"register","bench":{{"id":"documented","description":"","docs":"GPIO4 -> LED","tags":["soc=esp32s3"],"resources":{{"console":{{"kind":"serial","path":"/dev/null"}}}}}}}}"#
+    )
+    .expect("write");
+    hw.flush().expect("flush");
+    let mut reply = String::new();
+    BufReader::new(host.try_clone().unwrap())
+        .read_line(&mut reply)
+        .expect("read");
+    assert!(reply.contains("registered"), "{reply}");
+
+    let stream = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    let mut w = stream.try_clone().unwrap();
+    let mut r = BufReader::new(stream);
+
+    writeln!(
+        w,
+        r#"{{"msg":"open_session","request":1,"name":"agent-1"}}"#
+    )
+    .unwrap();
+    w.flush().unwrap();
+    let mut line = String::new();
+    r.read_line(&mut line).unwrap();
+    let token = line
+        .split("\"session\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("token")
+        .to_string();
+
+    line.clear();
+    writeln!(
+        w,
+        r#"{{"msg":"claim","request":2,"session":"{token}","claim":{{"slots":{{"dut":["soc=esp32s3"]}},"ttl":60}}}}"#
+    )
+    .unwrap();
+    w.flush().unwrap();
+    r.read_line(&mut line).unwrap();
+    assert!(line.contains("granted"), "{line}");
+    assert!(
+        line.contains("GPIO4 -> LED"),
+        "the grant must carry the bench's notes: {line}"
+    );
+}
 
 #[test]
 #[ignore = "spawns daemons"]

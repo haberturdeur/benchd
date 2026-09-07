@@ -17,10 +17,13 @@
 //! reintroduced through the back door. With the lease id in the path, a stale
 //! reference fails with `ENOENT`.
 //!
-//! Bind mounts rather than symlinks: the agent's sandbox has no `/dev`, so a
-//! symlink to `/dev/ttyACM0` would dangle. A bind mount puts the real inode at
-//! the destination, which is why the device behaves exactly as it would
-//! normally — it *is* the device.
+//! Bind mounts rather than symlinks. The original reason was that an agent ran
+//! in a sandbox with no `/dev`, where a symlink to `/dev/ttyACM0` would dangle.
+//! That no longer holds — hiding happens at the host now (D22), so no sandbox
+//! is required and the agent has an ordinary `/dev` — but a bind mount puts the
+//! real inode at the destination and behaves exactly as the device does,
+//! because it *is* the device. Symlinks would work today and would cost this
+//! daemon its `CAP_SYS_ADMIN`; that swap is worth making and has not been made.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,7 +32,7 @@ use crate::ids::LeaseKey;
 use benchd_core::lease::SessionId;
 use benchd_core::sysfs;
 use benchd_core::usbip;
-use benchd_core::wire::{ChannelHello, ChannelSide, Outcome, ResourceHandle};
+use benchd_core::wire::{ChannelHello, ChannelSide, Outcome, ResourceHandle, WantedNode};
 use futures::SinkExt;
 use tokio_util::codec::{FramedWrite, LinesCodec};
 
@@ -66,17 +69,19 @@ impl Materializer {
         }
     }
 
-    /// Import a remote device and return the device node it produced.
+    /// Import a remote device and return the vhci port it landed on, with the
+    /// USB speed needed to find that port again in sysfs.
     ///
-    /// Dial out, complete the import handshake over the relayed connection, hand
-    /// the socket to vhci, then wait for the kernel to enumerate — `attach`
-    /// returns before the tty exists.
+    /// Dial out, complete the import handshake over the relayed connection, then
+    /// hand the socket to vhci. No device node exists yet when this returns: the
+    /// kernel enumerates asynchronously, and one device may produce several
+    /// nodes, so resolving them is the caller's job.
     async fn import(
         &self,
         coordinator: crate::ids::CoordinatorId,
         channel: &benchd_core::wire::ChannelKey,
         busid: &str,
-    ) -> Result<(u32, PathBuf), String> {
+    ) -> Result<(u32, u32), String> {
         // The data channel goes to the coordinator that granted this lease, not
         // to whichever one happens to be first: the rendezvous key only exists
         // in that coordinator's relay.
@@ -127,20 +132,7 @@ impl Materializer {
             devid = device.devid(),
             "attached; waiting for enumeration"
         );
-
-        // Located by vhci port rather than by diffing /dev/serial/by-id: a
-        // forwarded device reproduces the *same* by-id name as the one that
-        // just vanished locally, so a diff would see nothing at all.
-        match sysfs::wait_for_vhci_tty(port, device.speed, std::time::Duration::from_secs(10)).await
-        {
-            Some(path) => Ok((port, path)),
-            None => {
-                sysfs::vhci_detach(port).await;
-                Err(format!(
-                    "{busid} was imported on port {port} but no serial device appeared;                      is the right usb-serial driver available on this machine?"
-                ))
-            }
-        }
+        Ok((port, device.speed))
     }
 
     fn lease_dir(&self, owner: &str, lease: LeaseKey) -> PathBuf {
@@ -251,6 +243,12 @@ impl Materializer {
         // of its devices and reasonably assume it had them all.
         let mut plan: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut ports: Vec<u32> = Vec::new();
+        // USB/IP forwards whole devices, so resources that share a channel share
+        // one import: a USB-SD-Mux arrives once and yields both the SCSI node
+        // that switches the card and the block node that holds it. Importing per
+        // resource instead would leave the second attempt waiting for a device
+        // the host has already handed over.
+        let mut imported: BTreeMap<&benchd_core::wire::ChannelKey, (u32, u32)> = BTreeMap::new();
         for (slot, resources) in slots {
             for (name, handle) in resources {
                 // This process is root and about to call mount(2) on a path
@@ -270,61 +268,50 @@ impl Materializer {
                         ),
                     };
                 }
-                match handle {
-                    ResourceHandle::Local { path } => {
-                        let source = match tokio::fs::canonicalize(path).await {
-                            Ok(p) => p,
-                            Err(err) => {
-                                return Outcome::Failed {
-                                    detail: format!("{slot}/{name}: {path} is not present ({err})"),
-                                };
+                let ResourceHandle::UsbIp {
+                    channel,
+                    busid,
+                    node,
+                } = handle;
+                let (port, speed) = match imported.get(channel) {
+                    Some(&already) => already,
+                    None => match self.import(lease.coordinator, channel, busid).await {
+                        Ok(fresh) => {
+                            ports.push(fresh.0);
+                            imported.insert(channel, fresh);
+                            fresh
+                        }
+                        Err(detail) => {
+                            for port in &ports {
+                                sysfs::vhci_detach(*port).await;
                             }
-                        };
-                        // Checked again after canonicalising, and against the
-                        // resolved path rather than the declared one: a symlink
-                        // under /dev could otherwise point anywhere. The
-                        // coordinator validates too, but this process is root
-                        // and must not trust it.
-                        if let Err(why) = benchd_core::model::valid_device_path(&source) {
                             return Outcome::Failed {
-                                detail: format!("{slot}/{name}: refusing to mount: {why}"),
+                                detail: format!("{slot}/{name}: {detail}"),
                             };
                         }
-                        match tokio::fs::metadata(&source).await {
-                            Ok(meta) => {
-                                use std::os::unix::fs::FileTypeExt;
-                                if !meta.file_type().is_char_device() {
-                                    return Outcome::Failed {
-                                        detail: format!(
-                                            "{slot}/{name}: {} is not a character device",
-                                            source.display()
-                                        ),
-                                    };
-                                }
-                            }
-                            Err(err) => {
-                                return Outcome::Failed {
-                                    detail: format!("{slot}/{name}: {err}"),
-                                };
-                            }
+                    },
+                };
+
+                // Located by vhci port rather than by name: a forwarded device
+                // reproduces the by-id name of the one that just vanished from
+                // the host, and this machine has storage device names of its own
+                // that an imported card would collide with.
+                match sysfs::wait_for_vhci_node(
+                    port,
+                    speed,
+                    *node,
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+                {
+                    Some(source) => plan.push((source, dir.join(slot).join(name))),
+                    None => {
+                        for port in &ports {
+                            sysfs::vhci_detach(*port).await;
                         }
-                        plan.push((source, dir.join(slot).join(name)));
-                    }
-                    ResourceHandle::UsbIp { channel, busid } => {
-                        match self.import(lease.coordinator, channel, busid).await {
-                            Ok((port, source)) => {
-                                ports.push(port);
-                                plan.push((source, dir.join(slot).join(name)));
-                            }
-                            Err(detail) => {
-                                for port in &ports {
-                                    sysfs::vhci_detach(*port).await;
-                                }
-                                return Outcome::Failed {
-                                    detail: format!("{slot}/{name}: {detail}"),
-                                };
-                            }
-                        }
+                        return Outcome::Failed {
+                            detail: format!("{slot}/{name}: {}", missing_node(port, *node)),
+                        };
                     }
                 }
             }
@@ -408,6 +395,34 @@ impl Materializer {
         tracing::info!(%lease, %owner, "unmaterialized");
         Outcome::Ok
     }
+}
+
+/// Why a node did not appear, phrased for whoever has to fix it.
+///
+/// The import succeeded, so the fault is on this machine: a driver the kernel
+/// does not have, or a bench that names an interface the device does not offer.
+fn missing_node(port: u32, want: WantedNode) -> String {
+    let (what, hint) = match want {
+        WantedNode::Tty {
+            interface: Some(interface),
+        } => (
+            format!("no serial device on USB interface {interface}"),
+            "the device may not have that interface, or usb-serial support for it is missing",
+        ),
+        WantedNode::Tty { interface: None } => (
+            "no serial device".to_string(),
+            "is the right usb-serial driver available on this machine?",
+        ),
+        WantedNode::Block => (
+            "no block device".to_string(),
+            "usb-storage support is needed to see the storage behind a device",
+        ),
+        WantedNode::Scsi => (
+            "no SCSI generic device".to_string(),
+            "sg support is needed; without it the device cannot be sent control commands",
+        ),
+    };
+    format!("imported on vhci port {port} but {what} appeared: {hint}")
 }
 
 async fn bind_mount(root: &Path, source: &Path, dest: &Path) -> Result<(), String> {

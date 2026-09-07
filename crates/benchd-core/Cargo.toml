@@ -25,6 +25,7 @@ usbip = ["dep:tokio", "dep:tracing", "tokio/fs", "tokio/net", "tokio/io-util", "
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
 
 [lints.rust]

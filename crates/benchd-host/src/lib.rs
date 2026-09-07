@@ -7,25 +7,34 @@
 //! This process **decides nothing**. It dials the coordinator, declares its
 //! bench, and executes epoch-qualified instructions. All policy, matching and
 //! lease state live at the other end (D6).
+//!
+//! It does own one thing outright: its bench's devices are hidden — bound to
+//! the USB/IP stub, with no tty — from startup to shutdown, so that hardware
+//! this host is responsible for cannot be reached on this machine except
+//! through a lease. See [`hide`].
 
 mod export;
+mod hide;
 
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use benchd_core::model::Resource;
+use benchd_core::model::{Resource, UsbNode};
 use benchd_core::wire::{BenchSpec, HostMsg, Outcome, RequestId, ToHost, DEFAULT_PORT};
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 use crate::export::Exports;
+use crate::hide::Hidden;
 
 #[derive(Parser)]
-#[command(name = "benchd-host", about = "benchd host daemon (one per bench)")]
-struct Args {
+pub struct HostArgs {
     /// This bench's definition. Lives next to the hardware it describes (D9),
     /// so adding a board is a single-machine operation.
     #[arg(long)]
@@ -42,6 +51,18 @@ struct Args {
     /// How often to check that this bench's hardware is still attached.
     #[arg(long, default_value_t = 5)]
     device_poll_seconds: u64,
+
+    /// Where to record which devices this bench has hidden, so a host that is
+    /// killed can still give them back on the next start.
+    #[arg(long, default_value = "/run/benchd-host")]
+    state_dir: String,
+
+    /// Give back every device this bench hid, then exit.
+    ///
+    /// For `ExecStopPost=`, which systemd runs even when the main process was
+    /// killed outright and never reached its own shutdown path.
+    #[arg(long)]
+    release_all: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +71,12 @@ struct BenchConfig {
     id: String,
     #[serde(default)]
     description: String,
+    /// Markdown given to whoever holds this bench: pinout, jumpers, what is
+    /// wired to what. It lives here rather than centrally for the same reason
+    /// the tags do (D9) — this file is next to the hardware it describes, so a
+    /// rewiring and its documentation are one edit.
+    #[serde(default)]
+    docs: String,
     tags: Vec<String>,
     resources: BTreeMap<String, RawResource>,
 }
@@ -70,24 +97,11 @@ struct RawResource {
 }
 
 /// The USB serial number of the device behind a `/dev/tty*` node.
-///
-/// Walks up from the tty until it finds the USB device that carries `serial`.
-/// The depth is not fixed: a CDC-ACM tty hangs directly off the interface,
-/// while a USB-serial bridge adds a `usb-serial` port node in between, so
-/// assuming a single parent works for ESP32s and silently fails for CP2102s.
 fn usb_serial_of(tty: &std::path::Path) -> Option<String> {
-    let name = tty.file_name()?.to_str()?;
-    let mut dir = std::fs::canonicalize(format!("/sys/class/tty/{name}/device")).ok()?;
-    for _ in 0..6 {
-        if let Ok(serial) = std::fs::read_to_string(dir.join("serial")) {
-            let serial = serial.trim();
-            if !serial.is_empty() {
-                return Some(serial.to_string());
-            }
-        }
-        dir = dir.parent()?.to_path_buf();
-    }
-    None
+    let dir = benchd_core::sysfs::usb_device_of_tty(tty)?;
+    let serial = std::fs::read_to_string(dir.join("serial")).ok()?;
+    let serial = serial.trim();
+    (!serial.is_empty()).then(|| serial.to_string())
 }
 
 fn serial() -> String {
@@ -109,6 +123,11 @@ impl BenchConfig {
             .context("invalid tag in bench config")?;
 
         let mut resources = BTreeMap::new();
+        // Which USB device each serial resource resolved to. The coordinator
+        // groups resources onto USB/IP channels and cannot see this, so it
+        // assumes one device per serial resource; two that share one would get
+        // two channels for a single import and the second would never pair.
+        let mut serial_devices: BTreeMap<String, String> = BTreeMap::new();
         for (name, raw) in &self.resources {
             let resource = match raw.kind.as_str() {
                 "serial" => {
@@ -126,6 +145,36 @@ impl BenchConfig {
                              (board unplugged, or a stale path?)"
                         )
                     })?;
+
+                    // A device forwarded back to the machine it lives on
+                    // reproduces the by-id name of the board it came from, so a
+                    // by-id resource can resolve to this bench's own imported
+                    // copy while a lease is being torn down. Registering that
+                    // would hide a phantom and leave the real board on its
+                    // driver, visible to everything on this machine.
+                    if let Some(dir) = benchd_core::sysfs::usb_device_of_tty(&resolved) {
+                        if benchd_core::sysfs::is_forwarded(&dir) {
+                            anyhow::bail!(
+                                "resource {name:?}: {declared} currently resolves to a device \
+                                 forwarded in over USB/IP, not to hardware on this machine. \
+                                 This is normally a lease on this bench being torn down and \
+                                 clears on its own; declaring the resource by_path avoids it \
+                                 entirely."
+                            );
+                        }
+                        if let Some(busid) = dir.file_name().and_then(|s| s.to_str()) {
+                            if let Some(other) =
+                                serial_devices.insert(busid.to_string(), name.clone())
+                            {
+                                anyhow::bail!(
+                                    "resources {other:?} and {name:?} are both serial ports on \
+                                     USB device {busid}, which is not supported yet: a device is \
+                                     forwarded once, and the coordinator would allocate a \
+                                     separate channel to each"
+                                );
+                            }
+                        }
+                    }
 
                     // Read the chip's own serial, and check it against the one
                     // declared for this position if there is one. by-path is
@@ -149,62 +198,113 @@ impl BenchConfig {
                             ),
                         }
                     }
+                    // Recorded now, while the tty still exists. After the
+                    // device is hidden there is nothing left to ask.
+                    let interface = benchd_core::sysfs::usb_interface_of_tty(&resolved);
                     tracing::info!(
                         %name, path = %resolved.display(),
                         serial = observed.as_deref().unwrap_or("unknown"),
+                        interface,
                         "resource present"
                     );
                     Resource::Serial {
                         path,
                         serial: observed,
+                        interface,
                     }
                 }
-                "usb" => {
+                kind @ ("block" | "scsi") => {
                     let busid = raw
                         .busid
                         .as_ref()
                         .with_context(|| format!("resource {name:?} needs busid"))?;
+                    // A busid is written by hand, so a typo is likely and would
+                    // otherwise surface as a bench that claims fine and then
+                    // fails to materialise.
+                    let dir = std::path::PathBuf::from("/sys/bus/usb/devices").join(busid);
+                    if !dir.exists() {
+                        anyhow::bail!(
+                            "resource {name:?}: no USB device {busid} on this machine \
+                             (unplugged, or a stale busid?)"
+                        );
+                    }
+                    if benchd_core::sysfs::is_forwarded(&std::fs::canonicalize(&dir).unwrap_or(dir))
+                    {
+                        anyhow::bail!(
+                            "resource {name:?}: {busid} is a device forwarded in over USB/IP, \
+                             not hardware on this machine"
+                        );
+                    }
+                    tracing::info!(%name, %busid, kind, "resource present");
                     Resource::Usb {
                         busid: busid.clone(),
+                        node: if kind == "block" {
+                            UsbNode::Block
+                        } else {
+                            UsbNode::Scsi
+                        },
                     }
                 }
+                "usb" => anyhow::bail!(
+                    "resource {name:?}: kind 'usb' no longer says enough — use 'block' for \
+                     the storage node or 'scsi' for the control node"
+                ),
                 other => anyhow::bail!("resource {name:?} has unknown kind {other:?}"),
             };
             resources.insert(name.clone(), resource);
         }
 
+        if self.docs.len() > benchd_core::model::MAX_BENCH_DOCS {
+            anyhow::bail!(
+                "docs are {} bytes, over the {} byte limit",
+                self.docs.len(),
+                benchd_core::model::MAX_BENCH_DOCS
+            );
+        }
+
         Ok(BenchSpec {
             id: self.id.clone(),
             description: self.description.clone(),
+            docs: self.docs.clone(),
             tags,
             resources,
         })
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "benchd_host=info".into()),
-        )
-        .init();
-
-    let args = Args::parse();
+pub async fn run(args: HostArgs) -> Result<()> {
     let text = std::fs::read_to_string(&args.config)
         .with_context(|| format!("failed to read {}", args.config))?;
     let config: BenchConfig =
         toml::from_str(&text).with_context(|| format!("failed to parse {}", args.config))?;
 
-    // Before resolving hardware, release anything a previous incarnation left
-    // bound to the USB/IP stub. Resolution goes through the tty, and a
-    // stub-bound device has none — so without this a host killed mid-export can
-    // never start again, and the board stays dead through every restart.
+    // The bench id becomes a filename under the state directory.
+    if !benchd_core::model::valid_component(&config.id) {
+        anyhow::bail!(
+            "bench id {:?} is not usable as a plain name (letters, digits, dash, \
+             underscore, dot)",
+            config.id
+        );
+    }
+    let state = hide::state_path(Path::new(&args.state_dir), &config.id);
+
+    // Release first, always. Whether this is a normal start or the cleanup pass
+    // after a host was killed, anything still hidden from a previous run has to
+    // go back to its driver before this one can resolve the bench through it.
+    hide::release_recorded(&state).await;
+    if args.release_all {
+        return Ok(());
+    }
+
+    // A second, best-effort sweep for devices left stubbed by a version that
+    // predates the record above. It can only find benches declared `by_id`,
+    // because it matches on the USB serial that such a name embeds; `by_path`
+    // benches are covered by the record instead.
     {
         let probe = BenchSpec {
             id: config.id.clone(),
             description: String::new(),
+            docs: String::new(),
             tags: Vec::new(),
             resources: config
                 .resources
@@ -216,6 +316,7 @@ async fn main() -> Result<()> {
                             Resource::Serial {
                                 path: std::path::PathBuf::from(p),
                                 serial: None,
+                                interface: None,
                             },
                         )
                     })
@@ -225,28 +326,125 @@ async fn main() -> Result<()> {
         crate::export::recover_orphans(&probe).await;
     }
 
+    // Held outside the work so that shutdown can give the devices back whether
+    // we get there by a signal or by falling out of the loop.
+    let hidden: Arc<Mutex<Option<Hidden>>> = Arc::new(Mutex::new(None));
+
+    let result = tokio::select! {
+        _ = shutdown_signal() => {
+            tracing::info!("shutting down");
+            Ok(())
+        }
+        result = serve_bench(&args, &config, &state, Arc::clone(&hidden)) => result,
+    };
+
+    if let Some(hidden) = hidden.lock().await.take() {
+        hidden.release().await;
+    }
+    result
+}
+
+/// SIGTERM or SIGINT.
+///
+/// Hidden devices are kernel state that outlives this process, so exiting
+/// without giving them back leaves a bench with no tty and nothing running that
+/// remembers why — the same class of problem as an export that outlives its
+/// host (D6). systemd sends SIGTERM, so this is the ordinary shutdown path
+/// rather than an edge case.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let terminate = async {
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            Err(err) => {
+                tracing::warn!(?err, "cannot listen for SIGTERM; relying on ExecStopPost");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    tokio::select! {
+        _ = terminate => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+/// Resolve the bench, hide it, and serve until the hardware goes away.
+///
+/// Two nested loops, and the difference between them matters: losing the
+/// coordinator must **not** unhide the bench, because no lease can exist while
+/// it is gone and briefly exposing every board to the machine would undo the
+/// point of hiding. Only the hardware itself disappearing sends us back out to
+/// resolve again.
+async fn serve_bench(
+    args: &HostArgs,
+    config: &BenchConfig,
+    state: &Path,
+    hidden: Arc<Mutex<Option<Hidden>>>,
+) -> Result<()> {
     loop {
-        // Resolved fresh each time round, so a board that was unplugged and
-        // plugged back in is picked up without anyone restarting anything.
-        let spec = wait_for_hardware(&config, args.device_poll_seconds).await;
+        // Resolved while the ttys still exist, which is the only window there
+        // is: hiding removes them, and the busids cannot be recovered from a
+        // device that has no tty to walk up from.
+        let spec = wait_for_hardware(config, args.device_poll_seconds).await;
         tracing::info!(bench = %spec.id, resources = spec.resources.len(), "bench");
+        let busids = crate::export::busids_for(&spec);
+
+        match Hidden::hide(state.to_path_buf(), &busids).await {
+            Ok(new) => *hidden.lock().await = Some(new),
+            Err(detail) => {
+                // Not fatal: a board being re-enumerated is a normal transient,
+                // and refusing to start would need a human to come back later.
+                tracing::error!(%detail, "could not hide this bench; retrying");
+                tokio::time::sleep(Duration::from_secs(args.device_poll_seconds.max(1))).await;
+                continue;
+            }
+        }
 
         // Nothing this process exported can outlive it: the kernel holds its own
         // reference to a handed-over socket, so teardown is mandatory rather
         // than optional. Clear anything a previous incarnation left behind
         // before we accept work (D6).
-        let mut exports = Exports::new(spec.clone(), args.coordinator.clone());
+        let mut exports = Exports::new(spec.clone(), args.coordinator.clone(), busids.clone());
         exports.clear_stale().await;
 
-        match run(&args, &spec, &mut exports).await {
-            Ok(()) => tracing::warn!("coordinator closed the connection"),
-            Err(err) => tracing::warn!(?err, "connection failed"),
-        }
-        // The coordinator holds all lease state, so anything we were exporting
-        // is void the moment we lose it (D6).
+        let ended = loop {
+            match session(args, &spec, &busids, &mut exports).await {
+                Ok(end @ (SessionEnd::HardwareGone | SessionEnd::Refused)) => break end,
+                Ok(SessionEnd::Disconnected) => {
+                    tracing::warn!("coordinator closed the connection")
+                }
+                Err(err) => tracing::warn!(?err, "connection failed"),
+            }
+            // The coordinator holds all lease state, so anything we were
+            // exporting is void the moment we lose it (D6). The bench stays
+            // hidden throughout: no lease can exist while the coordinator is
+            // gone, and briefly exposing every board would undo the point.
+            exports.release_all().await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            tracing::info!("reconnecting");
+        };
+
         exports.release_all().await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        tracing::info!("reconnecting");
+        // Unhidden on both paths out. If the board is gone its `match_busid`
+        // entry is not, and that entry would make the stub claim the device the
+        // instant it was plugged back in, leaving it with no tty and nothing
+        // able to resolve it. If the bench was refused, holding its hardware
+        // helps nobody and conceals the cause.
+        if let Some(hidden) = hidden.lock().await.take() {
+            hidden.release().await;
+        }
+        match ended {
+            SessionEnd::Refused => {
+                tracing::error!(
+                    "this bench is registered nowhere and its devices have been given \
+                     back; fix its config or the coordinator's vocabulary"
+                );
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            _ => tracing::warn!("waiting for this bench's hardware to come back"),
+        }
     }
 }
 
@@ -283,11 +481,16 @@ async fn wait_for_hardware(config: &BenchConfig, poll_seconds: u64) -> BenchSpec
 /// Watch this bench's resources and report the first one that disappears.
 ///
 /// Without this, `HostMsg::DeviceLost` was a message nothing ever sent: an
-/// unplugged co-located board left the bench registered and matchable forever,
-/// because the host kept heartbeating and never touches the device on a
-/// co-located export. Every claim then picked the dead bench and failed on the
+/// unplugged board left the bench registered and matchable forever, because the
+/// host kept heartbeating and, on a same-machine export, never touched the
+/// device at all. Every claim then picked the dead bench and failed on the
 /// client, and the capability was unusable until someone restarted the host by
 /// hand — even with another matching bench free.
+///
+/// It is also the only thing that unhides a bench. A `match_busid` entry
+/// outlives the device it names, so a board that is unplugged while hidden
+/// would be claimed by the stub the instant it came back, arriving with no tty
+/// and nothing able to resolve it.
 async fn watch_hardware(
     spec: BenchSpec,
     busids: BTreeMap<String, String>,
@@ -315,7 +518,7 @@ async fn watch_hardware(
                     // is exported.
                     None => tokio::fs::metadata(path).await.is_err(),
                 },
-                Resource::Usb { busid } => {
+                Resource::Usb { busid, .. } => {
                     tokio::fs::metadata(format!("/sys/bus/usb/devices/{busid}"))
                         .await
                         .is_err()
@@ -331,7 +534,26 @@ async fn watch_hardware(
     }
 }
 
-async fn run(args: &Args, spec: &BenchSpec, exports: &mut Exports) -> Result<()> {
+/// Why a coordinator session ended, which decides whether the bench stays
+/// hidden.
+enum SessionEnd {
+    /// The connection went away. Reconnect; the hardware is still ours.
+    Disconnected,
+    /// The board itself is no longer attached. Give up what we hid and start
+    /// over from resolution.
+    HardwareGone,
+    /// The coordinator refused this bench. Nobody can lease it, so keeping its
+    /// devices hidden serves no one and hides the cause as well as the boards.
+    Refused,
+}
+
+/// One connection to the coordinator, from `Register` until it ends.
+async fn session(
+    args: &HostArgs,
+    spec: &BenchSpec,
+    busids: &BTreeMap<String, String>,
+    exports: &mut Exports,
+) -> Result<SessionEnd> {
     let socket = tokio::net::TcpStream::connect(&args.coordinator)
         .await
         .with_context(|| format!("failed to dial {}", args.coordinator))?;
@@ -364,11 +586,9 @@ async fn run(args: &Args, spec: &BenchSpec, exports: &mut Exports) -> Result<()>
         })
     };
 
-    // Resolved while the ttys still exist, i.e. before anything is exported.
-    let busids = crate::export::busids_for(spec);
     let mut watcher = Box::pin(watch_hardware(
         spec.clone(),
-        busids,
+        busids.clone(),
         args.device_poll_seconds,
     ));
 
@@ -384,14 +604,14 @@ async fn run(args: &Args, spec: &BenchSpec, exports: &mut Exports) -> Result<()>
                 if let Ok(line) = serde_json::to_string(&msg) {
                     let _ = sink.send(line).await;
                 }
-                break Err(anyhow::anyhow!("hardware disappeared"));
+                break Ok(SessionEnd::HardwareGone);
             }
             outbound = rx.recv() => {
-                let Some(line) = outbound else { break Ok(()) };
+                let Some(line) = outbound else { break Ok(SessionEnd::Disconnected) };
                 sink.send(line).await?;
             }
             inbound = lines.next() => {
-                let Some(line) = inbound else { break Ok(()) };
+                let Some(line) = inbound else { break Ok(SessionEnd::Disconnected) };
                 let line = line?;
                 let msg: ToHost = match serde_json::from_str(&line) {
                     Ok(msg) => msg,
@@ -403,10 +623,14 @@ async fn run(args: &Args, spec: &BenchSpec, exports: &mut Exports) -> Result<()>
                 match msg {
                     ToHost::Registered => tracing::info!("registered"),
                     ToHost::Rejected { reason } => {
-                        // Terminal: retrying will not help, and a bench that
-                        // matches nothing is worse than no bench at all.
+                        // Retrying will not help until the config changes, and
+                        // a bench that matches nothing is worse than no bench
+                        // at all. The caller unhides on the way out: a bench
+                        // nobody can lease must not also be a bench nobody can
+                        // use by hand, or a typo'd tag silently removes the
+                        // hardware from the machine.
                         tracing::error!(%reason, "registration refused");
-                        break Err(anyhow::anyhow!("registration refused: {reason}"));
+                        break Ok(SessionEnd::Refused);
                     }
                     ToHost::Export { request, lease, epoch, session, channels } => {
                         let result = exports.export(lease, epoch, session, channels).await;

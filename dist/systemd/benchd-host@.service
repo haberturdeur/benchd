@@ -5,12 +5,20 @@ After=network.target
 # each can be restarted independently.
 
 [Service]
-ExecStart=/usr/local/bin/benchd-host --config /etc/benchd/benches/%i.toml --coordinator ${BENCHD_COORDINATOR}
+ExecStart=/usr/local/bin/benchd host --config /etc/benchd/benches/%i.toml --coordinator ${BENCHD_COORDINATOR}
+# Runs even when the main process was killed outright and never reached its own
+# shutdown path. A hidden device is bound to the usbip stub and has no tty, and
+# that binding is kernel state which outlives whatever created it -- so without
+# this, a SIGKILLed host leaves its boards invisible until something starts
+# again to release them.
+ExecStopPost=/usr/local/bin/benchd host --config /etc/benchd/benches/%i.toml --release-all
 Environment=BENCHD_COORDINATOR=127.0.0.1:4711
 Restart=always
 RestartSec=3
-# Needs root only for usbip sysfs writes on remote benches; a serial-only,
-# co-located bench can drop to a user in the dialout/plugdev group.
+# Root throughout. The host binds every one of its bench's devices to the usbip
+# stub for its whole lifetime, so that an unleased board has no tty for anyone
+# on this machine to open, and those are privileged sysfs writes. There is no
+# longer an unprivileged serial-only configuration.
 User=root
 
 [Install]

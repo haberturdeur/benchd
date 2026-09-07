@@ -74,12 +74,12 @@ If separating them would be *physically meaningless*, it's one bench.
       │ MCP over stdio
       ▼
  ┌──────────────────────────┐        ┌───────────────────────────────┐
- │ benchd-mcp   (per agent) │        │ COORDINATOR   (only listener) │
+ │ benchd mcp   (per agent) │        │ COORDINATOR   (only listener) │
  │  · thin, unprivileged    │        │  · inventory + matcher        │
  └──────────┬───────────────┘        │  · limits + lease state       │
             │ local socket           │  · reaper                     │
  ┌──────────▼───────────────┐  JSON  │                               │
- │ benchd-clientd (machine) │───────▶│                               │
+ │ benchd client (machine)  │───────▶│                               │
  │  · sandbox materialiser  │  lines │                               │
  │  · runs as root          │  / TCP │                               │
  └──────────┬───────────────┘        └───────────────▲───────────────┘
@@ -100,11 +100,13 @@ host works with no inbound reachability at all.
 
 **One host process per bench.** Blast radius of a wedged host is one bench; each
 restarts independently; device ownership is unambiguous. Deployed as
-`benchd-host@mesh-rig.service`, so N benches is a config concern.
+`benchd-host@mesh-rig.service`, so N benches is a config concern. Every box in the
+diagram is the same executable under a different subcommand (D26).
 
-**Same-machine is not a special case.** Co-located, the client and host are just two
-processes on one box and the materialiser bind-mounts a local inode. The protocol is
-identical — which is the point of doing this now rather than retrofitting it (D4).
+**Same-machine is not a special case** — and now not even a separate code path. On one
+box the client and host are just two processes, and the device still travels between
+them over USB/IP, because a host hides its devices for its whole lifetime (D22) and so
+has no local inode to offer. There is nothing to detect and nothing to choose (D4).
 
 ---
 
@@ -129,11 +131,15 @@ decides a lock is "probably stale", corrupts someone else's run silently.
 Bind-mount the real device inode to
 `/run/benchd/<owner>/<lease-id>/<slot>/<resource>`, exposed as `$LAB_DUT_CONSOLE`.
 
-*Why bind mounts:* Goal 2 rules out everything else. `rfc2217://` and `socket://` are
+*Why real nodes:* Goal 2 rules out everything else. `rfc2217://` and `socket://` are
 pyserial-only — `idf.py monitor`, `minicom` and `openocd` refuse them. A pty bridge
-loses modem-control lines, breaking ESP32 auto-reset intermittently. Symlinks dangle in
-a sandbox with no `/dev`. A bind mount behaves exactly like the device because it *is*
-the device.
+loses modem-control lines, breaking ESP32 auto-reset intermittently.
+
+*Why bind mounts specifically:* originally because a symlink would dangle inside a
+sandbox that had no `/dev`. Hiding at the host (D22) removed the sandbox and with it
+that constraint, so a symlink would serve today and would let the client daemon drop
+`CAP_SYS_ADMIN`. The bind mount remains for now; it behaves exactly like the device
+because it *is* the device.
 
 *Why the lease id is in the path:* if `/dev/lab/dut` meant board A last lease and board
 B this lease, a stale shell writes to the wrong board — the original failure,
@@ -167,8 +173,11 @@ protocol.
 executors that can act on stale instructions, needing fencing (D7) and a failure story
 (D6). Retrofitting that rewrites the lease manager rather than swapping a trait.
 
-*What stays a trait:* the materialiser, because the delivery mechanism genuinely varies
-— bind mount when co-located, USB/IP when not.
+*Not a trait any more:* the materialiser used to bind-mount a local inode when the host
+and client shared a machine, and forward over USB/IP when they did not. Hiding (D22)
+removes the choice — a hidden device has no tty, so there is no local inode to hand over
+even on one box — and USB/IP is now the only delivery mechanism. One code path, no
+topology detection, and the same bytes on the wire wherever the client happens to be.
 
 ### D5. Only the coordinator listens; newline-delimited JSON over plain TCP
 
@@ -264,9 +273,13 @@ was not already gone.
 reachable. It would cut the coordinator out of the data path, but it is a second code
 path for a topology we cannot rely on. Revisit if the relay measures badly.
 
-*Not used locally.* Co-located benches never touch USB/IP: the daemon bind-mounts the
-real inode. The control protocol is identical either way; only the `Materializer`
-implementation differs, which is what the trait is for (D4).
+*Used locally too.* A co-located bench takes exactly this path, relay and all. Its
+devices are hidden like any other (D22), so there is no local inode to bind-mount
+instead. The cost is the coordinator sitting in the data path for a board that is
+physically in the same machine; the benefit is one code path rather than two, and no
+inference about which machine anything is on. A direct host-to-client dial for the
+loopback case stays available as a later optimisation, and would be a transport variant
+of the same handle rather than a return to bind-mounting.
 
 ### D6. The coordinator is a SPOF; any restart releases leases
 
@@ -330,9 +343,11 @@ neither path may fail.
 
 ### D8. A privileged daemon per machine, a thin MCP shim per agent
 
-`benchd-clientd` is one root daemon per agent machine, holding the coordinator
-connection and doing all materialisation. `benchd-mcp` is a tiny unprivileged MCP
+`benchd client` is one root daemon per agent machine, holding the coordinator
+connection and doing all materialisation. `benchd mcp` is a tiny unprivileged MCP
 server, spawned per agent by its harness, talking to the daemon over a local socket.
+They are two subcommands of one binary (D26) and two processes at two privilege
+levels, which is the part that matters.
 
 *Why the daemon is privileged:* the device node must appear on the agent's machine
 (Goal 2). Bind-mounting needs `CAP_SYS_ADMIN`; `usbip attach` needs root. The agent
@@ -375,7 +390,7 @@ costs one config line and makes the drift loud, which is enough.
 
 ### D19. Identity is a session token; the name is only a label
 
-At startup `benchd-mcp` registers with the coordinator, declaring a name from
+At startup `benchd mcp` registers with the coordinator, declaring a name from
 `$BENCHD_IDENTITY` in its sandbox, and receives a **session token** (UUID) carried on
 every later call. **There is no authentication** — registration is a request for a
 token and the coordinator always grants one.
@@ -404,7 +419,7 @@ function, not an architecture.
 
 ### D21. A client speaks to several coordinators; the agent sees one lab
 
-A `benchd-clientd` dials any number of coordinators at once. The expected setup is two:
+A `benchd client` dials any number of coordinators at once. The expected setup is two:
 a shared lab server, and a coordinator on the operator's own machine, bound to
 `127.0.0.1`, owning the boards on that desk.
 
@@ -445,6 +460,63 @@ agent packs the coordinator into the high 32 bits, so the agent still passes one
 number to `release` and never learns there is more than one lab. This was not
 theoretical: the first end-to-end run had both coordinators issue `l1` simultaneously.
 
+### D22. A bench's devices are hidden by the host, not concealed by a sandbox
+
+`benchd host` binds every device its bench declares to `usbip-host` at startup and does
+not give them back until it exits. A stub-bound device has no driver claiming its serial
+interface, so it has **no tty at all** — not a `root`-owned one, not a mode-`0600` one.
+There is nothing on that machine to open, for another agent, an unprivileged user, or
+root.
+
+*Why absence rather than permissions:* every permission scheme leaves the node present,
+which means `root` and `CAP_DAC_OVERRIDE` still open it, and — worse — a stale
+`/dev/ttyUSB0` in a script still resolves to a real board. Absence has no such holes, and
+needs no policy to stay correct.
+
+*Why this replaces the client-side sandbox:* the sandbox existed to hide bench devices
+from an agent's `/dev`. With nothing to hide it has no job left, and benchd no longer
+requires one to function. Separating two agents that share a uid on one client machine is
+a different problem, and one the operator should solve with whatever sandbox they prefer
+rather than one this project mandates. `dist/benchd-sandbox` remains as a worked example.
+
+*Cost, accepted:* an unleased board is unusable on its own host without going through
+benchd, and `benchd host` now needs root even for a bench that never leaves the machine.
+
+*Why release must be belt and braces:* a stub binding is kernel state that outlives the
+process which made it, so a host that dies without unbinding leaves boards invisible and
+nothing running that remembers why — the D6 problem, applied to hiding. Three layers
+answer it. The busids are written to `/run/benchd-host/<bench>.busids` **before** they are
+bound, so the record can never be missing for a device that is; a SIGTERM handler releases
+on the ordinary shutdown path; and `ExecStopPost=` runs `--release-all` even when the
+process was killed outright. A power cut needs none of them, because stub bindings do not
+survive a reboot and neither does the `/run` record — which is exactly why it lives there.
+
+*Why a refused registration unhides:* a bench the coordinator will not accept cannot be
+leased by anyone, so keeping its boards hidden serves nobody and removes the hardware
+from the machine as well. Worse, it hides the cause: a typo in a tag would make the
+boards silently vanish. So registration being refused gives the devices back and retries
+slowly, which both keeps them usable by hand and lets a corrected vocabulary recover on
+its own. Losing the *coordinator* does not unhide, because that says nothing about
+whether the bench is valid and no lease can exist while it is gone.
+
+*Why a host refuses to manage a forwarded device:* now that co-located leases go over
+USB/IP like everything else, a bench can be imported back onto the very machine it is
+plugged into — the ordinary case for the private local coordinator of D21. The imported
+copy is faithful: same vendor, same product, same serial, and therefore the same
+`/dev/serial/by-id` name as the board it came from. On any other machine that is harmless
+and even useful; on this one it means a `by-id` resource can resolve to this bench's own
+copy during the seconds a lease is being torn down. Hiding *that* would stub a phantom
+and leave the real board on its driver, visible to everything hiding exists to keep it
+from — so resolution rejects any device sitting under `vhci_hcd`, and `wait_for_hardware`
+simply retries until the board itself is back. `by-path` benches were never exposed,
+since a virtual device has a different physical path.
+
+*Why the record, and not a search:* recovery used to match stub-bound devices by looking
+for their USB serial inside the declared path, which only works for a `by-id` name because
+only those embed one. `by-path` is the recommended way to declare a bench, and it never
+matched — a latent gap that became a restart-path failure the moment hiding made recovery
+routine. An explicit record needs no heuristic and works for both.
+
 ### D9. Central vocabulary, host-declared benches
 
 Each host declares its own bench — resources, tags, description — and registers it. The
@@ -461,8 +533,7 @@ called* is global.
 
 ### D10. Tag vocabulary is closed, `key=value`, with implications
 
-Benches expand through an implication graph (`soc=esp32s3` ⇒ `family=esp32`,
-`jtag=builtin`, …); unknown tags are rejected with did-you-mean suggestions.
+Unknown tags are rejected with did-you-mean suggestions.
 
 *Why:* free-form tags rot within a week once *agents* write the requests. A closed
 vocabulary turns a typo into a self-correcting error in one turn instead of ten turns of
@@ -472,7 +543,136 @@ vocabulary turns a typo into a self-correcting error in one turn instead of ten 
 request makes it strictly harder to satisfy.
 
 *Dashes:* legal in values generally (`name=esp32s3-a` is an opaque identity string),
-rejected in *vocabulary* values, which is where the `esp32-s3`/`esp32s3` split happens.
+rejected in *vocabulary* values and in qualifiers, which is where the
+`esp32-s3`/`esp32s3` split happens.
+
+#### What a board *is*, versus how it is *wired*
+
+The vocabulary is in three parts, and the split is load-bearing:
+
+| | example keys | declared by |
+|---|---|---|
+| Silicon | `soc`, `family`, `arch`, `net` | implied from `soc=` |
+| Board build | `psram`, `flash`, `peripheral` | the bench |
+| Wiring | `console`, `jtag` | the bench |
+
+Only silicon implies anything. `soc=esp32s3` ⇒ `family=esp32`, `arch=xtensa`, `net=wifi`,
+`net=bt`: these follow from the chip identity and nothing at the bench can make them
+false.
+
+`soc=esp32s3` used to also imply `jtag=builtin` and a `usb=native` key that no longer
+exists, and that was wrong. The
+S3 *has* a USB-JTAG peripheral, but whether this bench can reach it depends on which of
+the board's two sockets the cable is in — a fact the SoC cannot possibly know. The
+implication made every S3 advertise debug access, so a claim for `jtag=builtin` could be
+answered with a board wired through its UART bridge, and the agent found out by failing to
+attach. An implication that is true of the silicon but false of the bench is worse than no
+implication at all, because it is asserted with the coordinator's authority.
+
+The rule that falls out: **implications encode "is a kind of", never "is connected to"**.
+
+*Absence is not a value.* A bench with no debug access omits `jtag` rather than declaring
+`jtag=none`. Best-fit scoring (D12) prices every tag a bench carries but the request did
+not ask for, so declaring an absent capability would make the *less* capable board score
+as the more precious one.
+
+#### Qualified values: `peripheral=accel[mpu6050]`
+
+Categories are curated centrally; parts are not. A bench writes
+`peripheral=accel[mpu6050]`, where `accel` must exist in the vocabulary and `mpu6050` is
+free-form. Keys opt in with `qualified = true`.
+
+*Why:* the alternative is a central list of every accelerometer, flash chip and GNSS
+module anyone might solder to a board, maintained by someone who cannot see the board.
+Curating `soc=` pays for itself — three values cover the whole lab and each stands in for
+four more tags — but curating parts is unbounded work whose only reward is that someone
+else's bench config becomes legal. The person looking at the hardware already knows the
+part number; the vocabulary just needs to stop being in their way.
+
+At load time a qualified tag desugars into two ordinary tags on the bench,
+`peripheral=accel` and `peripheral=accel[mpu6050]`, so matching stays plain subset
+containment and the matcher needs no notion of qualifiers at all. Combined with the
+asymmetry above this gives exactly the behaviour you want in both directions: a request
+for the category matches the board that recorded its part, and a request for the exact
+part does *not* match a board that only claims "an accelerometer".
+
+Scoring treats the pair as one chip. Charging for both would mean a board scored as
+scarcer for having its part number written down, which teaches everyone to stop writing
+part numbers down.
+
+### D23. A bench documents itself, and the documentation arrives with the grant
+
+A bench config may carry a `docs` string of markdown — pinout, jumper positions, what is
+soldered to what. It rides the registration to the coordinator and is handed to the agent
+in the `granted` reply, per slot.
+
+*Why the bench config:* the same reason the tags live there (D9). The notes and the wiring
+they describe are the same edit; a central document is out of date the first time someone
+moves a jumper.
+
+*Why grant time, and not discovery:* tags say what a bench *can do*, which is what an
+agent needs in order to ask for one. Wiring notes say what is *on* a particular bench,
+which is only useful once you have it — and publishing them in `tag_list` would hand every
+agent a per-bench fingerprint to select on, quietly undoing D17's rule that agents describe
+hardware rather than name it. Delivering at grant time also means the notes are scoped to
+the slot: the agent is told what is wired to `dut`, not what exists in the lab.
+
+*Why capped at 8 KB:* this text lands in an agent's context window, uninvited, on every
+claim. That is a budget someone else is spending, so there is a ceiling — enforced on the
+host *and* re-checked at the coordinator, since the host may be an older build. Anything
+longer belongs in a repository the docs can link to.
+
+*Why the operator CLI flags the absence:* a bench with no notes is invisible until an agent
+wastes a lease guessing at its pinout, so `benchd inspect` marks it `[no docs]` rather than
+saying nothing.
+
+### D24. A resource names one device node; several may name one device
+
+A resource resolves to exactly one path an agent can open. A USB device that produces
+several nodes is therefore described by several resources sharing one `busid`, and the
+node each one wants is named explicitly: `kind = "scsi"` or `kind = "block"`.
+
+```toml
+[resources.sdmux]           # /dev/sg0 - usbsdmux switches the card through this
+kind  = "scsi"
+busid = "3-1.1"
+
+[resources.sdcard]          # /dev/sda - the card itself, once switched to the host
+kind  = "block"
+busid = "3-1.1"
+```
+
+*Why not one resource for the whole device:* it would have to resolve to a directory,
+and the agent would then have to pick a node out of it — a choice it cannot make
+correctly, because it cannot see the device. `usbsdmux` needs the SCSI node and `dd`
+needs the block node; a resource that names neither has moved the problem rather than
+solved it.
+
+*What follows from it:* USB/IP forwards whole devices, so resources sharing a `busid`
+share a single channel. The coordinator mints channel keys per device rather than per
+resource and repeats the key across them; the host binds the device once; the client
+imports once and resolves each node from that one vhci port. Both ends deduplicate on
+the key, so neither needs a second concept for "these two go together".
+
+*Why the host records a tty's USB interface:* the same device can offer two serial
+ports. An FT2232H exposes its two channels as interfaces 0 and 1, and on a WROVER-KIT
+one is JTAG and the other is the console — so locating the tty after an import by
+taking whichever the kernel lists first is a coin toss, and losing it hands the agent a
+port that will never speak to it. The `by-path` in the config already names the
+interface, so the host reads it while the hardware is still visible and the client asks
+for that interface by number. Nothing falls back to the other interface when the wanted
+one has no tty: the fallback is the ambiguity.
+
+*Why nodes are located by vhci port, never by name:* a forwarded device reproduces the
+`by-id` name of the board it came from, so diffing `/dev/serial/by-id` across an import
+can see nothing at all. Storage is worse — the machine running the client very likely
+has a `/dev/sda` of its own, and taking it would be a bind mount of the wrong disk into
+a lease directory.
+
+*Why `kind = "usb"` is now an error:* it meant "the whole device" and had no way to say
+which node was wanted, so such a bench registered without complaint and then spent ten
+seconds at materialisation waiting for a tty that would never appear. Failing at config
+load is the same error, ten minutes earlier, with the two spellings that would fix it.
 
 ### D11. A bench may hold several boards
 
@@ -498,8 +698,8 @@ that tag)` over wasted tags.
 *Why:* first-fit hands the only JTAG bench to an agent that asked for a blinking LED.
 
 *Why weighted — a bug we hit:* pure scarcity conflates *rare* with *valuable*. Being the
-only CP2102N made `usb=cp2102n` unique, so the matcher protected the lab's cheapest
-board and handed out the PSRAM one. Identity keys (`soc`, `arch`, `usb`) get weight 0;
+only CP2102N board made `console=uart` unique, so the matcher protected the lab's cheapest
+board and handed out the PSRAM one. Identity keys (`soc`, `arch`, `console`) get weight 0;
 contended peripherals keep 1.
 
 ### D13. Atomic multi-slot claims, solved exactly
@@ -573,8 +773,33 @@ it instead of `idf.py monitor`, giving two access paths and split logs. Claim-by
 means an agent hardcodes a bench into a script, reintroducing the contention this
 removes.
 
-*The distinction is the surface, not the caller:* both live in the operator CLI, which
-is a different program — not a privileged mode of the same one.
+*The distinction is the surface, not the caller:* both live in the operator commands,
+which an agent is never handed. Since D26 those ship in the same executable as the MCP
+shim, and this is undisturbed by that: what an agent can reach is the tool list its
+harness gives it, and it was never the set of programs on the machine.
+
+### D25. A person holds a bench through the agent surface, not the operator one
+
+`benchd lease` claims by capability, cannot name a bench, and has the same operations an
+agent has. It is a *presentation* of the agent surface — a terminal instead of MCP — and
+so is bound by D17 rather than an exception to it.
+
+*What it is not is an operator command that happens to be spelled differently.* They
+talk to different things: `benchd benches` speaks to a coordinator over TCP and answers
+"what exists, who has it, take it back", whereas claiming goes through the local client
+daemon, because the point of a claim is device nodes appearing on *this* machine. D26
+put them behind one command anyway, and the distinction survives it intact, because it
+was always about what each one can ask for and never about how it is invoked.
+
+*Why the process is the lease:* the socket connection is the session, so quitting,
+crashing, or closing the terminal returns the hardware immediately. It is the same
+mechanism that reclaims a bench when an MCP shim exits, and it makes the common human
+failure — walking away — cost nothing.
+
+*The TTL stays mandatory (D15) but the CLI supplies a default*, because a person at a
+terminal is not the runaway that limit is for; here it is the backstop for a death that
+takes the socket with it silently. Auto-renew is still refused: a holder who wants
+longer says so.
 
 ### D18. Rust, TOML, workspace
 
@@ -594,16 +819,51 @@ matching the installed toolchain.
 ```
 benchd-core         tags, model, matcher, policy, wire messages   pure, no I/O
 benchd-coordinator  matching, policy, lease state, reaper   (stateless)
+                      operator.rs: benches / leases / release
 benchd-host         owns one bench; export/teardown; power/mux
-benchd-clientd      privileged: coordinator link + sandbox materialiser
+benchd-client       privileged: coordinator link + materialiser
+                      lease.rs: hold a bench by hand (unprivileged)
 benchd-mcp          thin per-agent stdio MCP shim (unprivileged)
-benchd              operator CLI
+benchd              the dispatcher; the only crate that produces a binary
 ```
 
 With no `.proto` (D5) the wire messages are just `serde` types and live in core, which
 already depends on serde for config. Core stays free of tokio so its property test stays
-millisecond-scale. `benchd-mcp` and `benchd` are small enough to be binaries in the
-client and coordinator crates rather than crates of their own.
+millisecond-scale. The two hand-operated surfaces live in the crate whose daemon they
+talk to — the operator commands with the coordinator, `lease` with the client — because
+each is a thin front end over that daemon's protocol and shares its types.
+
+### D26. One binary, a subcommand per component
+
+Every component ships as `benchd <subcommand>`: `coordinator`, `host`, `client`, `mcp`,
+`lease`, and the operator commands `benches` / `leases` / `release`. Each is still its
+own crate, and `crates/benchd` is a dispatcher that owns exactly two things they must
+not each decide: the tokio runtime, and that logs go to stderr.
+
+*Why:* a lab is several machines running different subsets of the components, and six
+binaries meant six versions to keep in step across them. Every stale-binary dead end
+this project has had — and there have been several, which is why `deploy.sh` verifies
+checksums and restarts units — was one artefact being older than the others. One
+artefact cannot be half-upgraded, and the wire protocol between a host and a coordinator
+of different vintages is no longer something that can happen by accident on one machine.
+
+*What it costs:* a host installs the MCP shim it will never run, and a few hundred
+kilobytes of clap tables. Against having to reason about which of six things on a given
+box is current, that is not a real price.
+
+*What it does not cost:* the agent boundary (D17). It is tempting to read "the operator
+commands are in the same executable an agent runs" as a weakening, but the executable
+was never the control. An agent could always have run the operator CLI; what stops it
+hardcoding a bench is that its harness hands it five MCP tools and no shell. Merging the
+files leaves that exactly where it was.
+
+*Rejected:* busybox-style dispatch on `argv[0]`, with symlinks named after the old
+binaries. It would have made the migration a no-op, but it makes `benchd --help`
+untruthful and turns a wrong-symlink deployment into a mystery. A clean cut, with
+`deploy.sh` deleting the superseded names, fails loudly instead.
+
+*Rejected:* keeping the daemons separate and merging only the two CLIs. That is the
+split that causes the trouble — the daemons are the ones spread across machines.
 
 ---
 
@@ -620,7 +880,9 @@ runs the reaper (grace → revoke → teardown).
 
 **Host** — owns one bench, decides nothing, executes epoch-qualified instructions.
 Registers its bench upward; `export` / `unexport`; heartbeats; owns power/mux for setup
-and teardown only. Unexports everything at startup.
+and teardown only. Unexports everything at startup, and **hides its bench's devices for
+its whole lifetime** (D22) so they cannot be reached on that machine except through a
+lease.
 
 > **Device loss is watched for, reported, and waited out.** The host polls its
 > resources; when one disappears it sends `DeviceLost`, and the coordinator
@@ -631,33 +893,39 @@ and teardown only. Unexports everything at startup.
 > the bench is simply not offered in between. Verified by unbinding a board from
 > its USB driver: withdrawn in ~5s, back automatically on rebind, zero restarts.
 >
-> This matters more than it looks for a co-located bench, where `export` never
-> touches the device: without a watcher the bench stayed registered and
-> matchable forever, every claim picked it and failed on the client, and the
-> capability was dead until someone restarted the host by hand — even with
-> another matching bench free.
+> The watcher polls the **USB device in sysfs, not the tty**, and that is now
+> structural rather than a refinement: a hidden bench (D22) has no tty at any
+> point in its life, so a watcher looking for one would report every board lost
+> a few seconds after startup. The USB device node stays put whichever driver
+> holds it and vanishes only when the board actually does.
+>
+> Losing the hardware is also the *only* thing that unhides a bench. A coordinator
+> restart must not, because no lease can exist while it is gone and briefly
+> exposing every board to the machine would undo the point. An unplug must,
+> because the `match_busid` entry outlives the device and would otherwise let the
+> stub grab the board the instant it is replugged — leaving it with no tty and
+> nothing able to resolve it.
 
-**Client** — `benchd-clientd`, one privileged daemon per agent machine, holding the
+**Client** — `benchd client`, one privileged daemon per agent machine, holding the
 coordinator connection. Materialises and revokes; renews only on explicit agent call;
-removes every materialisation under its root at startup. `benchd-mcp` is the thin
+removes every materialisation under its root at startup. `benchd mcp` is the thin
 unprivileged stdio shim spawned per agent (D8), which registers a session and forwards
 calls over a local socket.
 
-> **Sandbox mechanism: bubblewrap** (`dist/benchd-sandbox`). The agent runs with
-> `--dev /dev`, which is a fresh minimal `/dev` containing no serial devices at all;
-> every serial device that is *not* a bench resource is handed back with
-> `--dev-bind`, so a board that is not part of the lab still works normally. Its
-> `/run/benchd/<identity>` is bind-mounted, and because that is a *directory*
-> mount, leases appear and disappear inside a running sandbox with no restart and
-> no cooperation from the agent.
+> **No sandbox is required.** Bench devices are hidden at the host (D22), so there
+> is nothing on the agent's machine for a sandbox to conceal: an agent that ignores
+> the skill and reaches for `/dev/ttyUSB0` finds no such device anywhere, because
+> the board it names has no tty until a lease imports one.
 >
-> Verified end to end: before a claim `/dev/ttyACM0` does not exist inside the
-> sandbox; after one, the lease path exists, is owned by the agent's uid and opens;
-> on release it is gone and reopening gives `ENOENT`. The raw device path is never
-> visible, even while the lease is held.
+> `dist/benchd-sandbox` remains as a worked example for operators who want to
+> separate agents that share a uid, which is the one thing hiding does not do. It
+> uses bubblewrap: `--dev /dev` gives a fresh minimal `/dev`, and the agent's
+> `/run/benchd/<identity>` is bind-mounted so that leases appear and disappear
+> inside a running sandbox with no restart and no cooperation from the agent.
+> Nothing in benchd assumes it ran.
 >
 > The owner directory is named from the agent's declared identity alone, never a
-> session id: the sandbox must bind-mount it at launch, which is before the
+> session id: a sandbox has to bind-mount it at launch, which is before the
 > coordinator has issued a session. `/run/benchd` is mode 1777 like `/tmp` so an
 > unprivileged sandbox can create its own; the device nodes inside are 0660 owned
 > by the agent's uid, so a listable directory grants nothing.
@@ -781,6 +1049,7 @@ revisit-with-evidence, not now.
 | Coordinator daemon | working end-to-end |
 | Host / client daemons | specified |
 | USB/IP handshake + sysfs fd handoff | done, verified on hardware |
+| One binary, a subcommand per component | done (D26) |
 | Skill | not started |
 
 No persistence layer appears here, and that is the point of D6. No schema language

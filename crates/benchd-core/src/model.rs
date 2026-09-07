@@ -59,24 +59,80 @@ pub enum Resource {
     /// describe. Declare it and a silent board swap is refused at registration
     /// instead of handing an agent an ESP32-C3 that every tag calls an S3.
     /// Leave it out and whatever is in the slot is accepted.
+    ///
+    /// `interface` is the USB interface number the tty hangs off, filled in by
+    /// the host when it resolves `path`. It exists because a device can expose
+    /// more than one serial port: on an FT2232H the two channels are interfaces
+    /// 0 and 1, and on a WROVER-KIT one of them is the JTAG channel and the
+    /// other is the console. Without it, locating the tty after a USB/IP import
+    /// means taking whichever one the kernel lists first, which is a coin toss.
+    /// Nobody writes this by hand — the `by_path` already names the interface.
     Serial {
         path: PathBuf,
         serial: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interface: Option<u8>,
     },
-    /// A whole USB device, for USB/IP export to a remote client. Carries the
-    /// bus id (`1-2.3`) that `usbip bind` needs. Not handled by the local
-    /// bind-mount backend.
-    Usb { busid: String },
+    /// A whole USB device, named directly by the bus id (`1-2.3`) that `usbip
+    /// bind` needs, rather than resolved from a tty like [`Resource::Serial`].
+    ///
+    /// `node` says which of the device's device nodes the agent wants. One USB
+    /// device can produce several at once — a USB-SD-Mux is switched through
+    /// its SCSI generic node and written through its block node — so two
+    /// resources may name the same `busid` and differ only here. USB/IP still
+    /// forwards the device once; the fan-out happens after the import.
+    Usb { busid: String, node: UsbNode },
+}
+
+/// Which of a USB device's nodes a resource wants.
+///
+/// Deliberately not "the whole device": an agent needs a path it can hand to
+/// `dd` or `usbsdmux`, and a resource that resolved to a directory of nodes
+/// would push the job of picking one onto the agent, which cannot see the
+/// device to pick correctly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsbNode {
+    /// `/dev/sd*` — the storage itself.
+    Block,
+    /// `/dev/sg*` — the SCSI generic node, which is how `usbsdmux` sends the
+    /// vendor command that switches the card between the DUT and the host.
+    Scsi,
+}
+
+impl UsbNode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UsbNode::Block => "block",
+            UsbNode::Scsi => "scsi",
+        }
+    }
 }
 
 // A resource has no `name` field: it is always stored in a map keyed by its
 // name, and carrying the name in both places invites them to disagree.
 
 impl Resource {
-    pub fn kind(&self) -> &'static str {
+    /// The `kind =` a bench config would write for this resource. Not the same
+    /// spelling as the wire tag, which says `usb` and puts the node beside it.
+    pub fn config_kind(&self) -> &'static str {
         match self {
             Resource::Serial { .. } => "serial",
-            Resource::Usb { .. } => "usb",
+            Resource::Usb { node, .. } => node.as_str(),
+        }
+    }
+
+    /// What distinguishes the *device* behind this resource, for grouping.
+    ///
+    /// Two resources with the same key are two views of one USB device and must
+    /// share a single USB/IP channel, because USB/IP forwards whole devices. A
+    /// serial resource falls back to its own name: the coordinator never learns
+    /// the busid behind a tty, and the host refuses a bench where two serial
+    /// resources resolve to one device rather than let the two disagree here.
+    pub fn device_key<'a>(&'a self, name: &'a str) -> &'a str {
+        match self {
+            Resource::Usb { busid, .. } => busid,
+            Resource::Serial { .. } => name,
         }
     }
 
@@ -99,10 +155,21 @@ pub struct Bench {
     pub tags: TagSet,
     pub resources: BTreeMap<String, Resource>,
     pub description: String,
+    /// Markdown handed to the agent at grant time: pinout, jumpers, what is
+    /// wired to what. Empty for most benches.
+    pub docs: String,
     /// Set false to keep a bench in the inventory but out of the matcher (dead
     /// board, cable being reseated) without deleting its definition.
     pub enabled: bool,
 }
+
+/// Ceiling on a bench's documentation, in bytes.
+///
+/// Generous for the pinout and jumper notes this is for, small enough that a
+/// host cannot push a datasheet into every agent's context window. Enforced
+/// both when loading a file and when a host registers, because the host is not
+/// necessarily running the same build as the coordinator.
+pub const MAX_BENCH_DOCS: usize = 8 * 1024;
 
 impl Bench {
     /// Resource names in stable order. A bench may hold several boards (D11);
@@ -171,12 +238,17 @@ pub fn valid_component(name: &str) -> bool {
 
 /// Where a bench's serial resources are allowed to live.
 ///
-/// A host declares this path and the client daemon — running as root —
-/// bind-mounts it and hands it to the agent's uid. Anyone who can reach the
-/// coordinator can register a bench (§9 accepts that), so without this check a
-/// registration string reaches `mount(2)` and `chown(2)` unvalidated: register a
-/// bench whose "device" is `/etc/shadow`, claim it, and the file is mounted into
-/// your sandbox owned by you.
+/// Written for a specific escalation: the declared path used to be handed
+/// straight to the client daemon, which bind-mounted it as root and chowned it
+/// to the agent — so registering a bench whose "device" was `/etc/shadow` put
+/// that file in your sandbox, owned by you. Anyone who can reach the
+/// coordinator can register a bench (§9 accepts that), and nothing checked.
+///
+/// That path is gone: a client only ever mounts a node the kernel produced for
+/// an imported device, never one a host named. The check stays anyway. It is
+/// two comparisons on an open registration surface, the declared path is still
+/// canonicalised by a root host process, and a bench that names something which
+/// is not a device could never work regardless.
 ///
 /// Devices live under `/dev`. Nothing else is a device, so nothing else is
 /// accepted.
@@ -316,6 +388,9 @@ struct RawTagKey {
     description: String,
     /// Per-key best-fit weight; see `Vocabulary::weight`.
     weight: Option<f64>,
+    /// Whether a bench may write `key=category[part]` on this key.
+    #[serde(default)]
+    qualified: bool,
     #[serde(default)]
     values: BTreeMap<String, RawTagValue>,
 }
@@ -332,6 +407,8 @@ struct RawTagValue {
 struct RawBench {
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    docs: String,
     #[serde(default)]
     tags: Vec<String>,
     #[serde(default = "default_true")]
@@ -355,6 +432,9 @@ struct RawResource {
     by_id: Option<PathBuf>,
     /// The USB serial number expected in this position, if it matters.
     serial: Option<String>,
+    /// Which USB interface the tty hangs off. Normally derived from the path
+    /// rather than written by hand.
+    interface: Option<u8>,
     busid: Option<String>,
 }
 
@@ -367,6 +447,7 @@ impl RawInventory {
         let mut defs = BTreeMap::new();
         let mut key_weights = BTreeMap::new();
         let mut key_descriptions = BTreeMap::new();
+        let mut qualified_keys = BTreeSet::new();
 
         for (key, body) in &self.tags {
             if let Some(weight) = body.weight {
@@ -374,6 +455,9 @@ impl RawInventory {
             }
             if !body.description.is_empty() {
                 key_descriptions.insert(key.clone(), body.description.clone());
+            }
+            if body.qualified {
+                qualified_keys.insert(key.clone());
             }
             for (value, val_body) in &body.values {
                 // Round-trip through the parser so config-declared tags obey
@@ -394,7 +478,13 @@ impl RawInventory {
             .unwrap_or_else(|| vec!["name".to_string()])
             .into_iter()
             .collect();
-        let vocabulary = Vocabulary::new(defs, open_keys, key_weights, key_descriptions)?;
+        let vocabulary = Vocabulary::new(
+            defs,
+            open_keys,
+            key_weights,
+            key_descriptions,
+            qualified_keys,
+        )?;
 
         let mut benches = BTreeMap::new();
         for (id, body) in self.benches {
@@ -429,13 +519,34 @@ impl RawInventory {
                                 ),
                             })?,
                         serial: res.serial,
+                        interface: res.interface,
                     },
-                    "usb" => Resource::Usb {
+                    kind @ ("block" | "scsi") => Resource::Usb {
                         busid: res.busid.ok_or_else(|| InventoryError::Bench {
                             bench: id.clone(),
-                            reason: format!("usb resource {res_name:?} needs 'busid'"),
+                            reason: format!("{kind} resource {res_name:?} needs 'busid'"),
                         })?,
+                        node: if kind == "block" {
+                            UsbNode::Block
+                        } else {
+                            UsbNode::Scsi
+                        },
                     },
+                    // `usb` used to mean "the whole device" and had no way to
+                    // say which node the agent wanted, so such a bench
+                    // registered happily and then hung at materialisation
+                    // waiting for a tty that would never appear. Failing here
+                    // is the same error ten minutes earlier.
+                    "usb" => {
+                        return Err(InventoryError::Bench {
+                            bench: id.clone(),
+                            reason: format!(
+                                "resource {res_name:?}: kind 'usb' no longer says enough — \
+                                 use 'block' for the storage node or 'scsi' for the \
+                                 control node"
+                            ),
+                        })
+                    }
                     other => {
                         return Err(InventoryError::Bench {
                             bench: id.clone(),
@@ -446,6 +557,16 @@ impl RawInventory {
                 resources.insert(res_name, resource);
             }
 
+            if body.docs.len() > MAX_BENCH_DOCS {
+                return Err(InventoryError::Bench {
+                    bench: id.clone(),
+                    reason: format!(
+                        "docs are {} bytes, over the {MAX_BENCH_DOCS} byte limit",
+                        body.docs.len()
+                    ),
+                });
+            }
+
             benches.insert(
                 id.clone(),
                 Bench {
@@ -453,6 +574,7 @@ impl RawInventory {
                     tags,
                     resources,
                     description: body.description,
+                    docs: body.docs,
                     enabled: body.enabled,
                 },
             );

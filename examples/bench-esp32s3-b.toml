@@ -1,6 +1,6 @@
 id          = "esp32s3-b"
 description = "ESP32-S3 devkit, native USB-JTAG"
-tags        = ["soc=esp32s3", "psram=none", "flash=8mb"]
+tags        = ["soc=esp32s3", "psram=none", "flash=8mb", "console=usbjtag", "jtag=builtin"]
 
 [resources.console]
 kind  = "serial"

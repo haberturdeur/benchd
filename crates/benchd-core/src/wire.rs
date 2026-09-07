@@ -53,6 +53,11 @@ pub struct BenchSpec {
     pub id: String,
     #[serde(default)]
     pub description: String,
+    /// Markdown handed to the agent when this bench is granted: pinout, jumper
+    /// positions, what is wired to what. Capped by the coordinator on
+    /// registration; see [`crate::model::MAX_BENCH_DOCS`].
+    #[serde(default)]
+    pub docs: String,
     pub tags: Vec<Tag>,
     pub resources: BTreeMap<String, Resource>,
 }
@@ -88,10 +93,10 @@ pub enum ToHost {
     Rejected { reason: String },
     /// Make this bench's resources reachable by `session`.
     ///
-    /// `channels` is empty when the host and client share a machine: there is
-    /// nothing to export and the client bind-mounts the real inode instead.
-    /// Otherwise it maps each resource name to the rendezvous key the host must
-    /// present when it dials out.
+    /// Maps each resource name to the rendezvous key the host must present when
+    /// it dials out. Always populated, on every lease: a host hides its devices
+    /// for its whole lifetime (D22), so there is no local inode to hand over
+    /// even when the host and client share a machine.
     Export {
         request: RequestId,
         lease: LeaseId,
@@ -226,6 +231,14 @@ pub enum ToClient {
         lease: LeaseId,
         /// slot -> bench id
         slots: BTreeMap<String, String>,
+        /// slot -> the bench's markdown documentation, where it has any.
+        ///
+        /// Delivered here rather than through discovery because this is the
+        /// first moment the agent is entitled to know it: before the grant it
+        /// has no bench, and a bench's wiring notes are exactly the sort of
+        /// detail that would let it start addressing hardware by name (D3).
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        docs: BTreeMap<String, String>,
         expires_at: Secs,
         /// Set when the granted TTL is shorter than the one requested.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,14 +288,57 @@ pub enum ToClient {
 }
 
 /// Where a resource actually is, from the client's point of view.
+///
+/// One variant, deliberately. A host keeps its devices bound to the USB/IP
+/// stub for its whole lifetime so that an unleased board has no tty for anyone
+/// on that machine to open, which leaves no local inode to hand over even when
+/// the host and client are the same box.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "via", rename_all = "snake_case")]
 pub enum ResourceHandle {
-    /// Same machine: bind-mount this device node.
-    Local { path: String },
-    /// Different machine: dial the coordinator with this key, complete the
-    /// USB/IP handshake, and hand the socket to the kernel (D5).
-    UsbIp { channel: ChannelKey, busid: String },
+    /// Dial the coordinator with this key, complete the USB/IP handshake, and
+    /// hand the socket to the kernel (D5).
+    ///
+    /// Two resources of one bench may carry the *same* `channel`, which is how
+    /// a device that produces several nodes is described: the import happens
+    /// once and each resource then takes a different `node` from it.
+    UsbIp {
+        channel: ChannelKey,
+        busid: String,
+        #[serde(default)]
+        node: WantedNode,
+    },
+}
+
+/// Which device node a resource resolves to once its device is imported.
+///
+/// The client cannot work this out for itself. After a USB/IP import it has a
+/// vhci port and a subtree of sysfs, and a device with two serial ports offers
+/// two equally plausible ttys — so the host, which could still see the hardware
+/// when it resolved the bench, says which one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WantedNode {
+    /// A serial port. `interface` disambiguates a device with more than one;
+    /// `None` means take whichever is found, which is correct for the single
+    /// port case and is what older hosts send.
+    Tty {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interface: Option<u8>,
+    },
+    /// `/dev/sd*`.
+    Block,
+    /// `/dev/sg*`.
+    Scsi,
+}
+
+/// A serial port with no interface preference: what every bench meant before
+/// there was anything else to mean, and so what a handle without a `node`
+/// deserialises to.
+impl Default for WantedNode {
+    fn default() -> Self {
+        WantedNode::Tty { interface: None }
+    }
 }
 
 /// Rendezvous key for one relayed data connection. Both ends dial out and
@@ -357,6 +413,12 @@ pub enum ToOperator {
 pub struct BenchView {
     pub id: String,
     pub description: String,
+    /// Whether the bench carries grant-time documentation, not the text itself:
+    /// an operator auditing which benches still have no pinout notes needs the
+    /// flag, and shipping every bench's markdown into every `inspect` would
+    /// bury the thing they came to read.
+    #[serde(default)]
+    pub has_docs: bool,
     /// Rendered `key=value`, already sorted.
     pub tags: Vec<String>,
     pub resources: Vec<String>,
@@ -500,18 +562,44 @@ mod tests {
 
     #[test]
     fn a_resource_handle_says_how_to_reach_it() {
-        let local = encode(&ResourceHandle::Local {
-            path: "/dev/ttyACM0".into(),
-        })
-        .unwrap();
-        assert_eq!(local, r#"{"via":"local","path":"/dev/ttyACM0"}"#);
-
         let remote = encode(&ResourceHandle::UsbIp {
             channel: ChannelKey("k1".into()),
             busid: "1-2".into(),
+            node: WantedNode::Tty { interface: None },
         })
         .unwrap();
-        assert_eq!(remote, r#"{"via":"usb_ip","channel":"k1","busid":"1-2"}"#);
+        assert_eq!(
+            remote,
+            r#"{"via":"usb_ip","channel":"k1","busid":"1-2","node":{"kind":"tty"}}"#
+        );
+    }
+
+    #[test]
+    fn a_handle_from_a_host_that_predates_node_kinds_is_a_serial_port() {
+        // Hosts and coordinators are upgraded separately, and the old meaning
+        // of a handle was always "the tty on the other end of this channel".
+        let old = r#"{"via":"usb_ip","channel":"k1","busid":"1-2"}"#;
+        let handle: ResourceHandle = serde_json::from_str(old).unwrap();
+        let ResourceHandle::UsbIp { node, .. } = handle;
+        assert_eq!(node, WantedNode::Tty { interface: None });
+    }
+
+    #[test]
+    fn two_resources_on_one_device_differ_only_in_the_node() {
+        // The USB-SD-Mux case: one import, one channel, two nodes.
+        let switch = ResourceHandle::UsbIp {
+            channel: ChannelKey("k1".into()),
+            busid: "3-1.1".into(),
+            node: WantedNode::Scsi,
+        };
+        let card = ResourceHandle::UsbIp {
+            channel: ChannelKey("k1".into()),
+            busid: "3-1.1".into(),
+            node: WantedNode::Block,
+        };
+        assert_ne!(switch, card);
+        assert_eq!(roundtrip(switch.clone()), switch);
+        assert_eq!(roundtrip(card.clone()), card);
     }
 
     #[test]

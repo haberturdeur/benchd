@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# Launch a command in a sandbox where the lab's hardware is unreachable without
-# a lease.
+# Run a command with one agent's lease directory visible and no other's.
 #
-# This is what makes a lease *enforced* rather than advisory (design decision
-# D2). Inside the sandbox:
+# **This is an example, not a requirement.** benchd does not need it and does not
+# assume it ran. Bench devices are hidden by the host that owns them (design
+# decision D22): they are bound to the usbip stub and have no tty on any machine,
+# so an agent that ignores the skill and reaches for /dev/ttyUSB0 gets ENOENT
+# whether or not it is sandboxed. There is nothing here left to conceal.
 #
-#   * /dev has no serial devices at all to begin with
-#   * every serial device NOT owned by a bench is handed back, so a board that
-#     is not part of the lab still works normally
-#   * /run/benchd/<identity> is bind-mounted, so leases appear and disappear
-#     live while the sandbox runs
+# What it is still good for is the one thing hiding does not do: separating two
+# agents that share a uid. Leases materialise under /run/benchd/<identity>, and
+# DAC alone cannot keep same-uid agents out of each other's directories. Binding
+# only the caller's own can.
 #
-# An agent that ignores the skill and reaches for /dev/ttyUSB0 therefore gets
-# ENOENT rather than someone else's test run.
+# Use whatever sandbox you prefer -- this one is bubblewrap. Adapt it, replace
+# it, or drop it.
 #
 # Usage:
 #   benchd-sandbox [--identity NAME] [--root DIR] -- command [args...]
@@ -22,16 +23,14 @@
 set -euo pipefail
 
 ROOT=/run/benchd
-BENCHES=/etc/benchd/benches
 IDENTITY=${BENCHD_IDENTITY:-}
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --identity) IDENTITY=$2; shift 2 ;;
     --root)     ROOT=$2; shift 2 ;;
-    --benches)  BENCHES=$2; shift 2 ;;
     --)         shift; break ;;
-    -h|--help)  sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)  sed -n '2,22p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *)          echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -51,80 +50,38 @@ fi
 # this sandbox cannot see.
 IDENTITY=$(echo "$IDENTITY" | tr -cd '[:alnum:]._-' | cut -c1-48)
 
-[ -d "$ROOT" ] || { echo "$ROOT does not exist; is benchd-clientd running?" >&2; exit 1; }
+[ -d "$ROOT" ] || { echo "$ROOT does not exist; is the benchd client daemon running?" >&2; exit 1; }
 
 # Ask the daemon to create the lease directory rather than creating it here.
 # It must be owned by root and not writable by the agent: an agent that can
 # write its own lease directory can plant a symlink where root will later
 # create the next lease, and root follows it.
 SOCK="$ROOT/agent.sock"
-[ -S "$SOCK" ] || { echo "$SOCK missing; is benchd-clientd running?" >&2; exit 1; }
+[ -S "$SOCK" ] || { echo "$SOCK missing; is the benchd client daemon running?" >&2; exit 1; }
 OWNER=$(printf '{"msg":"prepare_owner","request":1,"name":"%s"}\n' "$IDENTITY" \
   | timeout 5 socat - "UNIX-CONNECT:$SOCK" 2>/dev/null \
   | sed -n 's/.*"path":"\([^"]*\)".*/\1/p' | head -1)
 if [ -z "$OWNER" ]; then
-  echo "benchd-clientd did not prepare a lease directory for $IDENTITY" >&2
+  echo "the benchd client daemon did not prepare a lease directory for $IDENTITY" >&2
   exit 1
 fi
 
-# --- which serial devices belong to the lab? -------------------------------
-#
-# Resolved from the bench definitions on this machine. A device that is not a
-# bench resource is none of benchd's business and stays visible.
-# A resource may be named by position (by_path, preferred) or by chip (by_id).
-# Matching only one of them silently hid nothing the day the benches moved to
-# by_path — the sandbox reported "hidden: none" and every board was visible to
-# every agent. Match both, and count what we expected to find.
-declare -A BENCH_DEV=()
-DECLARED=0
-if [ -d "$BENCHES" ]; then
-  while IFS= read -r decl; do
-    DECLARED=$((DECLARED + 1))
-    [ -e "$decl" ] || continue
-    real=$(readlink -f "$decl") || continue
-    BENCH_DEV["$real"]=1
-  done < <(grep -ho '\(by_path\|by_id\) *= *"[^"]*"' "$BENCHES"/*.toml 2>/dev/null \
-           | sed 's/.*"\(.*\)"/\1/')
-fi
-
-# Fail closed. If benches declare devices but none resolved, something is out of
-# step — a renamed key, a moved config, an unplugged board — and the safe answer
-# is to hide every serial device rather than expose the lab. A security control
-# that silently degrades to "allow everything" is worse than none.
-FAIL_CLOSED=0
-if [ "$DECLARED" -gt 0 ] && [ "${#BENCH_DEV[@]}" -eq 0 ]; then
-  echo "benchd-sandbox: $DECLARED bench device(s) declared but none resolved;" >&2
-  echo "                hiding ALL serial devices rather than guessing." >&2
-  FAIL_CLOSED=1
-fi
-
-ALLOW=()
-HIDDEN=()
-for dev in /dev/ttyUSB* /dev/ttyACM* /dev/ttyS*; do
-  [ -e "$dev" ] || continue
-  real=$(readlink -f "$dev")
-  if [ -n "${BENCH_DEV[$real]:-}" ] || [ "$FAIL_CLOSED" = 1 ]; then
-    HIDDEN+=("$dev")
-  else
-    ALLOW+=(--dev-bind "$dev" "$dev")
-  fi
-done
-
 if [ "${BENCHD_SANDBOX_VERBOSE:-}" = "1" ]; then
   echo "benchd-sandbox: identity=$IDENTITY leases=$OWNER" >&2
-  echo "benchd-sandbox: hidden (bench-owned): ${HIDDEN[*]:-none}" >&2
-  echo "benchd-sandbox: visible (not a bench): $(printf '%s ' "${ALLOW[@]}" | grep -o '/dev/tty[^ ]*' | sort -u | tr '\n' ' ')" >&2
 fi
 
-# --ro-bind / / keeps the normal filesystem; --dev /dev replaces /dev with a
-# minimal one that has no serial devices. Order matters: --dev first, then the
-# devices we are handing back.
+# /dev is passed through untouched: the devices worth hiding have already been
+# hidden by their host, and the ones left are this machine's own business.
+#
+# --tmpfs over the root first, then a bind of only this agent's directory: that
+# is what stops one agent reaching another's leases. Because the bind is of a
+# *directory*, leases appear and disappear inside a running sandbox with no
+# restart and no cooperation from the agent.
 exec bwrap \
   --ro-bind / / \
-  --dev /dev \
-  "${ALLOW[@]}" \
+  --tmpfs "$ROOT" \
   --bind "$OWNER" "$OWNER" \
-  --bind /run/benchd/agent.sock /run/benchd/agent.sock \
+  --bind "$SOCK" "$SOCK" \
   --proc /proc \
   --tmpfs /tmp \
   --bind "${HOME}" "${HOME}" \

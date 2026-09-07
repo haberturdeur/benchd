@@ -1,12 +1,13 @@
 //! Making a bench's resources reachable, and taking them back.
 //!
-//! Two cases, and the difference is where the client is:
+//! One case, whichever machine the client is on: the device is already bound to
+//! `usbip-host` (see [`crate::hide`]), so we dial the coordinator, answer the
+//! client's import request over the relayed connection, and hand the socket to
+//! the kernel. We never run `usbipd` and never listen (D5).
 //!
-//! * **Co-located** — nothing to do. The client bind-mounts the real inode, so
-//!   `export` is bookkeeping only.
-//! * **Remote** — the device is bound to `usbip-host`, we dial the coordinator,
-//!   answer the client's import request over the relayed connection, and hand
-//!   the socket to the kernel. We never run `usbipd` and never listen (D5).
+//! There is deliberately no co-located shortcut. A bench device stays hidden —
+//! stub-bound, with no tty — for the whole life of this process, so there is no
+//! local inode for a same-machine client to bind-mount even in principle.
 //!
 //! Everything is **epoch-fenced and idempotent**. A delayed instruction for a
 //! superseded lease must be dropped, not obeyed: obeying it would hand live
@@ -25,6 +26,15 @@ use tokio_util::codec::{FramedWrite, LinesCodec};
 pub struct Exports {
     spec: BenchSpec,
     coordinator: String,
+    /// Resource name -> busid, resolved *before* the bench was hidden.
+    ///
+    /// It cannot be resolved later. A serial resource is named by a tty, and
+    /// hiding takes the device off its driver so the tty and the `/dev/serial`
+    /// symlink pointing at it both disappear — leaving nothing to walk up from.
+    /// Recomputing here silently dropped every serial resource, and the bench
+    /// then exported whatever else it had while the client sat waiting on a
+    /// channel nobody was ever going to dial.
+    busids: BTreeMap<String, String>,
     /// Highest epoch seen for this bench. Anything lower is stale.
     seen: Epoch,
     active: BTreeMap<LeaseId, Active>,
@@ -41,10 +51,11 @@ struct Active {
 }
 
 impl Exports {
-    pub fn new(spec: BenchSpec, coordinator: String) -> Self {
+    pub fn new(spec: BenchSpec, coordinator: String, busids: BTreeMap<String, String>) -> Self {
         Exports {
             spec,
             coordinator,
+            busids,
             seen: Epoch(0),
             active: BTreeMap::new(),
         }
@@ -64,27 +75,11 @@ impl Exports {
         }
     }
 
-    /// Every USB busid this bench can export.
-    ///
-    /// A serial resource identified by a by-id path is resolved to its USB
-    /// device here, so a bench does not have to be written twice to work both
-    /// locally and remotely.
+    /// Every USB busid this bench can export, by resource name.
     fn busids(&self) -> Vec<(String, String)> {
-        busids_for(&self.spec).into_iter().collect()
-    }
-
-    #[allow(dead_code)]
-    fn unused_busids(&self) -> Vec<(String, String)> {
-        self.spec
-            .resources
+        self.busids
             .iter()
-            .filter_map(|(name, r)| {
-                let busid = match r {
-                    Resource::Usb { busid } => Some(busid.clone()),
-                    Resource::Serial { path, .. } => busid_for_tty(path),
-                }?;
-                Some((name.clone(), busid))
-            })
+            .map(|(name, busid)| (name.clone(), busid.clone()))
             .collect()
     }
 
@@ -111,19 +106,6 @@ impl Exports {
             return Outcome::Ok; // idempotent: a retry is not an error
         }
 
-        if channels.is_empty() {
-            tracing::info!(bench = %self.spec.id, %lease, ?epoch, "exported (co-located)");
-            self.active.insert(
-                lease,
-                Active {
-                    epoch,
-                    session,
-                    exported: Vec::new(),
-                },
-            );
-            return Outcome::Ok;
-        }
-
         let busids = self.busids();
         if busids.is_empty() {
             return Outcome::Failed {
@@ -135,8 +117,17 @@ impl Exports {
             };
         }
 
+        // One device, one export, however many resources name it. A USB-SD-Mux
+        // is two resources — the SCSI node that switches the card and the block
+        // node that holds it — but USB/IP forwards whole devices, so binding it
+        // twice would fail on the second attempt and minting two channels would
+        // leave one of them with nobody to pair with.
         let mut exported = Vec::new();
+        let mut seen: std::collections::BTreeSet<&str> = Default::default();
         for (resource, busid) in &busids {
+            if !seen.insert(busid.as_str()) {
+                continue;
+            }
             // The coordinator minted this key and gave the same one to the
             // client; it is random rather than derived, so nobody else can
             // guess it and race us to the rendezvous.
@@ -309,6 +300,13 @@ pub async fn recover_orphans(spec: &BenchSpec) {
         if !wanted.iter().any(|path| path.contains(&serial)) {
             continue;
         }
+        // A copy of this bench forwarded back to it carries the same serial as
+        // the board itself, so matching on serial alone finds both. Recovering
+        // the copy would at best waste the re-probe budget on a device that is
+        // about to disappear, and at worst report the wrong thing.
+        if sysfs::is_forwarded_busid(&busid) {
+            continue;
+        }
         if sysfs::is_bound(&busid) {
             tracing::warn!(
                 %busid, %serial,
@@ -338,7 +336,7 @@ pub fn busids_for(spec: &BenchSpec) -> BTreeMap<String, String> {
         .iter()
         .filter_map(|(name, r)| {
             let busid = match r {
-                Resource::Usb { busid } => Some(busid.clone()),
+                Resource::Usb { busid, .. } => Some(busid.clone()),
                 Resource::Serial { path, .. } => busid_for_tty(path),
             }?;
             Some((name.clone(), busid))
@@ -352,25 +350,19 @@ pub fn busids_for(spec: &BenchSpec) -> BTreeMap<String, String> {
 /// its parent, and the busid is the part before the colon.
 fn busid_for_tty(path: &std::path::Path) -> Option<String> {
     let tty = std::fs::canonicalize(path).ok()?;
-    let name = tty.file_name()?.to_str()?;
-    let mut dir = std::fs::canonicalize(format!("/sys/class/tty/{name}/device")).ok()?;
-
-    // Walk up until we reach the USB *device*, identified by carrying `busnum`.
-    //
-    // The depth is not fixed. A CDC-ACM tty hangs off the interface, one level
-    // below the device; a USB-serial bridge inserts a `usb-serial` port node, so
-    // the device is two levels up. Assuming one level resolved ESP32s correctly
-    // and returned nothing for CP2102s — which made the liveness watcher fall
-    // back to polling the tty, and a tty vanishes the moment the bench is
-    // exported for a remote lease, so every relayed lease on such a bench was
-    // torn down within seconds as "device lost".
-    for _ in 0..6 {
-        if dir.join("busnum").exists() {
-            return dir.file_name()?.to_str().map(str::to_string);
-        }
-        dir = dir.parent()?.to_path_buf();
+    let dir = sysfs::usb_device_of_tty(&tty)?;
+    // Registration refuses a forwarded device already, so reaching here means
+    // one appeared under a name this bench had resolved. Nothing good can be
+    // done with it: binding the stub to a virtual device would leave the real
+    // board untouched, so treat it as no busid at all.
+    if sysfs::is_forwarded(&dir) {
+        tracing::warn!(
+            path = %path.display(),
+            "this resource resolves to a device forwarded over USB/IP, not to local hardware"
+        );
+        return None;
     }
-    None
+    dir.file_name()?.to_str().map(str::to_string)
 }
 
 /// Read a bound device's descriptors out of sysfs.

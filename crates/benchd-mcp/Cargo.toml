@@ -6,10 +6,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "benchd-mcp"
-path = "src/main.rs"
-
 [dependencies]
 benchd-core = { workspace = true }
 serde = { workspace = true }

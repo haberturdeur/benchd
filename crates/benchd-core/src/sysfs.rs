@@ -12,9 +12,11 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, IntoRawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tokio::net::TcpStream;
+
+use crate::wire::WantedNode;
 
 const STUB: &str = "/sys/bus/usb/drivers/usbip-host";
 const VHCI: &str = "/sys/devices/platform/vhci_hcd.0";
@@ -75,8 +77,19 @@ pub async fn unbind(busid: &str) {
     // leaves a live socket attached to a device we no longer own.
     let _ = write_sysfs(stub_path(busid).join("usbip_sockfd"), "-1").await;
     let _ = write_sysfs(format!("{STUB}/unbind"), busid).await;
+    // Dropped even when the board is gone: the entry is what makes the stub
+    // claim a device the moment it appears, so leaving it behind means a
+    // replugged board comes back with no tty and cannot be resolved.
     let _ = write_sysfs(format!("{STUB}/match_busid"), &format!("del {busid}")).await;
-    reattach(busid).await;
+    // Nothing to probe for a device that is no longer plugged in, and
+    // `reattach` would spend its whole retry budget failing before logging an
+    // error about a board that is simply absent.
+    if tokio::fs::metadata(format!("/sys/bus/usb/devices/{busid}"))
+        .await
+        .is_ok()
+    {
+        reattach(busid).await;
+    }
 }
 
 /// Put a device back under its normal driver.
@@ -131,9 +144,12 @@ async fn has_driver(busid: &str) -> bool {
 
 /// Whether this device currently presents a serial port.
 pub async fn has_tty(busid: &str) -> bool {
-    tty_under(&PathBuf::from(format!("/sys/bus/usb/devices/{busid}")))
-        .await
-        .is_some()
+    tty_under(
+        &PathBuf::from(format!("/sys/bus/usb/devices/{busid}")),
+        None,
+    )
+    .await
+    .is_some()
 }
 
 /// Every USB device on the system, as `(busid, serial)`.
@@ -155,6 +171,85 @@ pub async fn devices_by_serial() -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// The sysfs directory of the USB device behind a `/dev/tty*` node.
+///
+/// The depth is not fixed. A CDC-ACM tty hangs off the interface, one level
+/// below the device; a USB-serial bridge inserts a `usb-serial` port node, so
+/// the device is two levels up. Assuming one level resolved ESP32s correctly
+/// and returned nothing for CP2102s — which made the liveness watcher fall back
+/// to polling the tty, and a tty vanishes the moment the bench is exported for
+/// a remote lease, so every relayed lease on such a bench was torn down within
+/// seconds as "device lost". `busnum` is the marker that says we have arrived:
+/// interfaces and port nodes do not carry it, the device does.
+pub fn usb_device_of_tty(tty: &Path) -> Option<PathBuf> {
+    let name = tty.file_name()?.to_str()?;
+    let mut dir = std::fs::canonicalize(format!("/sys/class/tty/{name}/device")).ok()?;
+    for _ in 0..6 {
+        if dir.join("busnum").exists() {
+            return Some(dir);
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
+}
+
+/// Which USB interface a `/dev/tty*` node hangs off.
+///
+/// A device with one serial port does not need this. A device with two does:
+/// on an FT2232H the channels are interfaces 0 and 1, and on a WROVER-KIT one
+/// of them is the JTAG channel and the other is the console. The host records
+/// this while the tty still exists, so that after a USB/IP import the client
+/// can pick the same port again instead of whichever the kernel lists first.
+///
+/// `bInterfaceNumber` is hex-formatted in sysfs, so interface 10 reads `0a`.
+pub fn usb_interface_of_tty(tty: &Path) -> Option<u8> {
+    let name = tty.file_name()?.to_str()?;
+    let mut dir = std::fs::canonicalize(format!("/sys/class/tty/{name}/device")).ok()?;
+    for _ in 0..6 {
+        if let Ok(text) = std::fs::read_to_string(dir.join("bInterfaceNumber")) {
+            return u8::from_str_radix(text.trim(), 16).ok();
+        }
+        // `busnum` marks the device itself: we have walked past every
+        // interface without finding one, so there is nothing to report.
+        if dir.join("busnum").exists() {
+            return None;
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
+}
+
+/// Whether a device directory belongs to hardware forwarded in over USB/IP
+/// rather than to something plugged into this machine.
+///
+/// A forwarded device is a faithful copy: same vendor, same product, same
+/// serial, and so the same `/dev/serial/by-id` name as the board it came from.
+/// Harmless when it lands on another machine, dangerous when it lands on this
+/// one — a host whose bench is imported back over loopback can resolve its own
+/// copy instead of the board, and would then hide a phantom while leaving the
+/// real device on its driver, visible to everything the hiding exists to keep
+/// it from. Benches declared `by_path` never hit this; a virtual device has a
+/// different physical path.
+///
+/// Matched on the path component rather than against the full `vhci_hcd.0`
+/// path, because a second vhci instance is `vhci_hcd.1` and failing to
+/// recognise one means stubbing a device that is not really there.
+pub fn is_forwarded(dir: &Path) -> bool {
+    dir.components().any(|part| {
+        part.as_os_str()
+            .to_str()
+            .is_some_and(|s| s.starts_with("vhci_hcd"))
+    })
+}
+
+/// [`is_forwarded`], for a device already known by bus id.
+pub fn is_forwarded_busid(busid: &str) -> bool {
+    std::fs::canonicalize(format!("/sys/bus/usb/devices/{busid}"))
+        .as_deref()
+        .map(is_forwarded)
+        .unwrap_or(false)
 }
 
 /// Hand a connected socket to the stub driver for `busid`.
@@ -274,22 +369,24 @@ pub async fn attached_ports() -> Vec<u32> {
         .collect()
 }
 
-/// Wait for the serial device a freshly imported device produces, on `port`.
+/// Wait for a device node that a freshly imported device produces, on `port`.
 ///
 /// The kernel enumerates asynchronously, so nothing exists the instant `attach`
 /// returns.
 ///
-/// **Found by sysfs position, not by diffing `/dev/serial/by-id`.** A by-id name
-/// is built from vendor, product and serial number, so a device imported from
-/// another machine can produce *exactly* the name of one that just disappeared
-/// locally — which is precisely what happens when a bench is forwarded back to
-/// the machine it lives on. Diffing sees nothing; the port tells the truth.
+/// **Found by sysfs position, not by name.** A by-id name is built from vendor,
+/// product and serial number, so a device imported from another machine can
+/// produce *exactly* the name of one that just disappeared locally — which is
+/// what happens when a bench is forwarded back to the machine it lives on.
+/// Names are worse still for storage: the client machine very likely has a
+/// `/dev/sda` of its own. The port tells the truth.
 ///
 /// vhci exposes two root hubs, high speed and super speed. A device on rhport
 /// `p` of a hub whose bus is `b` enumerates as `b-(p+1)`.
-pub async fn wait_for_vhci_tty(
+pub async fn wait_for_vhci_node(
     port: u32,
     speed: u32,
+    want: WantedNode,
     timeout: std::time::Duration,
 ) -> Option<PathBuf> {
     let super_speed = speed >= 5;
@@ -300,10 +397,16 @@ pub async fn wait_for_vhci_tty(
             let device = PathBuf::from(VHCI)
                 .join(format!("usb{bus}"))
                 .join(format!("{bus}-{}", port + 1));
-            if let Some(tty) = tty_under(&device).await {
-                // Let udev finish applying permissions before anyone opens it.
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                return Some(tty);
+            if let Some(name) = node_under(&device, want).await {
+                // sysfs gains the node before udev creates it under /dev, so a
+                // name with nothing behind it yet just means "not ready"; the
+                // loop comes back for it.
+                let path = PathBuf::from("/dev").join(name);
+                if tokio::fs::metadata(&path).await.is_ok() {
+                    // Let udev finish applying permissions before anyone opens it.
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    return Some(path);
+                }
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -353,16 +456,41 @@ async fn read_num(path: &std::path::Path) -> Result<u32, ()> {
         .map_err(|_| ())
 }
 
-/// Find the `/dev/tty*` belonging to a USB device, via its interfaces.
+/// The name of the `/dev` node a device offers, as sysfs sees it.
+///
+/// Returns a bare name (`ttyACM0`, `sda`) rather than a path, because sysfs is
+/// the only thing being consulted; whether `/dev` has caught up is a separate
+/// question with a separate answer.
+async fn node_under(device: &std::path::Path, want: WantedNode) -> Option<std::ffi::OsString> {
+    match want {
+        WantedNode::Tty { interface } => tty_under(device, interface).await,
+        WantedNode::Block => class_node_under(device, "block").await,
+        WantedNode::Scsi => class_node_under(device, "scsi_generic").await,
+    }
+}
+
+/// Find the tty belonging to a USB device, via its interfaces.
 ///
 /// The layout is `<device>/<device>:<cfg>.<n>/tty/ttyACM0` for CDC-ACM and a
 /// direct `ttyUSB0` entry for most bridge chips, so both are handled. Every step
 /// fails independently: a device has many attribute files that are not
 /// directories, and one of them must not end the search.
-async fn tty_under(device: &std::path::Path) -> Option<PathBuf> {
+///
+/// `interface` narrows the search to one interface, and matters whenever a
+/// device has more than one serial port — on an FT2232H the two channels are
+/// interfaces 0 and 1, and on a WROVER-KIT one is JTAG and the other is the
+/// console, so taking whichever `readdir` yields first is a coin toss. Nothing
+/// falls back to the other interface when the wanted one has no tty: that would
+/// restore exactly the ambiguity the number exists to remove.
+async fn tty_under(device: &std::path::Path, interface: Option<u8>) -> Option<std::ffi::OsString> {
     let mut interfaces = tokio::fs::read_dir(device).await.ok()?;
-    while let Ok(Some(interface)) = interfaces.next_entry().await {
-        let Ok(mut children) = tokio::fs::read_dir(interface.path()).await else {
+    while let Ok(Some(entry)) = interfaces.next_entry().await {
+        if let Some(want) = interface {
+            if interface_number(&entry.path()).await != Some(want) {
+                continue;
+            }
+        }
+        let Ok(mut children) = tokio::fs::read_dir(entry.path()).await else {
             continue;
         };
         while let Ok(Some(child)) = children.next_entry().await {
@@ -373,16 +501,59 @@ async fn tty_under(device: &std::path::Path) -> Option<PathBuf> {
                     continue;
                 };
                 if let Ok(Some(entry)) = inner.next_entry().await {
-                    let dev = PathBuf::from("/dev").join(entry.file_name());
-                    if tokio::fs::metadata(&dev).await.is_ok() {
-                        return Some(dev);
-                    }
+                    return Some(entry.file_name());
                 }
             } else if name.starts_with("ttyUSB") || name.starts_with("ttyACM") {
-                let dev = PathBuf::from("/dev").join(name);
-                if tokio::fs::metadata(&dev).await.is_ok() {
-                    return Some(dev);
+                return Some(child.file_name());
+            }
+        }
+    }
+    None
+}
+
+/// The interface number of a `<device>:<cfg>.<n>` directory, if it is one.
+async fn interface_number(dir: &std::path::Path) -> Option<u8> {
+    let text = tokio::fs::read_to_string(dir.join("bInterfaceNumber"))
+        .await
+        .ok()?;
+    u8::from_str_radix(text.trim(), 16).ok()
+}
+
+/// Find the name under the first `<class>/` directory in a device's subtree —
+/// `block` for `sda`, `scsi_generic` for `sg0`.
+///
+/// Searched rather than addressed by a fixed path because the depth is not
+/// fixed: a USB mass-storage node sits at `<intf>/host0/target0:0:0/0:0:0:0/`,
+/// and the host, target and lun numbers are all assigned at enumeration.
+///
+/// The walk never follows symlinks. `read_dir` reports a symlink as such rather
+/// than as a directory, and sysfs is full of back-references (`subsystem`,
+/// `driver`, `device`) that would otherwise turn this into a cycle.
+async fn class_node_under(device: &std::path::Path, class: &str) -> Option<std::ffi::OsString> {
+    // Enough for the mass-storage layout above with room to spare; a bound is
+    // what keeps a surprising topology from turning into an unbounded walk.
+    const MAX_DEPTH: usize = 6;
+
+    let mut queue = vec![(device.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = queue.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if name == class {
+                let Ok(mut inner) = tokio::fs::read_dir(entry.path()).await else {
+                    continue;
+                };
+                if let Ok(Some(node)) = inner.next_entry().await {
+                    return Some(node.file_name());
                 }
+            } else if depth < MAX_DEPTH {
+                queue.push((entry.path(), depth + 1));
             }
         }
     }
@@ -391,7 +562,124 @@ async fn tty_under(device: &std::path::Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_padded;
+    use super::{is_forwarded, node_under, parse_padded};
+    use crate::wire::WantedNode;
+    use std::path::Path;
+
+    /// Build a directory tree, and write `bInterfaceNumber` for anything that
+    /// looks like a USB interface, the way sysfs does.
+    fn fake_sysfs(paths: &[&str]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for path in paths {
+            let mut dir = root.path().to_path_buf();
+            for part in path.split('/') {
+                dir.push(part);
+                std::fs::create_dir_all(&dir).unwrap();
+                // Interfaces are named `<busid>:<cfg>.<n>`, and sysfs prints
+                // the number in hex.
+                if let Some(n) = part
+                    .split_once(':')
+                    .and_then(|(_, config)| config.split_once('.'))
+                    .and_then(|(_, n)| n.parse::<u8>().ok())
+                {
+                    std::fs::write(dir.join("bInterfaceNumber"), format!("{n:02x}\n")).unwrap();
+                }
+            }
+        }
+        root
+    }
+
+    /// The WROVER-KIT: an FT2232H whose two channels are both serial ports, one
+    /// wired to JTAG and one to the console. Picking by directory order gets it
+    /// right half the time, which is the bug the interface number exists to fix.
+    #[tokio::test]
+    async fn the_interface_number_picks_one_tty_of_two() {
+        let root = fake_sysfs(&["1-1/1-1:1.0/ttyUSB0", "1-1/1-1:1.1/ttyUSB1"]);
+        let device = root.path().join("1-1");
+
+        let console = node_under(&device, WantedNode::Tty { interface: Some(1) }).await;
+        assert_eq!(console.as_deref(), Some("ttyUSB1".as_ref()));
+        let jtag = node_under(&device, WantedNode::Tty { interface: Some(0) }).await;
+        assert_eq!(jtag.as_deref(), Some("ttyUSB0".as_ref()));
+    }
+
+    /// Better nothing than the wrong board's console.
+    #[tokio::test]
+    async fn an_interface_with_no_tty_does_not_fall_back_to_the_other() {
+        let root = fake_sysfs(&["1-1/1-1:1.0/ttyUSB0", "1-1/1-1:1.1"]);
+        let device = root.path().join("1-1");
+        assert_eq!(
+            node_under(&device, WantedNode::Tty { interface: Some(1) }).await,
+            None
+        );
+    }
+
+    /// A CDC-ACM tty sits one level deeper than a bridge chip's, and a bench
+    /// with a single port names no interface at all.
+    #[tokio::test]
+    async fn a_lone_tty_is_found_without_being_asked_for_by_interface() {
+        let root = fake_sysfs(&["3-2/3-2:1.0/tty/ttyACM0"]);
+        let device = root.path().join("3-2");
+        assert_eq!(
+            node_under(&device, WantedNode::Tty { interface: None })
+                .await
+                .as_deref(),
+            Some("ttyACM0".as_ref())
+        );
+    }
+
+    /// The USB-SD-Mux: one device, two nodes, and the host, target and lun
+    /// numbers in between are assigned at enumeration, so the depth cannot be
+    /// hard-coded.
+    #[tokio::test]
+    async fn a_mass_storage_device_offers_both_its_block_and_its_scsi_node() {
+        let root = fake_sysfs(&[
+            "3-1.1/3-1.1:1.0/host4/target4:0:0/4:0:0:0/block/sda",
+            "3-1.1/3-1.1:1.0/host4/target4:0:0/4:0:0:0/scsi_generic/sg0",
+            "3-1.1/power",
+        ]);
+        let device = root.path().join("3-1.1");
+
+        assert_eq!(
+            node_under(&device, WantedNode::Block).await.as_deref(),
+            Some("sda".as_ref())
+        );
+        assert_eq!(
+            node_under(&device, WantedNode::Scsi).await.as_deref(),
+            Some("sg0".as_ref())
+        );
+        // And a device that is not storage does not acquire storage nodes.
+        let plain = fake_sysfs(&["1-1/1-1:1.0/ttyUSB0"]);
+        assert_eq!(
+            node_under(&plain.path().join("1-1"), WantedNode::Block).await,
+            None
+        );
+    }
+
+    /// The property that keeps a host from hiding a phantom.
+    ///
+    /// A bench imported back to the machine it lives on presents a second
+    /// device with the same serial, and therefore the same by-id name, as the
+    /// board itself. The two are told apart by where they sit in sysfs and by
+    /// nothing else.
+    #[test]
+    fn a_device_forwarded_over_usbip_is_not_local_hardware() {
+        assert!(is_forwarded(Path::new(
+            "/sys/devices/platform/vhci_hcd.0/usb9/9-1"
+        )));
+        // A second vhci instance is just as virtual as the first.
+        assert!(is_forwarded(Path::new(
+            "/sys/devices/platform/vhci_hcd.1/usb11/11-2"
+        )));
+        // Real hardware hangs off a PCI controller.
+        assert!(!is_forwarded(Path::new(
+            "/sys/devices/pci0000:00/0000:00:14.0/usb3/3-2/3-2.1"
+        )));
+        // Nothing else on the platform bus is vhci.
+        assert!(!is_forwarded(Path::new(
+            "/sys/devices/platform/xhci-hcd.0/usb1/1-1"
+        )));
+    }
 
     /// The real table lists both root hubs together.
     const STATUS: &str = "\

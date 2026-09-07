@@ -6,6 +6,15 @@
 #
 # Note the ordering: bare keys must precede the first [table], or TOML folds them
 # into it.
+#
+# The vocabulary is in three parts, and keeping them apart is what stops a bench
+# advertising hardware it cannot provide (D10):
+#
+#   SILICON     what the chip is. Implied from soc=, because a chip identity
+#               settles these unconditionally.
+#   BOARD BUILD what was fitted to this particular board. Declared per bench.
+#   WIRING      how this bench reaches its host. Declared per bench, never
+#               implied - no chip identity can know how a board was cabled.
 
 open_keys = ["name"]
 
@@ -14,6 +23,12 @@ max_ttl        = 900     # longest single grant, seconds
 max_total_hold = 7200    # sum across renewals
 max_benches    = 2       # concurrent benches per session
 grace          = 30      # warning window before teardown
+
+# --- SILICON ---------------------------------------------------------------
+# What the chip is. The only implications in the vocabulary live here, because
+# these are the only relations that hold unconditionally and that earn the
+# central curation they cost: one soc= tag stands in for four, on every board in
+# the lab. See D10.
 
 [tags.soc]
 description = "System-on-chip on the board"
@@ -24,11 +39,11 @@ weight = 0
 description = "Original ESP32, Xtensa dual-core"
 implies = ["family=esp32", "arch=xtensa", "net=wifi", "net=bt"]
 [tags.soc.values.esp32s3]
-description = "ESP32-S3, Xtensa dual-core with native USB"
-implies = ["family=esp32", "arch=xtensa", "net=wifi", "net=bt", "jtag=builtin", "usb=native"]
+description = "ESP32-S3, Xtensa dual-core"
+implies = ["family=esp32", "arch=xtensa", "net=wifi", "net=bt"]
 [tags.soc.values.esp32c3]
-description = "ESP32-C3, RISC-V single core with native USB"
-implies = ["family=esp32", "arch=riscv", "net=wifi", "net=bt", "jtag=builtin", "usb=native"]
+description = "ESP32-C3, RISC-V single core"
+implies = ["family=esp32", "arch=riscv", "net=wifi", "net=bt"]
 
 [tags.family]
 description = "SoC family (implied by soc=, rarely set directly)"
@@ -44,14 +59,6 @@ description = "Tensilica Xtensa"
 [tags.arch.values.riscv]
 description = "RISC-V"
 
-[tags.usb]
-description = "How the board attaches to USB"
-weight = 0
-[tags.usb.values.native]
-description = "SoC's own USB peripheral"
-[tags.usb.values.cp2102n]
-description = "Silicon Labs CP2102N USB-UART bridge"
-
 [tags.net]
 description = "Radios available on the board"
 [tags.net.values.wifi]
@@ -59,17 +66,16 @@ description = "2.4GHz Wi-Fi"
 [tags.net.values.bt]
 description = "Bluetooth / BLE"
 
-[tags.jtag]
-description = "Debug interface"
-[tags.jtag.values.builtin]
-description = "USB-JTAG built into the SoC, no external probe needed"
-[tags.jtag.values.external]
-description = "External JTAG probe wired to the bench"
+# --- BOARD BUILD -----------------------------------------------------------
+# What was fitted to this particular board. Two boards carrying the same SoC
+# differ here, so none of it can be implied from soc=.
 
 [tags.psram]
 description = "External PSRAM fitted"
 [tags.psram.values.none]
 description = "No PSRAM"
+[tags.psram.values.quad]
+description = "Quad-SPI PSRAM"
 [tags.psram.values.octal]
 description = "Octal-SPI PSRAM"
 
@@ -79,4 +85,60 @@ description = "Flash size"
 description = "4 MiB"
 [tags.flash.values."8mb"]
 description = "8 MiB"
+[tags.flash.values."16mb"]
+description = "16 MiB"
+
+[tags.peripheral]
+description = "Extra chips fitted to the board, beyond the SoC itself"
+# Qualified: a bench may name the exact part, as peripheral=accel[mpu6050]. The
+# category is curated here because that is what agents match on; the part is
+# not, because keeping a central list of every accelerometer that exists is a
+# losing game and the person looking at the board already knows. A bench
+# declaring a qualified value carries the bare category too, so a request for
+# either is satisfied.
+qualified = true
+[tags.peripheral.values.nand]
+description = "NAND flash, separate from the SoC's boot flash"
+[tags.peripheral.values.sdcard]
+description = "SD card slot wired to the SoC"
+[tags.peripheral.values.accel]
+description = "Accelerometer"
+[tags.peripheral.values.gps]
+description = "GNSS receiver"
+
+# --- WIRING ----------------------------------------------------------------
+# How this bench reaches its host. Never implied: an ESP32-S3 has a USB-JTAG
+# peripheral whatever else is true, but whether *this* bench can use it depends
+# on which socket the cable is in. Letting soc= assert that was the bug D10 now
+# exists to prevent.
+
+[tags.console]
+description = "How this bench's console reaches the host"
+# weight 0, like the other identity keys: the capability a USB-JTAG console
+# brings is priced by jtag= below, and charging for it twice would make the
+# better-connected board look scarcer than it is.
+weight = 0
+[tags.console.values.uart]
+description = "A UART bridge chip; serial console only"
+[tags.console.values.usbjtag]
+description = "The SoC's own USB-JTAG/serial peripheral: console and debug on one cable"
+
+[tags.jtag]
+description = "Debug access this bench actually provides"
+# A bench without debug access simply omits this key. There is deliberately no
+# jtag=none: an absent capability is not a capability, and declaring one would
+# have the matcher price it like a real one.
+[tags.jtag.values.builtin]
+description = "USB-JTAG built into the SoC and reachable on this bench"
+[tags.jtag.values.external]
+description = "External JTAG probe wired to the bench"
+
+[tags.sdmux]
+description = "Whether the SD card can be moved between the DUT and the host without hands"
+# Distinct from peripheral=sdcard, which says only that a slot exists. A slot an
+# agent cannot load is a slot it cannot use, and the difference is the whole
+# point of the hardware: without a mux, testing a card image means a human
+# walking over and swapping it.
+[tags.sdmux.values.usb]
+description = "A USB-attached SD mux; the card is switched by a command from the host"
 

@@ -34,12 +34,18 @@ Call `tag_list` first. It returns capability tags with how many benches have eac
 and how many are free:
 
 ```
-soc=esp32s3    3 benches, 1 free    "ESP32-S3, Xtensa dual-core with native USB"
-psram=octal    1 bench,  1 free     "Octal-SPI PSRAM"
-jtag=builtin   3 benches, 1 free    "USB-JTAG built into the SoC"
+soc=esp32s3               3 benches, 1 free    "ESP32-S3, Xtensa dual-core"
+psram=octal               1 bench,  1 free     "Octal-SPI PSRAM"
+jtag=builtin              2 benches, 1 free    "USB-JTAG built into the SoC and reachable on this bench"
+peripheral=accel          2 benches, 2 free    "Accelerometer"
+peripheral=accel[mpu6050] 1 bench,  1 free     "Accelerometer"
 ```
 
 If what you need is scarce, that is worth knowing before you ask for it.
+
+Some tags name a specific part in brackets. Ask for the bare category
+(`peripheral=accel`) unless your test really depends on that exact chip — asking for
+`peripheral=accel[mpu6050]` will not be satisfied by any other accelerometer.
 
 ### 2. Claim what you need, and no more
 
@@ -81,7 +87,14 @@ The reply gives you an environment-variable name and a path per resource:
 ```
 lease 7 — expires at 1788266909 (unix seconds)
   LAB_DUT_CONSOLE = /run/benchd/agent-3-s1/l7/dut/console
+
+--- notes for slot dut ---
+GPIO4 drives the LED; GPIO5 is wired to the peer's GPIO18.
 ```
+
+**Read the notes if there are any.** They are written by whoever wired the bench
+up and describe things you cannot discover from the board: pinout, jumpers, what
+is connected to what. They only appear for the bench you were actually granted.
 
 That is a real character device. Everything works as usual:
 
@@ -90,6 +103,18 @@ esptool --port "$LAB_DUT_CONSOLE" write-flash 0x0 firmware.bin
 idf.py -p "$LAB_DUT_CONSOLE" monitor
 minicom -D "$LAB_DUT_CONSOLE"
 ```
+
+Not every resource is a console. A bench may also hand you a block device or a
+SCSI node, and the notes say what each one is for — a bench with a switchable SD
+card gives you both, one to move the card and one to write it:
+
+```sh
+dd if=image.img of="$LAB_DUT_SDCARD" bs=4M conv=fsync
+```
+
+A few tools identify a device by the *name* of the path rather than by the
+device behind it, and those need the kernel's own node. The bench notes say so
+where it applies and give you the line to resolve it; nothing else does.
 
 Use the path verbatim. Do not resolve it to whatever `/dev` node it points at, and
 do not reuse a path from an earlier lease — the id in the path changes every time,

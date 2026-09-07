@@ -4,7 +4,7 @@ Documentation=https://github.com/tom/benchd
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/benchd-coordinator --config /etc/benchd/coordinator.toml
+ExecStart=/usr/local/bin/benchd coordinator --config /etc/benchd/coordinator.toml
 Restart=always
 RestartSec=3
 # Stateless by design (D6): a restart releases every lease, so there is nothing

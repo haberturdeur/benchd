@@ -8,6 +8,7 @@
 
 mod conn;
 mod handlers;
+pub mod operator;
 mod relay;
 mod state;
 
@@ -23,8 +24,7 @@ use tokio::sync::Mutex;
 use crate::state::State;
 
 #[derive(Parser)]
-#[command(name = "benchd-coordinator", about = "benchd coordinator daemon")]
-struct Args {
+pub struct CoordinatorArgs {
     /// Address to listen on.
     #[arg(long, default_value_t = format!("0.0.0.0:{DEFAULT_PORT}"))]
     listen: String,
@@ -37,11 +37,6 @@ struct Args {
     /// How often to check for expiring leases.
     #[arg(long, default_value_t = 1)]
     tick_seconds: u64,
-
-    /// Treat every bench as remote, forwarding devices over USB/IP even when the
-    /// host and client share a machine. Exercises the remote path on one box.
-    #[arg(long)]
-    force_relay: bool,
 
     /// Write the address actually bound to this file, then continue. Useful
     /// with `--listen 127.0.0.1:0`, where the kernel chooses the port.
@@ -69,17 +64,7 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "benchd_coordinator=info".into()),
-        )
-        .init();
-
-    let args = Args::parse();
-
+pub async fn run(args: CoordinatorArgs) -> Result<()> {
     let text = std::fs::read_to_string(&args.config)
         .with_context(|| format!("failed to read {}", args.config))?;
     let raw: toml::Value =
@@ -107,11 +92,7 @@ async fn main() -> Result<()> {
         "limits"
     );
 
-    let mut state = State::new(limits, vocabulary);
-    state.force_relay = args.force_relay;
-    if args.force_relay {
-        tracing::warn!("--force-relay: every bench will be forwarded over USB/IP");
-    }
+    let state = State::new(limits, vocabulary);
     let shared = Arc::new(Shared {
         state: Mutex::new(state),
         relay: Arc::new(crate::relay::Relay::default()),

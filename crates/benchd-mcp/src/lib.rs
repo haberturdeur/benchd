@@ -5,11 +5,14 @@
 //! would use it instead of `idf.py monitor` and you would get two access paths
 //! with split logs. If claim-by-name existed, an agent would hardcode a bench
 //! into a test script and reintroduce the contention this system removes. Both
-//! live in the operator CLI, which is a different program.
+//! live in the operator subcommands, which an agent is never handed.
 //!
 //! Unprivileged. One process per agent, because MCP over stdio is a pipe pair
 //! and the harness spawns the server (D8). All privilege lives in the client
 //! daemon on the other end of the unix socket.
+//!
+//! **stdout belongs to the transport.** Anything written there that is not
+//! JSON-RPC corrupts the session, which is why the dispatcher logs to stderr.
 
 mod daemon;
 
@@ -26,8 +29,7 @@ use serde::Deserialize;
 use crate::daemon::Daemon;
 
 #[derive(Parser)]
-#[command(name = "benchd-mcp", about = "benchd MCP server (one per agent)")]
-struct Args {
+pub struct McpArgs {
     /// The local client daemon's socket.
     #[arg(long, default_value = "/run/benchd/agent.sock", env = "BENCHD_SOCKET")]
     socket: String,
@@ -173,6 +175,17 @@ impl Benchd {
                 }
             }
         }
+        // Whoever wired the bench up wrote these notes: pinout, jumpers, what
+        // is connected to what. There is no other way for an agent to learn it,
+        // and guessing a pinout costs a lot more context than reading one.
+        if let Some(docs) = value.get("docs").and_then(|v| v.as_object()) {
+            for (slot, body) in docs {
+                let Some(body) = body.as_str() else { continue };
+                lines.push(String::new());
+                lines.push(format!("--- notes for slot {slot} ---"));
+                lines.push(body.trim_end().to_string());
+            }
+        }
         lines.push(String::new());
         lines.push(
             "If a device later gives ENOENT or EIO, your lease ended — claim again. \
@@ -265,18 +278,7 @@ fn internal(err: anyhow::Error) -> ErrorData {
     ErrorData::internal_error(err.to_string(), None)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // stderr, never stdout: stdout is the MCP transport.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "benchd_mcp=info".into()),
-        )
-        .init();
-
-    let args = Args::parse();
+pub async fn run(args: McpArgs) -> anyhow::Result<()> {
     let identity = args.identity.clone().unwrap_or_else(derive_identity);
     let daemon = Daemon::connect(&args.socket, &identity).await?;
     tracing::info!(%identity, "registered");

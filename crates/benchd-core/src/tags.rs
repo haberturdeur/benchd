@@ -79,6 +79,29 @@ impl Tag {
         }
         Ok(Tag::new(key, value))
     }
+
+    /// The value with any qualifier stripped: `accel` for `accel[mpu6050]`.
+    pub fn base(&self) -> &str {
+        match self.value.split_once('[') {
+            Some((base, _)) => base,
+            None => &self.value,
+        }
+    }
+
+    /// The free-form part identity inside the brackets, if there is one.
+    ///
+    /// A qualifier says *which* accelerometer a board carries without the
+    /// vocabulary having to know every accelerometer that exists. The category
+    /// is curated centrally because agents match on it; the part is asserted by
+    /// whoever is looking at the board, who is the only one who reliably knows.
+    pub fn qualifier(&self) -> Option<&str> {
+        self.value.split_once('[')?.1.strip_suffix(']')
+    }
+
+    /// This tag with its qualifier removed.
+    pub fn base_tag(&self) -> Tag {
+        Tag::new(self.key.clone(), self.base())
+    }
 }
 
 impl fmt::Display for Tag {
@@ -96,7 +119,22 @@ fn valid_key(key: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// A value, optionally carrying a `[qualifier]`.
+///
+/// Both halves obey the same character rules rather than the brackets loosening
+/// them: `accel[mpu6050]` is two ordinary values with a separator, not a new
+/// kind of string.
 fn valid_value(value: &str) -> bool {
+    match value.split_once('[') {
+        None => valid_plain(value),
+        Some((base, rest)) => match rest.strip_suffix(']') {
+            Some(qualifier) => valid_plain(base) && valid_plain(qualifier),
+            None => false,
+        },
+    }
+}
+
+fn valid_plain(value: &str) -> bool {
     let mut chars = value.chars();
     match chars.next() {
         Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
@@ -175,6 +213,13 @@ pub struct Vocabulary {
     /// Prose for each key, surfaced by the `tag_list` tool. Agents match on
     /// descriptions, so these are load-bearing, not decoration.
     key_descriptions: BTreeMap<String, String>,
+    /// Keys whose values may carry a free-form `[qualifier]`.
+    ///
+    /// Opt-in per key, so a qualifier is only legal where the vocabulary says a
+    /// value names a *category* with parts underneath it. Without the opt-in
+    /// `flash=8mb[whatever]` would quietly become a legal tag that matched
+    /// nothing anyone would think to ask for.
+    qualified_keys: BTreeSet<String>,
 }
 
 impl Default for Vocabulary {
@@ -184,6 +229,7 @@ impl Default for Vocabulary {
             open_keys: ["name".to_string()].into_iter().collect(),
             key_weights: BTreeMap::new(),
             key_descriptions: BTreeMap::new(),
+            qualified_keys: BTreeSet::new(),
         }
     }
 }
@@ -194,12 +240,14 @@ impl Vocabulary {
         open_keys: BTreeSet<String>,
         key_weights: BTreeMap<String, f64>,
         key_descriptions: BTreeMap<String, String>,
+        qualified_keys: BTreeSet<String>,
     ) -> Result<Self, TagError> {
         let vocab = Vocabulary {
             defs,
             open_keys,
             key_weights,
             key_descriptions,
+            qualified_keys,
         };
         vocab.validate()?;
         Ok(vocab)
@@ -217,12 +265,39 @@ impl Vocabulary {
         self.key_descriptions.get(key).map(String::as_str)
     }
 
+    /// Prose for a tag, falling back to its category.
+    ///
+    /// A qualified tag has no entry of its own — the whole point is that the
+    /// vocabulary does not enumerate parts — so `peripheral=accel[mpu6050]`
+    /// borrows the description of `peripheral=accel`. Without this its row in
+    /// `tag_list` would be blank, and agents match on those descriptions.
     pub fn describe(&self, tag: &Tag) -> Option<&str> {
-        self.defs.get(tag).map(|d| d.description.as_str())
+        if let Some(def) = self.defs.get(tag) {
+            return Some(def.description.as_str());
+        }
+        if tag.qualifier().is_some() {
+            return self
+                .defs
+                .get(&tag.base_tag())
+                .map(|d| d.description.as_str());
+        }
+        None
     }
 
     pub fn contains(&self, tag: &Tag) -> bool {
-        self.open_keys.contains(&tag.key) || self.defs.contains_key(tag)
+        if self.open_keys.contains(&tag.key) {
+            return true;
+        }
+        if tag.qualifier().is_some() {
+            return self.qualified_keys.contains(&tag.key)
+                && self.defs.contains_key(&tag.base_tag());
+        }
+        self.defs.contains_key(tag)
+    }
+
+    /// Whether values on this key may carry a `[qualifier]`.
+    pub fn is_qualified_key(&self, key: &str) -> bool {
+        self.qualified_keys.contains(key)
     }
 
     pub fn tags(&self) -> impl Iterator<Item = &Tag> {
@@ -242,6 +317,24 @@ impl Vocabulary {
                     "vocabulary value {tag} must not contain a dash (use {}={} instead)",
                     tag.key,
                     tag.value.replace('-', "")
+                )));
+            }
+            // A vocabulary entry declares a category, never a part. Enumerating
+            // parts centrally is exactly what qualifiers exist to avoid.
+            if tag.qualifier().is_some() {
+                return Err(TagError::Vocabulary(format!(
+                    "vocabulary value {tag} must not carry a [qualifier]; declare {}={} \
+                     and let benches name the part",
+                    tag.key,
+                    tag.base()
+                )));
+            }
+        }
+
+        for key in &self.qualified_keys {
+            if !self.defs.keys().any(|t| &t.key == key) {
+                return Err(TagError::Vocabulary(format!(
+                    "key {key:?} is marked qualified but has no values to qualify"
                 )));
             }
         }
@@ -301,6 +394,24 @@ impl Vocabulary {
     /// Reject anything outside the vocabulary, with did-you-mean suggestions.
     pub fn check<'a, I: IntoIterator<Item = &'a Tag>>(&self, tags: I) -> Result<(), TagError> {
         for tag in tags {
+            if let Some(qualifier) = tag.qualifier() {
+                if !self.open_keys.contains(&tag.key) && !self.qualified_keys.contains(&tag.key) {
+                    return Err(TagError::Vocabulary(format!(
+                        "{tag}: values on {:?} do not take a [qualifier]",
+                        tag.key
+                    )));
+                }
+                // The same anti-rot rule the vocabulary applies to its own
+                // values. A qualifier is matchable, so `accel[mpu-6050]` and
+                // `accel[mpu6050]` would be two different parts to a request
+                // asking for one of them by name.
+                if qualifier.contains('-') {
+                    return Err(TagError::Vocabulary(format!(
+                        "{tag}: qualifier must not contain a dash (use [{}] instead)",
+                        qualifier.replace('-', "")
+                    )));
+                }
+            }
             if !self.contains(tag) {
                 return Err(TagError::Unknown {
                     tag: tag.clone(),
@@ -313,6 +424,10 @@ impl Vocabulary {
 
     /// Closest known tags, for did-you-mean output.
     pub fn suggest(&self, tag: &Tag, limit: usize) -> Vec<String> {
+        // Suggest against the category. The vocabulary holds no parts, so
+        // comparing `peripheral=accel[mpu6050]` to it would score every entry
+        // badly and offer nothing useful for a mistyped category.
+        let tag = &tag.base_tag();
         let target = tag.to_string();
         let mut scored: Vec<(f64, String)> = self
             .defs
@@ -354,18 +469,32 @@ impl Vocabulary {
         keys.into_iter().take(limit).map(|(_, k)| k).collect()
     }
 
-    /// Return `tags` plus everything they transitively imply.
+    /// Return `tags` plus everything they transitively imply, and the bare
+    /// category behind every qualified value.
     ///
     /// Applied to *bench* tags at load time, so an agent asking for
     /// `family=esp32` matches a bench declared only as `soc=esp32s3`.
     /// Requirements are never expanded: doing so would make requests strictly
     /// harder to satisfy, which is the opposite of the intent.
+    ///
+    /// Qualifiers are desugared here for the same reason, and it is why they
+    /// cost the matcher nothing. A bench declaring `peripheral=accel[mpu6050]`
+    /// ends up carrying `peripheral=accel` as well, so both a request for the
+    /// category and a request for the exact part are satisfied by plain subset
+    /// containment. The asymmetry works out too: a *request* for the exact part
+    /// is not expanded, so it keeps demanding that part and nothing else.
     pub fn expand(&self, tags: &TagSet) -> TagSet {
         let mut seen = TagSet::new();
         let mut queue: VecDeque<Tag> = tags.iter().cloned().collect();
         while let Some(tag) = queue.pop_front() {
             if !seen.insert(tag.clone()) {
                 continue;
+            }
+            if tag.qualifier().is_some() {
+                let base = tag.base_tag();
+                if !seen.contains(&base) {
+                    queue.push_back(base);
+                }
             }
             if let Some(def) = self.defs.get(&tag) {
                 for implied in &def.implies {

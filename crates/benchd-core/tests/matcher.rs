@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use benchd_core::matcher::{BusyInfo, Failure};
+use benchd_core::matcher::{fit_cost, BusyInfo, Failure};
 use benchd_core::model::{Bench, ClaimRequest, Distinct, Inventory, Requirement};
 use benchd_core::tags::{parse_tags, Tag, TagError};
 use benchd_core::{allocate_in, format_tags};
@@ -199,7 +199,7 @@ fn an_impossible_request_names_the_tag_that_makes_it_impossible() {
 fn an_impossible_combination_of_individually_possible_tags_is_explained() {
     // Every tag exists somewhere, but no single bench has all of them.
     let inv = inventory();
-    let req = claim(&[("dut", &["usb=cp2102n", "psram=octal"])], Distinct::All);
+    let req = claim(&[("dut", &["console=uart", "psram=octal"])], Distinct::All);
     let err = allocate_in(&inv, &req, &no_one_is_busy()).unwrap_err();
 
     let diag = &err.slots[0];
@@ -221,7 +221,7 @@ fn a_distinctness_conflict_is_not_reported_as_contention() {
     // structural, not availability, and the message must say so.
     let inv = inventory();
     let req = claim(
-        &[("a", &["usb=cp2102n"]), ("b", &["soc=esp32"])],
+        &[("a", &["console=uart"]), ("b", &["soc=esp32"])],
         Distinct::All,
     );
     let err = allocate_in(&inv, &req, &no_one_is_busy()).unwrap_err();
@@ -287,6 +287,160 @@ fn identity_values_may_contain_dashes_so_bench_ids_survive_round_tripping() {
     assert_eq!(alloc.assignment["dut"], "esp32s3-a");
 }
 
+// --- qualified values -------------------------------------------------------
+
+/// Two boards with the same accelerometer, one of which had its part number
+/// written down.
+const QUALIFIED: &str = r#"
+    [tags.peripheral]
+    qualified = true
+    [tags.peripheral.values.accel]
+    description = "Accelerometer"
+
+    [tags.flash]
+    [tags.flash.values."4mb"]
+
+    [benches.recorded]
+    tags = ["peripheral=accel[mpu6050]", "flash=4mb"]
+
+    [benches.vague]
+    tags = ["peripheral=accel", "flash=4mb"]
+"#;
+
+#[test]
+fn naming_the_part_still_answers_a_request_for_the_category() {
+    // The point of qualifiers: recording *which* accelerometer must not hide
+    // the board from someone who just needs an accelerometer.
+    let inv = Inventory::from_toml_str(QUALIFIED).unwrap();
+    assert!(inv.benches["recorded"]
+        .tags
+        .contains(&Tag::parse("peripheral=accel").unwrap()));
+
+    let req = claim(&[("dut", &["peripheral=accel"])], Distinct::All);
+    assert!(allocate_in(&inv, &req, &no_one_is_busy()).is_ok());
+}
+
+#[test]
+fn asking_for_an_exact_part_will_not_settle_for_the_category() {
+    // The asymmetry that makes qualifiers useful: bench tags are expanded,
+    // requirements are not. A board that only claims "an accelerometer" cannot
+    // satisfy a test that needs an MPU-6050 specifically.
+    let inv = Inventory::from_toml_str(QUALIFIED).unwrap();
+    let req = claim(&[("dut", &["peripheral=accel[mpu6050]"])], Distinct::All);
+    let alloc = allocate_in(&inv, &req, &no_one_is_busy()).unwrap();
+    assert_eq!(alloc.assignment["dut"], "recorded");
+
+    let req = claim(&[("dut", &["peripheral=accel[lis3dh]"])], Distinct::All);
+    allocate_in(&inv, &req, &no_one_is_busy())
+        .expect_err("no bench carries that part, and the category must not stand in for it");
+}
+
+#[test]
+fn writing_down_a_part_number_does_not_make_a_bench_look_scarcer() {
+    // `recorded` carries both peripheral=accel and peripheral=accel[mpu6050].
+    // Charging for each would price one chip twice and quietly teach everyone
+    // to stop documenting their hardware.
+    let inv = Inventory::from_toml_str(QUALIFIED).unwrap();
+    let counts = inv.tag_counts();
+    let req = Requirement::parse(["flash=4mb"]).unwrap();
+    let weights = inv.vocabulary.key_weights();
+
+    let recorded = fit_cost(&inv.benches["recorded"], &req, &counts, weights);
+    let vague = fit_cost(&inv.benches["vague"], &req, &counts, weights);
+    assert_eq!(
+        recorded, vague,
+        "the two boards have the same hardware; only the documentation differs"
+    );
+}
+
+#[test]
+fn asking_for_a_part_is_not_also_charged_for_the_category_it_implies() {
+    // The mirror case: having asked for the MPU-6050, the `peripheral=accel`
+    // the bench also carries is not spare capability going to waste.
+    let inv = Inventory::from_toml_str(QUALIFIED).unwrap();
+    let counts = inv.tag_counts();
+    let weights = inv.vocabulary.key_weights();
+
+    let exact = Requirement::parse(["peripheral=accel[mpu6050]"]).unwrap();
+    let category = Requirement::parse(["peripheral=accel"]).unwrap();
+    assert_eq!(
+        fit_cost(&inv.benches["recorded"], &exact, &counts, weights),
+        fit_cost(&inv.benches["recorded"], &category, &counts, weights),
+    );
+}
+
+#[test]
+fn a_qualifier_is_rejected_on_a_key_that_did_not_ask_for_one() {
+    // Opt-in per key. Otherwise `flash=4mb[whatever]` becomes a legal tag that
+    // nobody would ever think to request.
+    let toml = r#"
+        [tags.flash]
+        [tags.flash.values."4mb"]
+
+        [benches.only]
+        tags = ["flash=4mb[winbond]"]
+    "#;
+    let err = Inventory::from_toml_str(toml).expect_err("qualifier must be opted into");
+    assert!(
+        err.to_string().contains("do not take a [qualifier]"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_qualified_value_with_an_unknown_category_is_rejected_with_suggestions() {
+    // The category is still closed vocabulary; only the part inside the
+    // brackets is free-form.
+    let inv = Inventory::from_toml_str(QUALIFIED).unwrap();
+    let err = inv
+        .vocabulary
+        .check([&Tag::parse("peripheral=accell[mpu6050]").unwrap()])
+        .expect_err("unknown category must be rejected");
+    match err {
+        TagError::Unknown { suggestions, .. } => assert!(
+            suggestions.iter().any(|s| s == "peripheral=accel"),
+            "expected the category in {suggestions:?}"
+        ),
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_vocabulary_may_not_enumerate_parts_itself() {
+    // Declaring a part centrally is exactly the curation burden qualifiers
+    // exist to remove, so the config that tries it fails loudly.
+    let toml = r#"
+        [tags.peripheral]
+        qualified = true
+        [tags.peripheral.values."accel[mpu6050]"]
+    "#;
+    let err = Inventory::from_toml_str(toml).expect_err("vocabulary must not name parts");
+    let msg = err.to_string();
+    assert!(msg.contains("must not carry a [qualifier]"), "{msg}");
+    assert!(
+        msg.contains("peripheral=accel"),
+        "should say what to do: {msg}"
+    );
+}
+
+#[test]
+fn a_qualifier_with_a_dash_is_rejected_like_any_other_matchable_value() {
+    // Qualifiers are matched on, so they rot the same way capability values do:
+    // `mpu-6050` and `mpu6050` would be two different chips.
+    let toml = r#"
+        [tags.peripheral]
+        qualified = true
+        [tags.peripheral.values.accel]
+
+        [benches.only]
+        tags = ["peripheral=accel[mpu-6050]"]
+    "#;
+    let err = Inventory::from_toml_str(toml).expect_err("dashed qualifier must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("must not contain a dash"), "{msg}");
+    assert!(msg.contains("[mpu6050]"), "should suggest the fix: {msg}");
+}
+
 #[test]
 fn single_character_tag_keys_are_allowed() {
     let toml = r#"
@@ -340,6 +494,61 @@ fn a_bench_may_hold_several_boards_and_they_are_claimed_together() {
     let alloc = allocate_in(&inv, &req, &no_one_is_busy()).unwrap();
     assert_eq!(alloc.assignment["dut"], "mesh-rig");
     assert_eq!(inv.benches[&alloc.assignment["dut"]].resources.len(), 3);
+}
+
+#[test]
+fn two_resources_may_name_one_device_and_differ_only_in_the_node() {
+    // A USB-SD-Mux is switched through its SCSI node and written through its
+    // block node. Both are the same USB device, which is forwarded once — so
+    // the two must resolve to a single grouping key or they would be imported
+    // twice.
+    let toml = r#"
+        [tags.sdmux]
+        [tags.sdmux.values.usb]
+
+        [benches.muxed]
+        description = "A card the host can hand to the DUT"
+        tags = ["sdmux=usb"]
+        [benches.muxed.resources.console]
+        kind = "serial"
+        by_id = "/dev/serial/by-id/fake"
+        [benches.muxed.resources.switch]
+        kind = "scsi"
+        busid = "3-1.1"
+        [benches.muxed.resources.card]
+        kind = "block"
+        busid = "3-1.1"
+    "#;
+
+    let inv = Inventory::from_toml_str(toml).unwrap();
+    let bench = &inv.benches["muxed"];
+    let key = |name: &str| bench.resources[name].device_key(name).to_string();
+    assert_eq!(key("switch"), key("card"));
+    // And the console, which the coordinator cannot resolve to a busid, keeps
+    // a key of its own rather than colliding with either.
+    assert_ne!(key("console"), key("card"));
+}
+
+#[test]
+fn a_resource_that_only_says_usb_does_not_say_enough() {
+    // `kind = "usb"` used to mean "the whole device" and could not name which
+    // node the agent wanted. Such a bench registered happily and then spent ten
+    // seconds at materialisation waiting for a tty that would never appear.
+    let toml = r#"
+        [tags.sdmux]
+        [tags.sdmux.values.usb]
+
+        [benches.muxed]
+        description = ""
+        tags = ["sdmux=usb"]
+        [benches.muxed.resources.card]
+        kind = "usb"
+        busid = "3-1.1"
+    "#;
+
+    let err = Inventory::from_toml_str(toml).unwrap_err().to_string();
+    assert!(err.contains("block"), "{err}");
+    assert!(err.contains("scsi"), "{err}");
 }
 
 #[test]
@@ -409,6 +618,7 @@ mod properties {
             tags: tagset,
             resources: Default::default(),
             description: String::new(),
+            docs: String::new(),
             enabled: true,
         }
     }

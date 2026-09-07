@@ -4,10 +4,24 @@
 # single-machine operation, with no central file to keep in sync. The tags must
 # exist in the coordinator's vocabulary, which is the one thing that stays
 # central - otherwise the closed vocabulary would rot per-machine.
+#
+# Note the ordering: every bare key must precede the first [table], or TOML folds
+# it into that table and `tags` quietly becomes a field of the resource.
 
 id          = "esp32s3-a"
 description = "ESP32-S3 devkit, native USB-JTAG"
-tags        = ["soc=esp32s3", "psram=octal", "flash=8mb"]
+tags        = ["soc=esp32s3", "psram=octal", "flash=8mb", "console=usbjtag", "jtag=builtin"]
+
+# Handed to whoever holds this bench, and to nobody else (D23). Put here what an
+# agent cannot discover from the board itself: what you wired to it, and which
+# way round. Keep it short - it is spent from someone else's context budget.
+docs = """
+Nothing is wired to the header; this is a bare devkit.
+
+The USB cable is in the **USB** port, not **UART**, so the console and JTAG are
+the SoC's own peripheral. Resetting into the bootloader over DTR/RTS works, but
+the port re-enumerates on reset and the tty briefly disappears.
+"""
 
 [resources.console]
 kind  = "serial"

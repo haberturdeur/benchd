@@ -1,0 +1,47 @@
+# A bench where one USB device supplies two resources. A USB-SD-Mux is switched
+# through its SCSI node and written through its block node, and an agent needs
+# both at once — so each resource names one node and they share a busid (D24).
+
+id          = "esp32s3-sdmux"
+description = "ESP32-S3 devkit whose SD slot is fed by a USB-SD-Mux"
+
+# sdmux=usb is the interesting tag: peripheral=sdcard says only that a slot
+# exists, which is no use to an agent that cannot get an image onto the card.
+tags = [
+  "soc=esp32s3",
+  "console=usbjtag",
+  "jtag=builtin",
+  "peripheral=sdcard",
+  "sdmux=usb",
+]
+
+docs = """
+- `$LAB_DUT_SDMUX` switches the card: `host` points it at you, `dut` at the
+  board. `usbsdmux` works out which mux it is from the *name* of the path rather
+  than the device behind it, so it needs the kernel's node:
+
+  ```sh
+  SDMUX=/dev/$(basename $(readlink -f /sys/dev/char/$(stat -c '%Hr:%Lr' "$LAB_DUT_SDMUX")))
+  usbsdmux "$SDMUX" host
+  ```
+
+- `$LAB_DUT_SDCARD` is the card, and only carries data while the mux is switched
+  to `host`. `sync` before switching away: the card is physically disconnected
+  the moment you do, and an unflushed page cache is lost.
+"""
+
+[resources.console]
+kind    = "serial"
+by_path = "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:2:1.0"
+serial  = "F4:12:FA:86:69:94"
+
+# A busid names a position in the USB topology, so moving the mux to another
+# socket means editing these. There is no by-path equivalent for a block device
+# the way there is for a tty.
+[resources.sdmux]
+kind  = "scsi"
+busid = "3-1.1"
+
+[resources.sdcard]
+kind  = "block"
+busid = "3-1.1"

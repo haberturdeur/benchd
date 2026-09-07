@@ -1,0 +1,25 @@
+[package]
+name = "benchd"
+description = "benchd: every component, one binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "benchd"
+path = "src/main.rs"
+
+[dependencies]
+benchd-core = { workspace = true }
+benchd-client = { path = "../benchd-client" }
+benchd-coordinator = { path = "../benchd-coordinator" }
+benchd-host = { path = "../benchd-host" }
+benchd-mcp = { path = "../benchd-mcp" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

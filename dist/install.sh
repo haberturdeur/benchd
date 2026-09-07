@@ -5,11 +5,8 @@ cd "$(dirname "$0")/.."
 
 # Build unless a release binary is already present (so this works under sudo,
 # where cargo may not be on PATH).
-[ -x target/release/benchd-coordinator ] || cargo build --release
-sudo install -m755 target/release/benchd-coordinator /usr/local/bin/
-sudo install -m755 target/release/benchd-host        /usr/local/bin/
-sudo install -m755 target/release/benchd-clientd     /usr/local/bin/
-sudo install -m755 target/release/benchd-mcp         /usr/local/bin/
+[ -x target/release/benchd ] || cargo build --release
+sudo install -m755 target/release/benchd /usr/local/bin/
 
 sudo mkdir -p /etc/benchd/benches
 [ -f /etc/benchd/coordinator.toml ] || sudo install -m644 examples/coordinator.toml /etc/benchd/

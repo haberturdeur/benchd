@@ -322,7 +322,7 @@ fn epochs_are_per_bench_not_per_lease() {
             ),
             (
                 "peer".to_string(),
-                Requirement::parse(["usb=cp2102n"]).unwrap(),
+                Requirement::parse(["console=uart"]).unwrap(),
             ),
         ]
         .into_iter()

@@ -230,6 +230,20 @@ pub fn fit_cost(
         // Every bench has exactly one name tag; it carries no capability
         // meaning and would otherwise dominate the score.
         .filter(|tag| tag.key != "name")
+        // One chip, one charge. A bench declaring `peripheral=accel[mpu6050]`
+        // carries the bare `peripheral=accel` too, so scoring both would make a
+        // board look twice as capable purely because someone recorded its part
+        // number. The category is the capability; the qualifier only says which
+        // part provides it.
+        .filter(|tag| tag.qualifier().is_none())
+        // The mirror case: when the request named an exact part, the category
+        // that part implies is not spare capability either.
+        .filter(|tag| {
+            !requirement
+                .tags
+                .iter()
+                .any(|asked| asked.qualifier().is_some() && &asked.base_tag() == *tag)
+        })
         .filter_map(|tag| {
             let weight = weights.get(&tag.key).copied().unwrap_or(1.0);
             if weight == 0.0 {

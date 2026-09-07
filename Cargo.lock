@@ -89,6 +89,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
+name = "benchd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "benchd-client",
+ "benchd-coordinator",
+ "benchd-core",
+ "benchd-host",
+ "benchd-mcp",
+ "clap",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "benchd-client"
 version = "0.1.0"
 dependencies = [
@@ -130,6 +145,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strsim",
+ "tempfile",
  "thiserror",
  "tokio",
  "toml",

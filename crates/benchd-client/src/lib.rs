@@ -12,13 +12,14 @@
 //! bind-mounting an inode needs `CAP_SYS_ADMIN` — the agent itself stays
 //! unprivileged, which is the whole point (D8).
 //!
-//! Agents do not talk to this process directly. `benchd-mcp` — a thin,
+//! Agents do not talk to this process directly. `benchd mcp` — a thin,
 //! unprivileged stdio shim, one per agent — connects over a unix socket. That
 //! split is forced rather than chosen: MCP over stdio is one process per
 //! client, so a single daemon could not serve several agents.
 
 mod agent;
 mod ids;
+pub mod lease;
 mod materialize;
 
 use std::collections::BTreeMap;
@@ -37,11 +38,7 @@ use crate::ids::{CoordinatorId, LeaseKey, SessionKey};
 use crate::materialize::Materializer;
 
 #[derive(Parser, Clone)]
-#[command(
-    name = "benchd-clientd",
-    about = "benchd client daemon (one per machine)"
-)]
-struct Args {
+pub struct ClientArgs {
     /// A coordinator to dial, as `name=address` or just `address`.
     ///
     /// Repeat for each one. The usual setup is a shared lab server plus a local
@@ -157,16 +154,7 @@ impl Shared {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "benchd_client=info".into()),
-        )
-        .init();
-
-    let args = Args::parse();
+pub async fn run(args: ClientArgs) -> Result<()> {
     let root = std::path::PathBuf::from(&args.root);
     std::fs::create_dir_all(&root)
         .with_context(|| format!("failed to create {}", root.display()))?;
@@ -222,7 +210,7 @@ async fn main() -> Result<()> {
         let args = args.clone();
         tasks.push(tokio::spawn(async move {
             loop {
-                if let Err(err) = run(&args, Arc::clone(&shared), &coordinator).await {
+                if let Err(err) = link(&args, Arc::clone(&shared), &coordinator).await {
                     tracing::warn!(
                         coordinator = %coordinator.name, ?err, "link failed"
                     );
@@ -245,7 +233,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run(args: &Args, shared: Arc<Shared>, coordinator: &Coordinator) -> Result<()> {
+/// One connection to one coordinator, from dial until it drops.
+async fn link(args: &ClientArgs, shared: Arc<Shared>, coordinator: &Coordinator) -> Result<()> {
     let socket = tokio::net::TcpStream::connect(&coordinator.address)
         .await
         .with_context(|| format!("failed to dial {}", coordinator.address))?;

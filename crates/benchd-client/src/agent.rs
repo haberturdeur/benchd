@@ -63,17 +63,81 @@ pub struct ClaimRetry {
     pub claim: benchd_core::wire::ClaimSpec,
 }
 
+/// What a fanned-out request will answer with once every coordinator is in.
+///
+/// Recorded when the request goes out rather than inferred from the last reply
+/// to arrive, because a fanout also has to be answerable when a coordinator
+/// never replies at all.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum FanoutKind {
+    Session,
+    Tags,
+    Leases,
+    /// Nothing to merge; success or the most useful failure.
+    #[default]
+    Ack,
+}
+
 /// A request the daemon asked of several coordinators at once.
 #[derive(Default)]
 struct Fanout {
+    kind: FanoutKind,
     outstanding: usize,
     tags: BTreeMap<String, benchd_core::wire::TagInfo>,
     leases: Vec<benchd_core::wire::LeaseStatus>,
+    /// The first session a coordinator handed back. Registration is fanned out
+    /// too, and the agent must not be told it has a session until every
+    /// coordinator has one — see the comment on the `OpenSession` arm of
+    /// `forward`.
+    session: Option<(SessionToken, SessionId)>,
     /// The most useful failure so far. A request no coordinator can ever
     /// satisfy is only unsatisfiable if *every* one says so; if any says it is
     /// merely busy, the agent should wait rather than give up (D14).
     error: Option<(String, bool)>,
     answered: bool,
+}
+
+impl Fanout {
+    /// The single reply that stands for all of them.
+    fn merged(&self, theirs: RequestId) -> ToClient {
+        let failed = |fallback: &str| match &self.error {
+            Some((error, retryable)) => ToClient::Error {
+                request: theirs,
+                error: error.clone(),
+                retryable: *retryable,
+            },
+            None => ToClient::Error {
+                request: theirs,
+                error: fallback.into(),
+                retryable: true,
+            },
+        };
+        match self.kind {
+            // A coordinator refusing a registration another accepted must not
+            // cost the agent the session it did get: it would be left unable to
+            // claim anything anywhere.
+            FanoutKind::Session => match &self.session {
+                Some((session, id)) => ToClient::SessionOpened {
+                    request: theirs,
+                    session: session.clone(),
+                    id: *id,
+                },
+                None => failed("no coordinator opened a session"),
+            },
+            FanoutKind::Tags => ToClient::Tags {
+                request: theirs,
+                tags: self.tags.values().cloned().collect(),
+            },
+            FanoutKind::Leases => ToClient::Status {
+                request: theirs,
+                leases: self.leases.clone(),
+            },
+            FanoutKind::Ack => match &self.error {
+                Some(_) => failed(""),
+                None => ToClient::Ok { request: theirs },
+            },
+        }
+    }
 }
 
 #[derive(Default)]
@@ -134,12 +198,13 @@ impl Agents {
 
     /// Record that `theirs` was fanned out to `n` coordinators, so the merge
     /// knows when every answer is in.
-    async fn expect_fanout(&self, agent_id: u64, theirs: RequestId, n: usize) {
+    async fn expect_fanout(&self, agent_id: u64, theirs: RequestId, n: usize, kind: FanoutKind) {
         let mut inner = self.inner.lock().await;
         let entry = inner
             .fanout
             .entry((agent_id, theirs.0))
             .or_insert_with(Fanout::default);
+        entry.kind = kind;
         entry.outstanding += n;
     }
 
@@ -265,7 +330,8 @@ impl Agents {
         // failed everywhere should report the most actionable reason.
         let fanout_key = (agent_id, theirs.0);
         let is_fanout = matches!(msg, ToClient::Tags { .. } | ToClient::Status { .. })
-            || (matches!(msg, ToClient::Error { .. }) && inner.fanout.contains_key(&fanout_key));
+            || (matches!(msg, ToClient::SessionOpened { .. } | ToClient::Error { .. })
+                && inner.fanout.contains_key(&fanout_key));
 
         if is_fanout {
             let entry = inner
@@ -274,6 +340,9 @@ impl Agents {
                 .or_insert_with(Fanout::default);
             entry.outstanding = entry.outstanding.saturating_sub(1);
             match &msg {
+                ToClient::SessionOpened { session, id, .. } => {
+                    entry.session.get_or_insert((session.clone(), *id));
+                }
                 ToClient::Tags { tags, .. } => merge_tags(&mut entry.tags, tags),
                 ToClient::Status { leases, .. } => {
                     // Rewrite to public ids here too, or two coordinators that
@@ -297,24 +366,7 @@ impl Agents {
                 return None;
             }
             entry.answered = true;
-            let merged = match &msg {
-                ToClient::Tags { .. } => ToClient::Tags {
-                    request: theirs,
-                    tags: entry.tags.values().cloned().collect(),
-                },
-                ToClient::Status { .. } => ToClient::Status {
-                    request: theirs,
-                    leases: entry.leases.clone(),
-                },
-                _ => match &entry.error {
-                    Some((error, retryable)) => ToClient::Error {
-                        request: theirs,
-                        error: error.clone(),
-                        retryable: *retryable,
-                    },
-                    None => ToClient::Ok { request: theirs },
-                },
-            };
+            let merged = entry.merged(theirs);
             inner.fanout.remove(&fanout_key);
             if let Some(agent) = inner.agents.get(&agent_id) {
                 if let Ok(line) = serde_json::to_string(&merged) {
@@ -333,12 +385,14 @@ impl Agents {
                 request,
                 lease,
                 slots,
+                docs,
                 expires_at,
                 note,
             } => ToClient::Granted {
                 request,
                 lease: benchd_core::lease::LeaseId(LeaseKey::new(from, lease).to_public()),
                 slots,
+                docs,
                 expires_at,
                 note,
             },
@@ -443,6 +497,41 @@ impl Agents {
     /// boards. They are independent authorities.
     pub async fn invalidate(&self, coordinator: CoordinatorId) {
         let mut inner = self.inner.lock().await;
+
+        // A fanned-out request still waiting on this coordinator will never
+        // hear from it, and an agent blocked on the answer would stay blocked
+        // for as long as the link stayed down. Registration is fanned out too,
+        // so without this a coordinator dying at the wrong moment wedges every
+        // agent on the machine at startup.
+        let orphaned: Vec<(u64, u64)> = inner
+            .pending
+            .values()
+            .filter(|(_, _, to)| *to == coordinator)
+            .map(|(agent, theirs, _)| (*agent, theirs.0))
+            .collect();
+        for key in orphaned {
+            let Some(entry) = inner.fanout.get_mut(&key) else {
+                continue;
+            };
+            entry.outstanding = entry.outstanding.saturating_sub(1);
+            keep_best_error(
+                &mut entry.error,
+                "a coordinator went away before answering",
+                true,
+            );
+            if entry.outstanding > 0 || entry.answered {
+                continue;
+            }
+            entry.answered = true;
+            let merged = entry.merged(RequestId(key.1));
+            inner.fanout.remove(&key);
+            if let Some(agent) = inner.agents.get(&key.0) {
+                if let Ok(line) = serde_json::to_string(&merged) {
+                    let _ = agent.out.send(line);
+                }
+            }
+        }
+
         inner.pending.retain(|_, (_, _, to)| *to != coordinator);
         inner
             .lease_owner
@@ -506,6 +595,7 @@ fn with_request(msg: ToClient, request: RequestId) -> ToClient {
         Granted {
             lease,
             slots,
+            docs,
             expires_at,
             note,
             ..
@@ -513,6 +603,7 @@ fn with_request(msg: ToClient, request: RequestId) -> ToClient {
             request,
             lease,
             slots,
+            docs,
             expires_at,
             note,
         },
@@ -653,8 +744,17 @@ async fn forward(shared: &Arc<Shared>, agent_id: u64, msg: ClientMsg) {
             reply_error(shared, agent_id, *request, "no coordinator is reachable").await;
             return;
         }
-        // The agent is told it has a session as soon as the first one answers;
-        // the rest arrive behind it. `deliver_reply` only forwards the first.
+        // One reply, once every coordinator has answered. An earlier version
+        // answered on the first, which raced: a claim is only offered to
+        // coordinators the agent already has a session with, so claiming the
+        // moment registration "succeeded" quietly skipped every coordinator
+        // slower than the fastest one. On a laptop with a local coordinator and
+        // a lab across the network that is *always* the lab, so every claim for
+        // remote hardware failed as unsatisfiable.
+        shared
+            .agents
+            .expect_fanout(agent_id, *request, live.len(), FanoutKind::Session)
+            .await;
         for to in live {
             let ours = shared.agents.track(agent_id, *request, to).await;
             shared
@@ -743,21 +843,29 @@ async fn forward(shared: &Arc<Shared>, agent_id: u64, msg: ClientMsg) {
             .await;
         }
         ClientMsg::Status { .. } => {
-            broadcast(shared, agent_id, theirs, |request, session| {
-                ClientMsg::Status { request, session }
-            })
+            broadcast(
+                shared,
+                agent_id,
+                theirs,
+                FanoutKind::Leases,
+                |request, session| ClientMsg::Status { request, session },
+            )
             .await;
         }
         ClientMsg::TagList { .. } => {
-            broadcast(shared, agent_id, theirs, |request, _| ClientMsg::TagList {
-                request,
+            broadcast(shared, agent_id, theirs, FanoutKind::Tags, |request, _| {
+                ClientMsg::TagList { request }
             })
             .await;
         }
         ClientMsg::CloseSession { .. } => {
-            broadcast(shared, agent_id, theirs, |request, session| {
-                ClientMsg::CloseSession { request, session }
-            })
+            broadcast(
+                shared,
+                agent_id,
+                theirs,
+                FanoutKind::Ack,
+                |request, session| ClientMsg::CloseSession { request, session },
+            )
             .await;
         }
         _ => {}
@@ -797,6 +905,7 @@ async fn broadcast(
     shared: &Arc<Shared>,
     agent_id: u64,
     theirs: RequestId,
+    kind: FanoutKind,
     build: impl Fn(RequestId, SessionToken) -> ClientMsg,
 ) {
     let live = shared.live_links().await;
@@ -826,7 +935,7 @@ async fn broadcast(
     // while later coordinators are still being asked.
     shared
         .agents
-        .expect_fanout(agent_id, theirs, targets.len())
+        .expect_fanout(agent_id, theirs, targets.len(), kind)
         .await;
     for (to, session) in targets {
         let ours = shared.agents.track(agent_id, theirs, to).await;
@@ -915,6 +1024,112 @@ fn keep_best_error(best: &mut Option<(String, bool)>, error: &str, retryable: bo
 mod tests {
     use super::*;
     use benchd_core::wire::TagInfo;
+
+    /// An agent connected to `Agents`, with the receiving end of its socket.
+    async fn connect(agents: &Agents) -> (u64, mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut inner = agents.inner.lock().await;
+        inner.next_agent += 1;
+        let id = inner.next_agent;
+        inner.agents.insert(
+            id,
+            Agent {
+                name: "tester".into(),
+                sessions: BTreeMap::new(),
+                internal: BTreeMap::new(),
+                uid: 1000,
+                out: tx,
+            },
+        );
+        (id, rx)
+    }
+
+    fn opened(request: RequestId, id: u64) -> ToClient {
+        ToClient::SessionOpened {
+            request,
+            session: SessionToken(format!("token-{id}")),
+            id: SessionId(id),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registration_is_answered_only_once_every_coordinator_has_a_session() {
+        // The race this guards: a claim is only offered to coordinators the
+        // agent already has a session with, so answering on the first reply
+        // meant claims silently skipped every slower coordinator. With a local
+        // coordinator and a lab across the network, the slower one is always
+        // the lab — so every claim for remote hardware failed as unsatisfiable.
+        let agents = Agents::default();
+        let (agent, mut out) = connect(&agents).await;
+
+        let lab = CoordinatorId(0);
+        let local = CoordinatorId(1);
+        let theirs = RequestId(1);
+        agents
+            .expect_fanout(agent, theirs, 2, FanoutKind::Session)
+            .await;
+        let for_lab = agents.track(agent, theirs, lab).await;
+        let for_local = agents.track(agent, theirs, local).await;
+
+        agents.deliver_reply(local, opened(for_local, 7)).await;
+        assert!(
+            out.try_recv().is_err(),
+            "the agent must not be told it has a session while a coordinator is \
+             still registering"
+        );
+
+        agents.deliver_reply(lab, opened(for_lab, 3)).await;
+        let line = out
+            .try_recv()
+            .expect("one reply once everyone has answered");
+        let reply: ToClient = serde_json::from_str(&line).unwrap();
+        assert!(matches!(
+            reply,
+            ToClient::SessionOpened { request, .. } if request == theirs
+        ));
+        assert!(out.try_recv().is_err(), "exactly one reply, not one each");
+
+        // Both sessions are recorded, which is what a claim looks for.
+        assert!(agents.session_on(agent, lab).await.is_some());
+        assert!(agents.session_on(agent, local).await.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_coordinator_refusing_still_leaves_a_usable_session() {
+        // Registration always succeeds today (D19), but a coordinator that is
+        // reachable and unhappy must not cost the agent the sessions it did
+        // get: it would be left unable to claim anything anywhere.
+        let agents = Agents::default();
+        let (agent, mut out) = connect(&agents).await;
+
+        let theirs = RequestId(1);
+        agents
+            .expect_fanout(agent, theirs, 2, FanoutKind::Session)
+            .await;
+        let good = agents.track(agent, theirs, CoordinatorId(0)).await;
+        let bad = agents.track(agent, theirs, CoordinatorId(1)).await;
+
+        agents
+            .deliver_reply(CoordinatorId(0), opened(good, 1))
+            .await;
+        agents
+            .deliver_reply(
+                CoordinatorId(1),
+                ToClient::Error {
+                    request: bad,
+                    error: "no".into(),
+                    retryable: false,
+                },
+            )
+            .await;
+
+        let line = out.try_recv().expect("an answer");
+        let reply: ToClient = serde_json::from_str(&line).unwrap();
+        assert!(
+            matches!(reply, ToClient::SessionOpened { .. }),
+            "got {reply:?}"
+        );
+    }
 
     fn tag(name: &str, benches: usize, free: usize) -> TagInfo {
         TagInfo {

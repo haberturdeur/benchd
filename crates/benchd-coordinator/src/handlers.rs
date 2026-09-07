@@ -123,7 +123,6 @@ async fn serve_host(
                         bench: bench_id.clone(),
                         conn_id,
                         out: out.clone(),
-                        peer_ip: peer.ip(),
                         last_seen: now(),
                     },
                 );
@@ -238,6 +237,7 @@ async fn serve_operator(shared: Arc<Shared>, out: Outbox, msg: OperatorMsg) -> R
                 .map(|b| BenchView {
                     id: b.id.clone(),
                     description: b.description.clone(),
+                    has_docs: !b.docs.is_empty(),
                     tags: b
                         .tags
                         .iter()
@@ -332,7 +332,6 @@ async fn serve_client(
             id,
             ClientConn {
                 out: out.clone(),
-                peer_ip: peer.ip(),
                 last_seen: now(),
             },
         );
@@ -483,6 +482,16 @@ async fn handle_client(
             };
             match state.leases.claim(id, &req, now()) {
                 Ok(granted) => {
+                    let inventory = state.leases.inventory();
+                    let docs = granted
+                        .assignment
+                        .iter()
+                        .filter_map(|(slot, bench)| {
+                            let bench = inventory.benches.get(bench)?;
+                            (!bench.docs.is_empty()).then(|| (slot.clone(), bench.docs.clone()))
+                        })
+                        .collect();
+
                     // Granted first, then the Materialize that follows from
                     // dispatch: the client correlates them by lease id and
                     // answers the agent once the nodes actually exist.
@@ -490,6 +499,7 @@ async fn handle_client(
                         request,
                         lease: granted.lease,
                         slots: granted.assignment.clone(),
+                        docs,
                         expires_at: granted.expires_at,
                         note: granted.ttl.note(),
                     });

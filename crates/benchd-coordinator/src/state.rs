@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use benchd_core::lease::{Effect, Epoch, LeaseId, LeaseManager, SessionId};
 use benchd_core::model::{Bench, Inventory};
 use benchd_core::wire::{
-    BenchSpec, ChannelKey, RequestId, ResourceHandle, SessionToken, ToClient, ToHost,
+    BenchSpec, ChannelKey, RequestId, ResourceHandle, SessionToken, ToClient, ToHost, WantedNode,
 };
 use benchd_core::Limits;
 
@@ -37,16 +37,12 @@ pub struct HostConn {
     /// half-open connection after a machine sleeps — so silence, not a socket
     /// close, is what marks a bench unavailable (D19).
     pub last_seen: u64,
-    /// Address the host dialled from. Used to decide whether a client is
-    /// co-located with it, which is what selects bind-mount versus USB/IP.
-    pub peer_ip: std::net::IpAddr,
 }
 
 /// A connected client daemon (one per agent machine).
 pub struct ClientConn {
     pub out: Outbox,
     pub last_seen: u64,
-    pub peer_ip: std::net::IpAddr,
 }
 
 pub struct State {
@@ -71,8 +67,6 @@ pub struct State {
     channels: BTreeMap<(LeaseId, String, String), ChannelKey>,
     next_request: u64,
     next_conn: u64,
-    /// Treat every bench as remote. Exercises the USB/IP path on one machine.
-    pub force_relay: bool,
 }
 
 impl State {
@@ -94,7 +88,6 @@ impl State {
             channels: BTreeMap::new(),
             next_request: 1,
             next_conn: 1,
-            force_relay: false,
         }
     }
 
@@ -176,7 +169,7 @@ impl State {
         // loud, visible in the log, and a configuration error worth seeing.
         if let Some(old) = self.hosts.get(&spec.id) {
             tracing::warn!(
-                bench = %spec.id, old = %old.peer_ip,
+                bench = %spec.id, old = old.conn_id,
                 "re-registering a bench that was already claimed by another connection"
             );
         }
@@ -197,6 +190,15 @@ impl State {
         if !benchd_core::model::valid_component(&spec.id) {
             return Err(format!("invalid bench id {:?}", spec.id));
         }
+        // Re-checked here even though the host checks it too: the host may be an
+        // older build, and this text lands in agent context windows.
+        if spec.docs.len() > benchd_core::model::MAX_BENCH_DOCS {
+            return Err(format!(
+                "docs are {} bytes, over the {} byte limit",
+                spec.docs.len(),
+                benchd_core::model::MAX_BENCH_DOCS
+            ));
+        }
 
         let vocabulary = &self.leases.inventory().vocabulary;
         let declared: benchd_core::tags::TagSet = spec.tags.iter().cloned().collect();
@@ -212,6 +214,7 @@ impl State {
             tags,
             resources: spec.resources.clone(),
             description: spec.description.clone(),
+            docs: spec.docs.clone(),
             enabled: true,
         })
     }
@@ -235,23 +238,35 @@ impl State {
                         tracing::warn!(%bench, "export for a bench whose host has gone");
                         continue;
                     };
-                    // Mint one key per resource now; the client is handed the
-                    // same keys when its Materialize is built below.
+                    // Mint one key per *device*, not per resource, and hand the
+                    // same key to every resource that names it. USB/IP forwards
+                    // whole devices, so a USB-SD-Mux claimed as both its SCSI
+                    // and its block node is one import; two keys would leave one
+                    // of them with nobody to pair with in the relay. The client
+                    // is handed these same keys when its Materialize is built
+                    // below, and both ends deduplicate by key.
                     let mut channels = BTreeMap::new();
-                    if self.needs_relay(&bench, session) {
-                        let names: Vec<String> = self
-                            .leases
-                            .inventory()
-                            .benches
-                            .get(&bench)
-                            .map(|b| b.resource_names().iter().map(|s| s.to_string()).collect())
-                            .unwrap_or_default();
-                        for name in names {
-                            let key = ChannelKey::generate();
-                            self.channels
-                                .insert((lease, bench.clone(), name.clone()), key.clone());
-                            channels.insert(name, key);
-                        }
+                    let resources: Vec<(String, String)> = self
+                        .leases
+                        .inventory()
+                        .benches
+                        .get(&bench)
+                        .map(|b| {
+                            b.resources
+                                .iter()
+                                .map(|(name, r)| (name.clone(), r.device_key(name).to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut per_device: BTreeMap<String, ChannelKey> = BTreeMap::new();
+                    for (name, device) in resources {
+                        let key = per_device
+                            .entry(device)
+                            .or_insert_with(ChannelKey::generate)
+                            .clone();
+                        self.channels
+                            .insert((lease, bench.clone(), name.clone()), key.clone());
+                        channels.insert(name, key);
                     }
                     let request = self.next_request();
                     self.pending.insert(request, lease);
@@ -295,7 +310,7 @@ impl State {
                         continue;
                     };
                     let epoch = self.lease_epoch(lease);
-                    let handles = self.handles_for(&slots, session, lease);
+                    let handles = self.handles_for(&slots, lease);
                     let request = self.next_request();
                     self.pending.insert(request, lease);
                     out.push(Outgoing::Client {
@@ -349,27 +364,6 @@ impl State {
         self.clients.get(conn_id).map(|c| c.out.clone())
     }
 
-    /// True when the host and client are on different machines, so the device
-    /// must be forwarded rather than bind-mounted (D5).
-    ///
-    /// `force_relay` makes every bench take the remote path regardless, which is
-    /// how the USB/IP code is exercised on a single machine.
-    fn needs_relay(&self, bench: &str, session: SessionId) -> bool {
-        if self.force_relay {
-            return true;
-        }
-        let Some(host) = self.hosts.get(bench) else {
-            return false;
-        };
-        let Some(conn_id) = self.session_conn.get(&session) else {
-            return false;
-        };
-        let Some(client) = self.clients.get(conn_id) else {
-            return false;
-        };
-        host.peer_ip != client.peer_ip
-    }
-
     /// One epoch for a whole lease, for the client to fence on.
     ///
     /// The client holds a lease, not a bench, so it needs a single number. The
@@ -407,10 +401,15 @@ impl State {
         self.leases.lease(lease)?.epochs.get(bench).copied()
     }
 
+    /// How the client should reach each resource of each granted bench.
+    ///
+    /// Always USB/IP, even when the host and client share a machine. The host
+    /// keeps its devices bound to the USB/IP stub for its whole lifetime so
+    /// that an unleased board has no tty for anyone to open, and a stub-bound
+    /// device cannot also be handed over as a local inode — there is none.
     pub fn handles_for(
         &self,
         slots: &BTreeMap<String, String>,
-        session: SessionId,
         lease: LeaseId,
     ) -> BTreeMap<String, BTreeMap<String, ResourceHandle>> {
         let mut out = BTreeMap::new();
@@ -418,7 +417,6 @@ impl State {
             let Some(bench) = self.leases.inventory().benches.get(bench_id) else {
                 continue;
             };
-            let relay = self.needs_relay(bench_id, session);
             // Keys are no longer derived from the epoch, but this still checks
             // that the lease really holds this bench before handing out a path
             // to it.
@@ -428,23 +426,27 @@ impl State {
             }
             let mut resources = BTreeMap::new();
             for (name, resource) in &bench.resources {
+                // The busid is resolved by the host, which is the machine that
+                // can actually see the device. The client only needs to name
+                // what it is asking for, and the host answers with whatever
+                // busid it exported under.
                 let handle = match resource {
-                    benchd_core::model::Resource::Serial { path, .. } if !relay => {
-                        ResourceHandle::Local {
-                            path: path.display().to_string(),
+                    benchd_core::model::Resource::Serial { interface, .. } => {
+                        ResourceHandle::UsbIp {
+                            channel: self.channel_for(lease, bench_id, name),
+                            busid: String::new(),
+                            node: WantedNode::Tty {
+                                interface: *interface,
+                            },
                         }
                     }
-                    // Remote: the busid is resolved by the host, which is the
-                    // machine that can actually see the device. The client only
-                    // needs to name what it is asking for, and the host answers
-                    // with whatever busid it exported under.
-                    benchd_core::model::Resource::Serial { .. } => ResourceHandle::UsbIp {
-                        channel: self.channel_for(lease, bench_id, name),
-                        busid: String::new(),
-                    },
-                    benchd_core::model::Resource::Usb { busid } => ResourceHandle::UsbIp {
+                    benchd_core::model::Resource::Usb { busid, node } => ResourceHandle::UsbIp {
                         channel: self.channel_for(lease, bench_id, name),
                         busid: busid.clone(),
+                        node: match node {
+                            benchd_core::model::UsbNode::Block => WantedNode::Block,
+                            benchd_core::model::UsbNode::Scsi => WantedNode::Scsi,
+                        },
                     },
                 };
                 resources.insert(name.clone(), handle);

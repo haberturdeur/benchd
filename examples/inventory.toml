@@ -9,6 +9,8 @@ open_keys = ["name"]
 
 # --- vocabulary ------------------------------------------------------------
 
+# Silicon: what the chip is. The only implications live here (D10).
+
 [tags.soc]
 description = "System-on-chip on the board"
 # weight 0: identity, not a contended capability. Being the only board with a
@@ -18,11 +20,11 @@ weight = 0
 description = "Original ESP32, Xtensa dual-core"
 implies = ["family=esp32", "arch=xtensa", "net=wifi", "net=bt"]
 [tags.soc.values.esp32s3]
-description = "ESP32-S3, Xtensa dual-core with native USB"
-implies = ["family=esp32", "arch=xtensa", "net=wifi", "net=bt", "jtag=builtin", "usb=native"]
+description = "ESP32-S3, Xtensa dual-core"
+implies = ["family=esp32", "arch=xtensa", "net=wifi", "net=bt"]
 [tags.soc.values.esp32c3]
-description = "ESP32-C3, RISC-V single core with native USB"
-implies = ["family=esp32", "arch=riscv", "net=wifi", "net=bt", "jtag=builtin", "usb=native"]
+description = "ESP32-C3, RISC-V single core"
+implies = ["family=esp32", "arch=riscv", "net=wifi", "net=bt"]
 
 [tags.family]
 description = "SoC family (implied by soc=, rarely set directly)"
@@ -38,14 +40,6 @@ description = "Tensilica Xtensa"
 [tags.arch.values.riscv]
 description = "RISC-V"
 
-[tags.usb]
-description = "How the board attaches to USB"
-weight = 0
-[tags.usb.values.native]
-description = "SoC's own USB peripheral"
-[tags.usb.values.cp2102n]
-description = "Silicon Labs CP2102N USB-UART bridge"
-
 [tags.net]
 description = "Radios available on the board"
 [tags.net.values.wifi]
@@ -53,12 +47,7 @@ description = "2.4GHz Wi-Fi"
 [tags.net.values.bt]
 description = "Bluetooth / BLE"
 
-[tags.jtag]
-description = "Debug interface"
-[tags.jtag.values.builtin]
-description = "USB-JTAG built into the SoC, no external probe needed"
-[tags.jtag.values.external]
-description = "External JTAG probe wired to the bench"
+# Board build: what was fitted to this particular board.
 
 [tags.psram]
 description = "External PSRAM fitted"
@@ -73,26 +62,63 @@ description = "Flash size"
 description = "4 MiB"
 [tags.flash.values."8mb"]
 description = "8 MiB"
+[tags.flash.values."16mb"]
+description = "16 MiB"
+
+[tags.peripheral]
+description = "Extra chips fitted to the board, beyond the SoC itself"
+# Categories are curated here; exact parts are not. A bench writes
+# peripheral=accel[mpu6050] and carries peripheral=accel as well, so no central
+# list of every accelerometer ever made has to be maintained.
+qualified = true
+[tags.peripheral.values.nand]
+description = "NAND flash, separate from the SoC's boot flash"
+[tags.peripheral.values.sdcard]
+description = "SD card slot wired to the SoC"
+[tags.peripheral.values.accel]
+description = "Accelerometer"
+[tags.peripheral.values.gps]
+description = "GNSS receiver"
+
+# Wiring: how this bench reaches its host. Never implied.
+
+[tags.console]
+description = "How this bench's console reaches the host"
+weight = 0
+[tags.console.values.uart]
+description = "A UART bridge chip; serial console only"
+[tags.console.values.usbjtag]
+description = "The SoC's own USB-JTAG/serial peripheral: console and debug on one cable"
+
+[tags.jtag]
+description = "Debug access this bench actually provides"
+# No jtag=none: a bench without debug access omits the key, because an absent
+# capability must not be priced like a real one.
+[tags.jtag.values.builtin]
+description = "USB-JTAG built into the SoC and reachable on this bench"
+[tags.jtag.values.external]
+description = "External JTAG probe wired to the bench"
 
 # --- benches ---------------------------------------------------------------
 
 [benches."esp32s3-a"]
 description = "ESP32-S3 devkit, native USB-JTAG"
-tags = ["soc=esp32s3", "psram=octal", "flash=8mb"]
+tags = ["soc=esp32s3", "psram=octal", "flash=8mb", "console=usbjtag", "jtag=builtin"]
 [benches."esp32s3-a".resources.console]
 kind = "serial"
 by_id = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_30:ED:A0:EC:ED:41-if00"
 
 [benches."esp32s3-b"]
 description = "ESP32-S3 devkit, native USB-JTAG"
-tags = ["soc=esp32s3", "psram=none", "flash=8mb"]
+tags = ["soc=esp32s3", "psram=none", "flash=8mb", "console=usbjtag", "jtag=builtin"]
 [benches."esp32s3-b".resources.console]
 kind = "serial"
 by_id = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:84:27:40:98:90-if00"
 
 [benches."esp32-cp2102"]
 description = "Classic ESP32 devkit behind a CP2102N bridge"
-tags = ["soc=esp32", "usb=cp2102n", "psram=none", "flash=4mb"]
+# No jtag key: the board exposes no debug interface on this bench.
+tags = ["soc=esp32", "console=uart", "psram=none", "flash=4mb"]
 [benches."esp32-cp2102".resources.console]
 kind = "serial"
 by_id = "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_8642368df26cef11bddfc5a7c169b110-if00-port0"

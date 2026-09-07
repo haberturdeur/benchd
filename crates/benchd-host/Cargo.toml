@@ -6,10 +6,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "benchd-host"
-path = "src/main.rs"
-
 [dependencies]
 benchd-core = { workspace = true, features = ["usbip"] }
 serde = { workspace = true }

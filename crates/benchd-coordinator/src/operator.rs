@@ -1,9 +1,10 @@
-//! `benchd` — the operator CLI.
+//! The operator subcommands: `benches`, `leases`, `release`.
 //!
-//! Deliberately a **separate program** from the agent surface, not a privileged
-//! mode of it (D17). Agents get five tools and no way to name a bench; you get
-//! the whole picture and the ability to take hardware back. Keeping them apart
-//! is what stops an agent hardcoding a bench name into a test script.
+//! A **different surface** from the one agents get, not a privileged mode of it
+//! (D17). Agents get five MCP tools and no way to name a bench; an operator
+//! sees the whole picture and can take hardware back. That the two now ship in
+//! one executable changes nothing: the boundary is the tool list an agent is
+//! handed, never which file it lives in (D25).
 //!
 //! Talks the same JSON-lines protocol as everything else, as an operator
 //! connection.
@@ -12,23 +13,13 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use benchd_core::wire::{OperatorMsg, ToOperator, DEFAULT_PORT};
-use clap::{Parser, Subcommand};
+use benchd_core::wire::{OperatorMsg, ToOperator};
+use clap::Subcommand;
 use futures::{SinkExt, StreamExt};
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
-#[derive(Parser)]
-#[command(name = "benchd", about = "benchd operator CLI", version)]
-struct Args {
-    #[arg(long, default_value_t = format!("127.0.0.1:{DEFAULT_PORT}"), env = "BENCHD_COORDINATOR")]
-    coordinator: String,
-
-    #[command(subcommand)]
-    command: Command,
-}
-
 #[derive(Subcommand)]
-enum Command {
+pub enum Command {
     /// Show every bench, its tags, and who holds it.
     Benches,
     /// Show every live lease.
@@ -47,18 +38,16 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-    let socket = tokio::net::TcpStream::connect(&args.coordinator)
+pub async fn run(coordinator: &str, command: Command) -> Result<()> {
+    let socket = tokio::net::TcpStream::connect(coordinator)
         .await
-        .with_context(|| format!("failed to reach the coordinator at {}", args.coordinator))?;
+        .with_context(|| format!("failed to reach the coordinator at {coordinator}"))?;
     socket.set_nodelay(true).ok();
     let (read, write) = socket.into_split();
     let mut lines = FramedRead::new(read, LinesCodec::new());
     let mut sink = FramedWrite::new(write, LinesCodec::new());
 
-    let request = match &args.command {
+    let request = match &command {
         Command::Benches | Command::Leases => OperatorMsg::Inspect,
         Command::Release { bench, now } => OperatorMsg::ForceRelease {
             bench: bench.clone(),
@@ -74,7 +63,7 @@ async fn main() -> Result<()> {
     let reply: ToOperator = serde_json::from_str(&line)
         .with_context(|| format!("could not understand the coordinator's reply: {line}"))?;
 
-    match (&args.command, reply) {
+    match (&command, reply) {
         (Command::Benches, ToOperator::State { benches, leases }) => {
             print_benches(&benches, &leases)
         }
@@ -107,7 +96,7 @@ fn print_benches(
     leases: &[benchd_core::wire::LeaseView],
 ) {
     if benches.is_empty() {
-        println!("no benches registered (is any benchd-host running?)");
+        println!("no benches registered (is any `benchd host` running?)");
         return;
     }
     let held: BTreeMap<&str, &benchd_core::wire::LeaseView> = leases
@@ -134,6 +123,17 @@ fn print_benches(
         // Tags second, indented: when you are looking for a free board the
         // status is what you are scanning for.
         println!("{:<width$}  {}", "", bench.tags.join(" "), width = width);
+        if !bench.description.is_empty() || !bench.has_docs {
+            let description = if bench.description.is_empty() {
+                "(no description)"
+            } else {
+                &bench.description
+            };
+            // Flagging the *absence* of docs, because a bench nobody documented
+            // is the one an agent will waste a lease guessing at.
+            let docs = if bench.has_docs { "" } else { "  [no docs]" };
+            println!("{:<width$}  {description}{docs}", "", width = width);
+        }
     }
 }
 
