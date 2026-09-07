@@ -1,6 +1,13 @@
 //! benchd client daemon: one privileged process per agent machine.
 //!
-//! Holds the coordinator connection and does all materialisation. It runs as
+//! Holds the coordinator connections and does all materialisation.
+//!
+//! **Several coordinators at once, deliberately.** The usual setup is a shared
+//! lab server plus a local coordinator owning the operator's own boards, bound
+//! to loopback so it is private without any authentication. Each is an
+//! independent authority (D6), so they fail independently: the lab server
+//! restarting must not disturb a lease on a board plugged into this machine.
+//! The agent sees one merged view and never learns there is more than one. It runs as
 //! root because the device node has to appear on *this* machine and
 //! bind-mounting an inode needs `CAP_SYS_ADMIN` — the agent itself stays
 //! unprivileged, which is the whole point (D8).
@@ -11,6 +18,7 @@
 //! client, so a single daemon could not serve several agents.
 
 mod agent;
+mod ids;
 mod materialize;
 
 use std::collections::BTreeMap;
@@ -25,17 +33,27 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 use crate::agent::Agents;
+use crate::ids::{CoordinatorId, LeaseKey, SessionKey};
 use crate::materialize::Materializer;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(
     name = "benchd-clientd",
     about = "benchd client daemon (one per machine)"
 )]
 struct Args {
-    /// Coordinator to dial. Only the coordinator listens (D5).
-    #[arg(long, default_value_t = format!("127.0.0.1:{DEFAULT_PORT}"))]
-    coordinator: String,
+    /// A coordinator to dial, as `name=address` or just `address`.
+    ///
+    /// Repeat for each one. The usual setup is a shared lab server plus a local
+    /// coordinator owning this machine's own boards, and order matters: a claim
+    /// is offered to them in the order given, so listing the local one first
+    /// prefers your own hardware over the shared pool.
+    #[arg(
+        long = "coordinator",
+        action = clap::ArgAction::Append,
+        default_values_t = [format!("local=127.0.0.1:{DEFAULT_PORT}")]
+    )]
+    coordinators: Vec<String>,
 
     /// Where device nodes are materialised. Bind-mount `<root>/<owner>` into an
     /// agent's sandbox and its leases appear and disappear live.
@@ -50,20 +68,47 @@ struct Args {
     heartbeat_seconds: u64,
 }
 
+/// One configured coordinator.
+#[derive(Clone, Debug)]
+pub struct Coordinator {
+    pub id: CoordinatorId,
+    /// Shown to operators and used to disambiguate bench names.
+    pub name: String,
+    pub address: String,
+}
+
+impl Coordinator {
+    /// Parse `name=address`, or `address` with the host part as the name.
+    fn parse(index: u32, spec: &str) -> Coordinator {
+        let (name, address) = match spec.split_once('=') {
+            Some((name, address)) => (name.to_string(), address.to_string()),
+            None => (
+                spec.split(':').next().unwrap_or(spec).to_string(),
+                spec.to_string(),
+            ),
+        };
+        Coordinator {
+            id: CoordinatorId(index),
+            name,
+            address,
+        }
+    }
+}
+
 pub struct Shared {
+    pub coordinators: Vec<Coordinator>,
+    /// Outbound queue per coordinator; absent while that link is down.
+    pub links: Mutex<BTreeMap<CoordinatorId, mpsc::UnboundedSender<String>>>,
     /// One lock per lease, so operations on a single lease stay ordered while
     /// different leases proceed independently.
-    pub lease_locks: Mutex<BTreeMap<benchd_core::lease::LeaseId, Arc<Mutex<()>>>>,
+    pub lease_locks: Mutex<BTreeMap<LeaseKey, Arc<Mutex<()>>>>,
     pub materializer: Mutex<Materializer>,
     pub agents: Agents,
-    /// Outbound queue to the coordinator. Unbounded and non-blocking, so a
-    /// stalled coordinator link can never deadlock a materialisation.
-    pub to_coordinator: Mutex<Option<mpsc::UnboundedSender<String>>>,
     pub root: std::path::PathBuf,
 }
 
 impl Shared {
-    async fn lease_queue(&self, lease: benchd_core::lease::LeaseId) -> Arc<Mutex<()>> {
+    async fn lease_queue(&self, lease: LeaseKey) -> Arc<Mutex<()>> {
         let mut locks = self.lease_locks.lock().await;
         Arc::clone(
             locks
@@ -72,7 +117,21 @@ impl Shared {
         )
     }
 
-    pub async fn send(&self, msg: &ClientMsg) {
+    pub fn name_of(&self, id: CoordinatorId) -> &str {
+        self.coordinators
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.name.as_str())
+            .unwrap_or("?")
+    }
+
+    /// Send to one coordinator.
+    ///
+    /// The sender is cloned out under a short lock and the channel is
+    /// unbounded, so this never blocks. An earlier version used `try_lock` and
+    /// dropped the message when merely contended, reporting it as "link is
+    /// down" — a silent loss with a misleading log line.
+    pub async fn send(&self, to: CoordinatorId, msg: &ClientMsg) {
         let line = match serde_json::to_string(msg) {
             Ok(line) => line,
             Err(err) => {
@@ -80,17 +139,21 @@ impl Shared {
                 return;
             }
         };
-        // The sender is cloned out under a short lock and the channel itself is
-        // unbounded, so sending never blocks. An earlier version used try_lock
-        // and dropped the message when merely contended, reporting it as "link
-        // is down" — which was both a silent loss and a misleading log line.
-        let tx = self.to_coordinator.lock().await.clone();
+        let tx = self.links.lock().await.get(&to).cloned();
         match tx {
             Some(tx) => {
                 let _ = tx.send(line);
             }
-            None => tracing::warn!("coordinator link is down; message dropped"),
+            None => tracing::warn!(
+                coordinator = %self.name_of(to),
+                "link is down; message dropped"
+            ),
         }
+    }
+
+    /// Every coordinator currently connected.
+    pub async fn live_links(&self) -> Vec<CoordinatorId> {
+        self.links.lock().await.keys().copied().collect()
     }
 }
 
@@ -114,16 +177,27 @@ async fn main() -> Result<()> {
     std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .with_context(|| format!("failed to set permissions on {}", root.display()))?;
 
-    let mut materializer = Materializer::new(root.clone(), args.coordinator.clone());
-    // Nothing we mounted survives us in any meaningful sense: the coordinator
-    // holds all lease state and has forgotten everything (D6).
+    let coordinators: Vec<Coordinator> = args
+        .coordinators
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| Coordinator::parse(i as u32, spec))
+        .collect();
+    for c in &coordinators {
+        tracing::info!(name = %c.name, address = %c.address, id = %c.id, "coordinator");
+    }
+
+    let mut materializer = Materializer::new(root.clone(), coordinators.clone());
+    // Nothing we mounted survives us in any meaningful sense: every coordinator
+    // holds its own lease state and all of them have forgotten everything (D6).
     materializer.clear_stale().await;
 
     let shared = Arc::new(Shared {
+        coordinators: coordinators.clone(),
+        links: Mutex::new(BTreeMap::new()),
         lease_locks: Mutex::new(BTreeMap::new()),
         materializer: Mutex::new(materializer),
         agents: Agents::default(),
-        to_coordinator: Mutex::new(None),
         root,
     });
 
@@ -138,41 +212,59 @@ async fn main() -> Result<()> {
         });
     }
 
-    loop {
-        if let Err(err) = run(&args, Arc::clone(&shared)).await {
-            tracing::warn!(?err, "coordinator link failed");
-        }
-        // Every lease was granted by a coordinator we can no longer reach, so
-        // none of them are valid any more (D6).
-        {
-            let mut m = shared.materializer.lock().await;
-            m.clear_stale().await;
-        }
-        shared.agents.invalidate_all().await;
-        *shared.to_coordinator.lock().await = None;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        tracing::info!("reconnecting");
+    // One reconnect loop per coordinator. They are independent authorities, so
+    // one being unreachable must not disturb the others: a lab server restart
+    // cannot be allowed to tear down a lease on a board plugged into this
+    // machine.
+    let mut tasks = Vec::new();
+    for coordinator in coordinators {
+        let shared = Arc::clone(&shared);
+        let args = args.clone();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                if let Err(err) = run(&args, Arc::clone(&shared), &coordinator).await {
+                    tracing::warn!(
+                        coordinator = %coordinator.name, ?err, "link failed"
+                    );
+                }
+                // Only this coordinator's leases are void.
+                {
+                    let mut m = shared.materializer.lock().await;
+                    m.clear_coordinator(coordinator.id).await;
+                }
+                shared.agents.invalidate(coordinator.id).await;
+                shared.links.lock().await.remove(&coordinator.id);
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                tracing::info!(coordinator = %coordinator.name, "reconnecting");
+            }
+        }));
     }
+    for t in tasks {
+        let _ = t.await;
+    }
+    Ok(())
 }
 
-async fn run(args: &Args, shared: Arc<Shared>) -> Result<()> {
-    let socket = tokio::net::TcpStream::connect(&args.coordinator)
+async fn run(args: &Args, shared: Arc<Shared>, coordinator: &Coordinator) -> Result<()> {
+    let socket = tokio::net::TcpStream::connect(&coordinator.address)
         .await
-        .with_context(|| format!("failed to dial {}", args.coordinator))?;
+        .with_context(|| format!("failed to dial {}", coordinator.address))?;
     socket.set_nodelay(true).ok();
-    tracing::info!(coordinator = %args.coordinator, "connected");
+    tracing::info!(
+        coordinator = %coordinator.name, address = %coordinator.address, "connected"
+    );
 
     let (read, write) = socket.into_split();
     let mut lines = FramedRead::new(read, LinesCodec::new());
     let mut sink = FramedWrite::new(write, LinesCodec::new());
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    *shared.to_coordinator.lock().await = Some(tx.clone());
+    shared.links.lock().await.insert(coordinator.id, tx.clone());
 
     // Agents that were connected across the outage get fresh sessions without
     // having to notice anything: their stdio shims are still running and their
     // unix sockets never closed.
-    shared.agents.reregister_all(&shared).await;
+    shared.agents.reregister_all(&shared, coordinator.id).await;
 
     let heartbeat = {
         let tx = tx.clone();
@@ -214,7 +306,7 @@ async fn run(args: &Args, shared: Arc<Shared>) -> Result<()> {
                 // lease and every other agent on this machine. A revocation
                 // notice that arrives 30s late is a device yanked without
                 // warning.
-                dispatch(&shared, msg);
+                dispatch(&shared, coordinator.id, msg);
             }
         }
     };
@@ -229,11 +321,11 @@ async fn run(args: &Args, shared: Arc<Shared>) -> Result<()> {
 /// `Unmaterialize` must never overtake the `Materialize` it undoes — while work
 /// on different leases proceeds in parallel and cheap notifications are never
 /// stuck behind either.
-fn dispatch(shared: &Arc<Shared>, msg: ToClient) {
+fn dispatch(shared: &Arc<Shared>, from: CoordinatorId, msg: ToClient) {
     let lease = match &msg {
         ToClient::Materialize { lease, .. }
         | ToClient::Unmaterialize { lease, .. }
-        | ToClient::Failed { lease, .. } => Some(*lease),
+        | ToClient::Failed { lease, .. } => Some(LeaseKey::new(from, *lease)),
         _ => None,
     };
 
@@ -243,14 +335,18 @@ fn dispatch(shared: &Arc<Shared>, msg: ToClient) {
     // it learns the real reason only after its own 30s timeout has already
     // reported something vaguer.
     if let ToClient::Failed { lease, detail } = &msg {
-        let (shared, lease, detail) = (Arc::clone(shared), *lease, detail.clone());
-        tokio::spawn(async move { shared.agents.notify_failed(lease, &detail).await });
+        let (shared, key, detail) = (
+            Arc::clone(shared),
+            LeaseKey::new(from, *lease),
+            detail.clone(),
+        );
+        tokio::spawn(async move { shared.agents.notify_failed(key, &detail).await });
     }
 
     let Some(lease) = lease else {
         // Cheap and order-independent: handle inline.
         let shared = Arc::clone(shared);
-        tokio::spawn(async move { handle(&shared, msg).await });
+        tokio::spawn(async move { handle(&shared, from, msg).await });
         return;
     };
 
@@ -258,11 +354,11 @@ fn dispatch(shared: &Arc<Shared>, msg: ToClient) {
     tokio::spawn(async move {
         let queue = shared.lease_queue(lease).await;
         let _guard = queue.lock().await;
-        handle(&shared, msg).await;
+        handle(&shared, from, msg).await;
     });
 }
 
-async fn handle(shared: &Arc<Shared>, msg: ToClient) {
+async fn handle(shared: &Arc<Shared>, from: CoordinatorId, msg: ToClient) {
     match msg {
         // Instructions we execute.
         ToClient::Materialize {
@@ -272,23 +368,28 @@ async fn handle(shared: &Arc<Shared>, msg: ToClient) {
             session,
             slots,
         } => {
+            let key = LeaseKey::new(from, lease);
+            let session = SessionKey::new(from, session);
             let owner = shared.agents.owner_for(session).await;
             let uid = shared.agents.uid_for(session).await;
             let outcome = {
                 let mut m = shared.materializer.lock().await;
-                m.materialize(lease, epoch, &owner, uid, &slots).await
+                m.materialize(key, epoch, &owner, uid, &slots).await
             };
             if let benchd_core::wire::Outcome::Ok = outcome {
-                let paths = paths_for(&shared.root, &owner, lease, &slots);
-                shared.agents.deliver_paths(lease, paths).await;
+                let paths = paths_for(&shared.root, &owner, key, &slots);
+                shared.agents.deliver_paths(key, paths).await;
             } else {
-                tracing::error!(%lease, ?outcome, "materialisation failed");
+                tracing::error!(%key, ?outcome, "materialisation failed");
             }
             shared
-                .send(&ClientMsg::Done {
-                    request,
-                    result: outcome,
-                })
+                .send(
+                    from,
+                    &ClientMsg::Done {
+                        request,
+                        result: outcome,
+                    },
+                )
                 .await;
         }
         ToClient::Unmaterialize {
@@ -297,16 +398,23 @@ async fn handle(shared: &Arc<Shared>, msg: ToClient) {
             epoch,
             session,
         } => {
-            let owner = shared.agents.owner_for(session).await;
+            let key = LeaseKey::new(from, lease);
+            let owner = shared
+                .agents
+                .owner_for(SessionKey::new(from, session))
+                .await;
             let outcome = {
                 let mut m = shared.materializer.lock().await;
-                m.unmaterialize(lease, epoch, &owner).await
+                m.unmaterialize(key, epoch, &owner).await
             };
             shared
-                .send(&ClientMsg::Done {
-                    request,
-                    result: outcome,
-                })
+                .send(
+                    from,
+                    &ClientMsg::Done {
+                        request,
+                        result: outcome,
+                    },
+                )
                 .await;
         }
 
@@ -318,11 +426,14 @@ async fn handle(shared: &Arc<Shared>, msg: ToClient) {
         } => {
             shared
                 .agents
-                .notify_revoking(lease, &reason, teardown_at)
+                .notify_revoking(LeaseKey::new(from, lease), &reason, teardown_at)
                 .await;
         }
         ToClient::Ended { lease, reason } => {
-            shared.agents.notify_ended(lease, &reason).await;
+            shared
+                .agents
+                .notify_ended(LeaseKey::new(from, lease), &reason)
+                .await;
         }
         ToClient::Failed { lease, detail: _ } => {
             // The agent has already been told (see `dispatch`); this is the
@@ -330,29 +441,42 @@ async fn handle(shared: &Arc<Shared>, msg: ToClient) {
             // the same lease so it cannot undo work that has not happened yet.
             let owner = shared
                 .agents
-                .owner_for(lease_session(shared, lease).await)
+                .owner_for(lease_session(shared, LeaseKey::new(from, lease)).await)
                 .await;
             let mut m = shared.materializer.lock().await;
-            m.unmaterialize_now(lease, &owner).await;
+            m.unmaterialize_now(LeaseKey::new(from, lease), &owner)
+                .await;
         }
 
         // Replies to agent requests.
-        other => shared.agents.deliver_reply(other).await,
+        other => {
+            // A claim the previous coordinator could not satisfy is offered to
+            // the next one.
+            if let Some(retry) = shared.agents.deliver_reply(from, other).await {
+                shared
+                    .send(
+                        retry.to,
+                        &ClientMsg::Claim {
+                            request: retry.request,
+                            session: retry.session,
+                            claim: retry.claim,
+                        },
+                    )
+                    .await;
+            }
+        }
     }
 }
 
 /// Which session a lease belongs to, as far as this daemon knows.
-async fn lease_session(
-    shared: &Arc<Shared>,
-    lease: benchd_core::lease::LeaseId,
-) -> benchd_core::lease::SessionId {
+async fn lease_session(shared: &Arc<Shared>, lease: LeaseKey) -> SessionKey {
     shared.agents.session_for_lease(lease).await
 }
 
 fn paths_for(
     root: &std::path::Path,
     owner: &str,
-    lease: benchd_core::lease::LeaseId,
+    lease: LeaseKey,
     slots: &BTreeMap<String, BTreeMap<String, benchd_core::wire::ResourceHandle>>,
 ) -> BTreeMap<String, BTreeMap<String, String>> {
     let mut out = BTreeMap::new();

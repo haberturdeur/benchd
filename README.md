@@ -55,6 +55,12 @@ waste. A granted claim is a **lease** with a mandatory explicit TTL, renewable o
 explicit call, released the moment its session dies. Executors fence on a per-bench
 epoch, so a stale instruction can never hand out live hardware.
 
+A client may hold links to **several coordinators at once** — the usual arrangement is a
+shared lab server plus one bound to `127.0.0.1` owning the boards on your own desk, which
+keeps them private without needing accounts or ACLs, and means a lab outage cannot take
+your local hardware with it. Agents are not told: tag counts are summed, statuses merged,
+and a claim goes to the first coordinator that can satisfy it.
+
 Everything talks newline-delimited JSON over plain TCP, with no schema language and no
 cryptography: benchd assumes a trusted LAN (see §9 of the design doc), and the trust
 boundary belongs to the network, not the application.
@@ -87,6 +93,13 @@ dist/install.sh          # first time: binaries, config, systemd units
 dist/deploy.sh           # thereafter: rebuild, install, verify checksums
 sudo systemctl enable --now benchd-coordinator benchd-clientd
 sudo systemctl enable --now benchd-host@esp32s3-a      # one per bench
+```
+
+To also use a shared lab server, give the client both — in preference order, so your own
+boards are tried first:
+
+```sh
+benchd-clientd --coordinator local=127.0.0.1:4711 --coordinator lab=lab.example:4711
 ```
 
 Run agents sandboxed, so a lease is enforced rather than advisory:

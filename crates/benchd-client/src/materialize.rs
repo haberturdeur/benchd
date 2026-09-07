@@ -25,7 +25,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use benchd_core::lease::{LeaseId, SessionId};
+use crate::ids::LeaseKey;
+use benchd_core::lease::SessionId;
 use benchd_core::sysfs;
 use benchd_core::usbip;
 use benchd_core::wire::{ChannelHello, ChannelSide, Outcome, ResourceHandle};
@@ -37,25 +38,27 @@ type OwnershipToRestore = (PathBuf, (u32, u32));
 
 pub struct Materializer {
     root: PathBuf,
-    coordinator: String,
+    /// Needed to dial a relay data channel, which goes to the coordinator that
+    /// granted the lease rather than to any particular one.
+    coordinators: Vec<crate::Coordinator>,
     /// Highest epoch seen per lease. The client is an executor too, and a
     /// delayed instruction for a superseded lease must be dropped rather than
     /// obeyed — obeying it would expose hardware whose lease is gone (D7).
     /// Until now only the host fenced, and the client relied on TCP ordering.
-    seen: BTreeMap<LeaseId, benchd_core::lease::Epoch>,
-    active: BTreeMap<LeaseId, PathBuf>,
+    seen: BTreeMap<LeaseKey, benchd_core::lease::Epoch>,
+    active: BTreeMap<LeaseKey, PathBuf>,
     /// vhci ports this lease imported, needing an explicit detach.
-    imported: BTreeMap<LeaseId, Vec<u32>>,
+    imported: BTreeMap<LeaseKey, Vec<u32>>,
     /// Device ownership to put back on release. A bind mount shares the source
     /// inode, so handing a device to an agent changes it in `/dev` too.
-    restore: BTreeMap<LeaseId, Vec<OwnershipToRestore>>,
+    restore: BTreeMap<LeaseKey, Vec<OwnershipToRestore>>,
 }
 
 impl Materializer {
-    pub fn new(root: impl Into<PathBuf>, coordinator: String) -> Self {
+    pub fn new(root: impl Into<PathBuf>, coordinators: Vec<crate::Coordinator>) -> Self {
         Materializer {
             root: root.into(),
-            coordinator,
+            coordinators,
             seen: BTreeMap::new(),
             active: BTreeMap::new(),
             restore: BTreeMap::new(),
@@ -70,10 +73,20 @@ impl Materializer {
     /// returns before the tty exists.
     async fn import(
         &self,
+        coordinator: crate::ids::CoordinatorId,
         channel: &benchd_core::wire::ChannelKey,
         busid: &str,
     ) -> Result<(u32, PathBuf), String> {
-        let stream = tokio::net::TcpStream::connect(&self.coordinator)
+        // The data channel goes to the coordinator that granted this lease, not
+        // to whichever one happens to be first: the rendezvous key only exists
+        // in that coordinator's relay.
+        let address = self
+            .coordinators
+            .iter()
+            .find(|c| c.id == coordinator)
+            .map(|c| c.address.clone())
+            .ok_or_else(|| format!("no address for coordinator {coordinator}"))?;
+        let stream = tokio::net::TcpStream::connect(&address)
             .await
             .map_err(|e| format!("dialling the coordinator for a data channel: {e}"))?;
         stream.set_nodelay(true).ok();
@@ -130,8 +143,12 @@ impl Materializer {
         }
     }
 
-    fn lease_dir(&self, owner: &str, lease: LeaseId) -> PathBuf {
-        self.root.join(owner).join(lease.to_string())
+    fn lease_dir(&self, owner: &str, lease: LeaseKey) -> PathBuf {
+        // The coordinator is part of the path: two coordinators both issue l1,
+        // and without it their device nodes would land on top of each other.
+        self.root
+            .join(owner)
+            .join(format!("{}-{}", lease.coordinator, lease.lease))
     }
 
     /// Remove everything under our root.
@@ -139,8 +156,30 @@ impl Materializer {
     /// Bind mounts are kernel state and outlive the process that made them, so
     /// without this a restart would leave hardware reachable by an agent whose
     /// lease is gone (D6).
+    /// Forget everything belonging to ONE coordinator, and release its devices.
+    ///
+    /// Per coordinator, not global: a blip on the shared lab server must not
+    /// tear down leases granted by the local coordinator that owns this
+    /// operator's own boards. Those are independent authorities and one being
+    /// unreachable says nothing about the other.
+    pub async fn clear_coordinator(&mut self, coordinator: crate::ids::CoordinatorId) {
+        let mine: Vec<LeaseKey> = self
+            .active
+            .keys()
+            .chain(self.imported.keys())
+            .chain(self.seen.keys())
+            .filter(|k| k.coordinator == coordinator)
+            .copied()
+            .collect();
+        for lease in mine {
+            self.unmaterialize_now(lease, "").await;
+            self.seen.remove(&lease);
+        }
+    }
+
+    /// Clear everything, including kernel state left by a previous process.
     pub async fn clear_stale(&mut self) {
-        // Every lease the coordinator granted is void, so none of the
+        // Every lease every coordinator granted is void, so none of the
         // bookkeeping about them means anything either.
         //
         // `seen` in particular MUST be cleared. It is keyed by lease id, and a
@@ -181,7 +220,7 @@ impl Materializer {
 
     /// Accept an instruction only if it is at least as new as anything we have
     /// already seen for this lease.
-    fn fence(&mut self, lease: LeaseId, epoch: benchd_core::lease::Epoch) -> Result<(), Outcome> {
+    fn fence(&mut self, lease: LeaseKey, epoch: benchd_core::lease::Epoch) -> Result<(), Outcome> {
         let seen = self
             .seen
             .entry(lease)
@@ -196,7 +235,7 @@ impl Materializer {
 
     pub async fn materialize(
         &mut self,
-        lease: LeaseId,
+        lease: LeaseKey,
         epoch: benchd_core::lease::Epoch,
         owner: &str,
         uid: Option<u32>,
@@ -272,7 +311,7 @@ impl Materializer {
                         plan.push((source, dir.join(slot).join(name)));
                     }
                     ResourceHandle::UsbIp { channel, busid } => {
-                        match self.import(channel, busid).await {
+                        match self.import(lease.coordinator, channel, busid).await {
                             Ok((port, source)) => {
                                 ports.push(port);
                                 plan.push((source, dir.join(slot).join(name)));
@@ -335,7 +374,7 @@ impl Materializer {
 
     pub async fn unmaterialize(
         &mut self,
-        lease: LeaseId,
+        lease: LeaseKey,
         epoch: benchd_core::lease::Epoch,
         owner: &str,
     ) -> Outcome {
@@ -347,7 +386,7 @@ impl Materializer {
 
     /// Teardown without fencing, for paths that already know the lease is dead
     /// (a failed setup, or clearing state at startup).
-    pub async fn unmaterialize_now(&mut self, lease: LeaseId, owner: &str) -> Outcome {
+    pub async fn unmaterialize_now(&mut self, lease: LeaseKey, owner: &str) -> Outcome {
         // Give the device back before unmounting: afterwards the path is gone
         // and the inode is unreachable from here.
         for (path, (uid, gid)) in self.restore.remove(&lease).unwrap_or_default() {
@@ -446,12 +485,12 @@ async fn unmount_tree(dir: &Path) {
 pub fn resource_path(
     root: &Path,
     owner: &str,
-    lease: LeaseId,
+    lease: LeaseKey,
     slot: &str,
     resource: &str,
 ) -> PathBuf {
     root.join(owner)
-        .join(lease.to_string())
+        .join(format!("{}-{}", lease.coordinator, lease.lease))
         .join(slot)
         .join(resource)
 }

@@ -402,6 +402,49 @@ only reclaim path.
 `Register { name, credential } -> SessionToken` if authentication is ever wanted — one
 function, not an architecture.
 
+### D21. A client speaks to several coordinators; the agent sees one lab
+
+A `benchd-clientd` dials any number of coordinators at once. The expected setup is two:
+a shared lab server, and a coordinator on the operator's own machine, bound to
+`127.0.0.1`, owning the boards on that desk.
+
+*Why:* the requirement is "my own boards stay mine, the lab's are shared". Doing that on
+one coordinator means bench ownership, which means real identity, authentication and
+per-bench ACLs — the whole apparatus D19 exists to avoid, to obtain a property that
+binding to loopback gives for free. A local coordinator is not reachable from the
+network at all, so the lab server never learns those boards exist and no policy has to
+be written down.
+
+It also buys **failure isolation**, which matters more than it first appears. D6 makes
+the coordinator a SPOF whose death releases every lease it owns. With one coordinator,
+lab downtime — or simply being on a train — takes the boards on your own desk with it.
+With two, a lab outage is invisible to local work, and the daemon reconnects to each
+independently. This is verified: killing the lab coordinator tears down its lease and
+leaves the local one materialised and usable.
+
+**One bench, one authority.** A host registers with exactly one coordinator. Registering
+with two would let two authorities grant a lease for the same hardware simultaneously,
+which is the single-writer property of D6 — the whole point of the system. The unit of
+division is therefore the *access policy*, not the team: benches that can be claimed
+*together* must share a coordinator, because an atomic multi-slot claim (D13) cannot
+span two authorities without two-phase commit, which is not worth it here.
+
+**Agents are not told.** `tag_list` returns the union with counts summed; `lease_status`
+merges; a claim is offered to coordinators in configuration order and the first that can
+satisfy it wins. Listing the local one first therefore prefers your own hardware. A claim
+is never broadcast: two coordinators satisfying it at once would hold hardware nobody
+asked for. Failures merge by D14's rule — retryable if *any* coordinator is merely
+contended, unsatisfiable only when they all agree.
+
+**Ids are per-coordinator and must be namespaced.** Each coordinator is an independent
+authority numbering its own `LeaseId`, `SessionId` and epochs from 1, so `l1` is
+ambiguous the moment a second coordinator exists — and silently so, which is how the
+epoch bug in Appendix B behaved. The client therefore keys every map on a composite
+`(coordinator, lease)`, and materialises to `…/<owner>/c1-l7/…`. The id handed to the
+agent packs the coordinator into the high 32 bits, so the agent still passes one opaque
+number to `release` and never learns there is more than one lab. This was not
+theoretical: the first end-to-end run had both coordinators issue `l1` simultaneously.
+
 ### D9. Central vocabulary, host-declared benches
 
 Each host declares its own bench — resources, tags, description — and registers it. The
@@ -786,6 +829,7 @@ more than the individual bugs.
 | Medium | A slow materialisation blocked *all* coordinator messages for every agent | Messages handled serially in the read loop |
 | Medium | `tick` advanced one state per call, so an overdue lease survived a late tick | Warning and teardown were mutually exclusive branches |
 | Medium | Host leaked a usbip binding when export failed after binding | Teardown list excluded the busid being worked on |
+| High | With two coordinators, `lease_status` reported every lease as belonging to the first | Lease ids rewritten to public form on `Granted` but not on the merged `Status` — same invariant, second place |
 | Medium | `force_release` could extend a lease past its own expiry | Grace added to `now` without capping at `expires_at` |
 | Medium | Relay keys were derived from `(lease, epoch, bench, resource)` — all small, sequential or discoverable — so a third party could guess a live key and be spliced in place of the real device | Convenience of independent derivation was preferred to unguessability |
 | Medium | The client never fenced on epoch at all | Only the host implemented D7; the client relied on TCP ordering |
@@ -859,6 +903,14 @@ most starkly, fixed on the host and then reintroduced on the client weeks of
 work later. The lesson is not "test more" but that a fix to an invariant must be
 applied to *every* component that holds it, and the invariant itself written
 down somewhere a reviewer can check.
+
+Multi-coordinator support (D21) produced the pattern a third time, and it is
+worth recording because the invariant was *brand new*: lease ids had to be
+rewritten to their agent-facing form on the way out, which was done on the grant
+path and forgotten on the status path, so `lease_status` attributed every lease
+to the first coordinator. Newly-introduced invariants are not safer than
+long-standing ones — they are more dangerous, because no reviewer has the habit
+of checking them yet.
 
 The privileged daemons remain the least-tested surface: both escalations lived
 where no test ran.
