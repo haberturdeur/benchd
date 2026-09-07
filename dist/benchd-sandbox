@@ -2,21 +2,30 @@
 # Run a command with one agent's lease directory visible and no other's.
 #
 # **This is an example, not a requirement.** benchd does not need it and does not
-# assume it ran. Bench devices are hidden by the host that owns them (design
-# decision D22): they are bound to the usbip stub and have no tty on any machine,
-# so an agent that ignores the skill and reaches for /dev/ttyUSB0 gets ENOENT
-# whether or not it is sandboxed. There is nothing here left to conceal.
+# assume it ran. A bench's own boards are hidden by the host that owns them
+# (design decision D22): they are bound to the usbip stub and have no tty, so an
+# agent that ignores the skill and reaches for /dev/ttyUSB0 gets ENOENT there
+# whether or not it is sandboxed.
 #
-# What it is still good for is the one thing hiding does not do: separating two
-# agents that share a uid. Leases materialise under /run/benchd/<identity>, and
-# DAC alone cannot keep same-uid agents out of each other's directories. Binding
-# only the caller's own can.
+# That is a fact about the *host*, though, and this script runs on the client.
+# A lease imports its device over USB/IP onto this machine, and the import
+# enumerates a real, fresh device node here — which the client daemon then makes
+# reachable by the agent holding the lease. Nothing the host does keeps a
+# *second* agent on this machine away from that node under its own /dev name,
+# and two agents sharing a uid is exactly the case this script exists to
+# separate. So it does two things:
+#
+#   - a minimal /dev, so that a leased board is reachable only through the lease
+#     that granted it, by the agent it was granted to;
+#   - a bind of only the caller's own lease directory, because leases
+#     materialise under /run/benchd/<identity> and DAC alone cannot keep
+#     same-uid agents out of each other's.
 #
 # Use whatever sandbox you prefer -- this one is bubblewrap. Adapt it, replace
 # it, or drop it.
 #
 # Usage:
-#   benchd-sandbox [--identity NAME] [--root DIR] -- command [args...]
+#   benchd-sandbox [--identity NAME] [--root DIR] [--dev-allow PATH]... -- command [args...]
 #
 # Example:
 #   benchd-sandbox --identity pi-4f2a -- pi
@@ -24,14 +33,18 @@ set -euo pipefail
 
 ROOT=/run/benchd
 IDENTITY=${BENCHD_IDENTITY:-}
+DEV_ALLOW=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --identity) IDENTITY=$2; shift 2 ;;
-    --root)     ROOT=$2; shift 2 ;;
-    --)         shift; break ;;
-    -h|--help)  sed -n '2,22p' "$0" | sed 's/^# \?//'; exit 0 ;;
-    *)          echo "unknown option: $1" >&2; exit 2 ;;
+    --identity)  IDENTITY=$2; shift 2 ;;
+    --root)      ROOT=$2; shift 2 ;;
+    --dev-allow) DEV_ALLOW+=("$2"); shift 2 ;;
+    --)          shift; break ;;
+    # Printed from the header itself, up to the first line of code, so that
+    # editing the comment above cannot silently truncate the help.
+    -h|--help)   sed -n '2,/^[^#]/p' "$0" | sed -n 's/^# \?//p'; exit 0 ;;
+    *)           echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
 
@@ -70,18 +83,61 @@ if [ "${BENCHD_SANDBOX_VERBOSE:-}" = "1" ]; then
   echo "benchd-sandbox: identity=$IDENTITY leases=$OWNER" >&2
 fi
 
-# /dev is passed through untouched: the devices worth hiding have already been
-# hidden by their host, and the ones left are this machine's own business.
+# Anything the site genuinely needs from the real /dev, named one device at a
+# time. The escape hatch has to be here and obvious, because the alternative is
+# what happened last time: somebody needed one node, widened the default to a
+# bind of the whole of /dev, and the isolation went with it.
+DEV_ARGS=()
+for d in "${DEV_ALLOW[@]}"; do
+  [ -e "$d" ] || { echo "--dev-allow $d: no such path" >&2; exit 2; }
+  DEV_ARGS+=(--dev-bind "$d" "$d")
+done
+
+# --dev /dev: a fresh, minimal devtmpfs, not a bind of the host's.
 #
-# --tmpfs over the root first, then a bind of only this agent's directory: that
-# is what stops one agent reaching another's leases. Because the bind is of a
-# *directory*, leases appear and disappear inside a running sandbox with no
-# restart and no cooperation from the agent.
+# Two properties matter and only the fresh mount has both. Nothing this machine
+# has now is visible — including /dev/bus/usb, which reaches an imported device
+# just as directly as its tty does. And nothing this machine gains *later*
+# becomes visible either: a lease granted to another agent while this sandbox is
+# running imports a device and enumerates a node for it, and through a bind of
+# /dev that node would appear in here too, under a name this agent can open.
+# There is nothing to re-check and no window to get right; the node simply is
+# not in this mount namespace.
+#
+# The devices this agent is entitled to arrive by the lease directory instead.
+#
+# --dev-bind for that directory, not --bind: bubblewrap adds MS_NODEV to a
+# plain --bind, and a device node that is an ordinary inode *in* the directory
+# is then unopenable (EACCES). A node the daemon bind-mounts there is a mount
+# of its own, carries the flags of /dev, and would survive either way; a node
+# the daemon creates there with mknod would not. The directory is root-owned
+# and not agent-writable (see PrepareOwner above), so allowing devices on it
+# does not let the agent introduce one of its own.
+#
+# Necessary but not sufficient, and the other half is not ours: bubblewrap can
+# only add mount flags, never clear them, and a bind made inside a user
+# namespace has them locked anyway. So if the filesystem the lease directory
+# lives on is itself nodev -- /run is, on both machines here -- a created node
+# cannot be opened from inside this sandbox or outside it, and the daemon has
+# to give its root a mount that permits devices.
+#
+# --tmpfs over the lease root first, then a bind of only this agent's
+# directory: that is what stops one agent reaching another's leases. Because
+# the bind is of a *directory*, leases appear and disappear inside a running
+# sandbox with no restart and no cooperation from the agent.
+#
+# --unshare-pid, because /proc/<pid>/root of a process with the same uid leads
+# straight into that process's mount namespace, lease directory and all. Same
+# uid is the entire threat model here, so leaving the host's pids visible would
+# hand back what the bind above just withheld.
 exec bwrap \
   --ro-bind / / \
+  --dev /dev \
+  "${DEV_ARGS[@]}" \
   --tmpfs "$ROOT" \
-  --bind "$OWNER" "$OWNER" \
+  --dev-bind "$OWNER" "$OWNER" \
   --bind "$SOCK" "$SOCK" \
+  --unshare-pid \
   --proc /proc \
   --tmpfs /tmp \
   --bind "${HOME}" "${HOME}" \

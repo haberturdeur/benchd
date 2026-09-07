@@ -11,7 +11,21 @@ ExecStart=/usr/local/bin/benchd host --config /etc/benchd/benches/%i.toml --coor
 # that binding is kernel state which outlives whatever created it -- so without
 # this, a SIGKILLed host leaves its boards invisible until something starts
 # again to release them.
-ExecStopPost=/usr/local/bin/benchd host --config /etc/benchd/benches/%i.toml --release-all
+#
+# The bench is named by the instance rather than by its config file, because
+# this has to work when the config is gone: deleting it is step one of
+# decommissioning a bench, and `systemctl disable --now` is step two. Reading
+# the config first meant the recovery failed on a bench that no longer had one
+# and released nothing, leaving boards stub-bound with no tty and nothing on the
+# machine that remembered why. What the release actually needs is the name the
+# devices were recorded under, which is this.
+ExecStopPost=/usr/local/bin/benchd host --release-all --bench %i
+# Loopback default so a single-machine install needs no configuration. A lab
+# with a shared coordinator overrides it in a drop-in --
+# /etc/systemd/system/benchd-host@.service.d/10-coordinator.conf, which
+# install.sh creates -- and not here: deploy.sh reinstalls this file on every
+# deploy, because the unit names the binary's subcommands and the two have to
+# move together.
 Environment=BENCHD_COORDINATOR=127.0.0.1:4711
 Restart=always
 RestartSec=3

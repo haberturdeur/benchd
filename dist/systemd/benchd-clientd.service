@@ -4,6 +4,15 @@ After=network.target
 
 [Service]
 ExecStart=/usr/local/bin/benchd client --coordinator ${BENCHD_COORDINATOR} --root /run/benchd
+# Loopback default so a single-machine install needs no configuration. To add a
+# shared lab server the client needs a second --coordinator, which means
+# overriding ExecStart= rather than this line, and either way the place for it
+# is a drop-in --
+# /etc/systemd/system/benchd-clientd.service.d/10-coordinator.conf, which
+# install.sh creates. Not here: deploy.sh reinstalls this file on every deploy,
+# because the unit names the binary's subcommands and the two have to move
+# together. An ExecStart= override needs an empty ExecStart= line before it, or
+# systemd appends a second command instead of replacing the first.
 Environment=BENCHD_COORDINATOR=127.0.0.1:4711
 Restart=always
 RestartSec=3
