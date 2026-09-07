@@ -64,9 +64,21 @@ if [ -n "$STALE" ]; then
 fi
 
 cargo build --release
-sudo install -m755 target/release/benchd /usr/local/bin/
 
-a=$(sha256sum target/release/benchd | cut -d' ' -f1)
+# Ask cargo where it built rather than assuming ./target. CARGO_TARGET_DIR in
+# the environment, or build.target-dir in a .cargo/config.toml, sends the
+# artefact elsewhere -- and then the install and the checksum below both read a
+# *different*, older file and agree with each other about it. That is how this
+# script reported "deployed and verified" for a binary the build never touched,
+# which is precisely the failure the rest of it exists to catch.
+TARGET_DIR=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+  | grep -o '"target_directory":"[^"]*"' | head -1 | cut -d'"' -f4)
+BIN="${TARGET_DIR:-${CARGO_TARGET_DIR:-target}}/release/benchd"
+[ -x "$BIN" ] || { echo "cargo built no $BIN" >&2; exit 1; }
+
+sudo install -m755 "$BIN" /usr/local/bin/
+
+a=$(sha256sum "$BIN" | cut -d' ' -f1)
 c=$(sha256sum /usr/local/bin/benchd  | cut -d' ' -f1)
 [ "$a" = "$c" ] || { echo "MISMATCH: /usr/local/bin/benchd is not the binary just built"; exit 1; }
 

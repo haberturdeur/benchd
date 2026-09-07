@@ -7,6 +7,16 @@ cd "$(dirname "$0")/.."
 # binary this script installs, or the units die on `unrecognized subcommand`.
 SUBCOMMANDS="coordinator host client"
 
+# Ask cargo where it builds rather than assuming ./target. CARGO_TARGET_DIR in
+# the environment, or build.target-dir in a .cargo/config.toml, sends the
+# artefact somewhere else -- and then every check below reads a *different*,
+# older file, compares it against itself, and reports a successful install of a
+# binary the build never touched. Exactly the stale-artefact failure the rest of
+# this script exists to prevent, arriving through the one path it trusted.
+TARGET_DIR=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+  | grep -o '"target_directory":"[^"]*"' | head -1 | cut -d'"' -f4)
+BIN="${TARGET_DIR:-${CARGO_TARGET_DIR:-target}}/release/benchd"
+
 # Ask a binary whether it is the merged benchd.
 #
 # `--help` on a subcommand parses the command line and exits without running
@@ -21,7 +31,7 @@ has_subcommands() {
 # Build unless a release binary is already present (so this works under sudo,
 # where cargo may not be on PATH) -- but "present" is not "correct". `benchd`
 # was a binary name before the merge too: it was the operator CLI, and cargo
-# never deletes a binary it has stopped producing. So target/release/benchd
+# never deletes a binary it has stopped producing. So a release `benchd`
 # exists on every machine that ever built the old tree, and a plain -x test on
 # it made `git pull && dist/install.sh` skip the build, install a program with
 # no coordinator, host or client subcommand, and then write unit files invoking
@@ -32,27 +42,27 @@ has_subcommands() {
 # the build has run there is nothing to compare against, and rather than built
 # unconditionally because that would lose the no-cargo-on-PATH case above. What
 # actually matters is whether the file can do the job the units ask of it.
-if ! has_subcommands target/release/benchd; then
+if ! has_subcommands "$BIN"; then
   if ! command -v cargo >/dev/null; then
-    echo "target/release/benchd is missing or predates the one-binary merge," >&2
+    echo "$BIN is missing or predates the one-binary merge," >&2
     echo "and cargo is not on PATH to rebuild it. Run 'cargo build --release'" >&2
     echo "as the user who owns the build tree, then run this script again." >&2
     exit 1
   fi
   cargo build --release
-  has_subcommands target/release/benchd || {
-    echo "the build produced a target/release/benchd without one of:" >&2
+  has_subcommands "$BIN" || {
+    echo "the build produced a $BIN without one of:" >&2
     echo "  $SUBCOMMANDS" >&2
     exit 1
   }
 fi
 
-sudo install -m755 target/release/benchd /usr/local/bin/
+sudo install -m755 "$BIN" /usr/local/bin/
 
 # The check deploy.sh has always had, and this script never did. Four separate
 # debugging dead ends in this project were a stale binary in /usr/local/bin,
 # and the one above only proves the *source* of the copy was sound.
-a=$(sha256sum target/release/benchd | cut -d' ' -f1)
+a=$(sha256sum "$BIN" | cut -d' ' -f1)
 c=$(sha256sum /usr/local/bin/benchd  | cut -d' ' -f1)
 [ "$a" = "$c" ] || { echo "MISMATCH: /usr/local/bin/benchd is not the binary just built"; exit 1; }
 
