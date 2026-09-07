@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 
 use benchd_core::lease::{Effect, LeaseManager, LeaseState, RevokeReason};
 use benchd_core::limits::Limits;
-use benchd_core::model::{valid_component, ClaimRequest, Distinct, Inventory, Requirement};
+use benchd_core::model::{
+    valid_component, ClaimRequest, Distinct, Inventory, Requirement, MAX_SLOTS,
+};
 
 const INVENTORY: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -90,6 +92,29 @@ fn a_claim_must_name_at_least_one_slot() {
         reason: String::new(),
     };
     assert!(request.validate().is_err());
+}
+
+#[test]
+fn a_claim_cannot_name_unboundedly_many_slots() {
+    // The assignment search is exponential in slots and runs under the
+    // coordinator's one state lock. Admission counts benches, not slots — as
+    // `max_benches` says it does — so nothing else stops an agent asking for a
+    // thousand slots that all share one board.
+    let slots = |n: usize| ClaimRequest {
+        slots: (0..n)
+            .map(|i| {
+                (
+                    format!("s{i}"),
+                    Requirement::parse(["soc=esp32s3"]).unwrap(),
+                )
+            })
+            .collect(),
+        distinct: Distinct::None,
+        ttl_seconds: 60,
+        reason: String::new(),
+    };
+    assert!(slots(MAX_SLOTS).validate().is_ok());
+    assert!(slots(MAX_SLOTS + 1).validate().is_err());
 }
 
 // --- a lease must never outlive its teardown -------------------------------

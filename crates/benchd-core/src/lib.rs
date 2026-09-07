@@ -34,19 +34,13 @@ pub use matcher::{allocate, fit_cost, Allocation, BusyInfo, Failure, NoMatch, Sl
 pub use model::{Bench, ClaimRequest, Distinct, Inventory, InventoryError, Requirement, Resource};
 pub use tags::{format_tags, parse_tags, Tag, TagError, TagSet, Vocabulary};
 
-/// Convenience wrapper: allocate against a whole inventory, wiring up the tag
-/// counts and per-key weights the matcher needs.
+/// Convenience wrapper: allocate against a whole inventory, wiring up the
+/// per-key weights the matcher needs.
 pub fn allocate_in(
     inventory: &Inventory,
     request: &ClaimRequest,
     busy: &std::collections::BTreeMap<String, BusyInfo>,
 ) -> Result<Allocation, NoMatch> {
     let benches = inventory.enabled_benches();
-    allocate(
-        request,
-        &benches,
-        busy,
-        &inventory.tag_counts(),
-        inventory.vocabulary.key_weights(),
-    )
+    allocate(request, &benches, busy, inventory.vocabulary.key_weights())
 }

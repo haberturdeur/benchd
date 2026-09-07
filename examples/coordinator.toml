@@ -72,8 +72,9 @@ description = "Bluetooth / BLE"
 
 [tags.psram]
 description = "External PSRAM fitted"
-[tags.psram.values.none]
-description = "No PSRAM"
+# No psram=none, for the same reason there is no jtag=none below: a board with
+# no PSRAM omits the key, and an absent capability is not one the matcher may
+# price.
 [tags.psram.values.quad]
 description = "Quad-SPI PSRAM"
 [tags.psram.values.octal]
@@ -81,6 +82,12 @@ description = "Octal-SPI PSRAM"
 
 [tags.flash]
 description = "Flash size"
+# weight 0: this describes the board rather than naming a capability an agent
+# can waste. Scoring prices a tag by how few benches carry that exact value,
+# and flash values are ordinal - so 4mb, being rarer, was charged more than
+# 8mb, and "least capable wins" ran backwards. A claim that needs 8 MiB asks
+# for flash=8mb and gets an exact match; there is no ladder between values.
+weight = 0
 [tags.flash.values."4mb"]
 description = "4 MiB"
 [tags.flash.values."8mb"]

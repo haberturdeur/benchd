@@ -18,7 +18,8 @@ pub struct Limits {
     pub max_ttl: Secs,
     /// Longest total hold across renewals, so nobody renews forever.
     pub max_total_hold: Secs,
-    /// Concurrent benches per session.
+    /// Concurrent benches per session — distinct boards, counted once each
+    /// however many slots point at them.
     pub max_benches: usize,
     /// Warning window before teardown, during which the lease is `Revoking`
     /// and the holder can park the board. Yanking a device mid-flash can leave
@@ -92,26 +93,47 @@ impl GrantedTtl {
 
 impl Limits {
     /// Validate a claim and return the TTL to grant.
+    ///
+    /// `benches_wanted` is a count of **benches, not slots**. Two slots that
+    /// deliberately share one board under `distinct = false` cost one, which is
+    /// what `max_benches` means and what the error says out loud; charging per
+    /// slot told an agent holding a single board that it was holding two.
     pub fn grant(
         &self,
         requested_ttl: Secs,
-        slots: usize,
+        benches_wanted: usize,
         benches_held: usize,
     ) -> Result<GrantedTtl, LimitError> {
         if requested_ttl == 0 {
             return Err(LimitError::NoTtl);
         }
-        if benches_held + slots > self.max_benches {
-            return Err(LimitError::TooManyBenches {
-                max: self.max_benches,
-                held: benches_held,
-                wanted: slots,
-            });
-        }
+        self.check_benches(benches_held, benches_wanted)?;
         Ok(GrantedTtl {
             granted: requested_ttl.min(self.max_ttl).min(self.max_total_hold),
             requested: requested_ttl,
         })
+    }
+
+    /// Whether a session already holding `benches_held` may take
+    /// `benches_wanted` more.
+    ///
+    /// Separate from [`Limits::grant`] because how many benches a claim really
+    /// takes is only known once the matcher has assigned it: admission runs
+    /// first on the fewest benches the claim could possibly need, and the
+    /// caller checks the assignment it actually got against this.
+    pub fn check_benches(
+        &self,
+        benches_held: usize,
+        benches_wanted: usize,
+    ) -> Result<(), LimitError> {
+        if benches_held + benches_wanted > self.max_benches {
+            return Err(LimitError::TooManyBenches {
+                max: self.max_benches,
+                held: benches_held,
+                wanted: benches_wanted,
+            });
+        }
+        Ok(())
     }
 
     /// Validate a renewal and return the extension to grant.

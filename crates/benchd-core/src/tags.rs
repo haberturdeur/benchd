@@ -284,6 +284,12 @@ impl Vocabulary {
         None
     }
 
+    /// Whether this tag is one the vocabulary knows.
+    ///
+    /// An open key is accepted wholesale, because there is nothing to check it
+    /// against — which is right for a *requirement* (`name=esp32s3-a` is how an
+    /// operator asks for one board) and wrong for a bench declaring its own
+    /// tags. See [`crate::model::check_declared_tags`].
     pub fn contains(&self, tag: &Tag) -> bool {
         if self.open_keys.contains(&tag.key) {
             return true;
@@ -305,8 +311,23 @@ impl Vocabulary {
     }
 
     /// Check that vocabulary values are well-formed, that every implied tag
-    /// exists, and that there are no cycles.
+    /// exists, that weights are usable numbers, and that there are no cycles.
     fn validate(&self) -> Result<(), TagError> {
+        // A weight is multiplied into every cost and divided by nothing that
+        // can rescue it. A NaN propagates through the whole score, which makes
+        // every branch-and-bound comparison false and quietly turns best-fit
+        // into "whatever the search happened to reach last"; a negative weight
+        // breaks the non-negativity the bound assumes and can prune the
+        // cheapest assignment away.
+        for (key, weight) in &self.key_weights {
+            if !weight.is_finite() || *weight < 0.0 {
+                return Err(TagError::Vocabulary(format!(
+                    "key {key:?} has weight {weight}; weights must be finite and \
+                     non-negative (0 for a descriptive key, 1 for a capability)"
+                )));
+            }
+        }
+
         for tag in self.defs.keys() {
             // Dashes are legal in tag values generally (identity values like
             // `name=esp32s3-a` need them), but a *capability* value with a dash
@@ -341,6 +362,28 @@ impl Vocabulary {
 
         for (tag, def) in &self.defs {
             for implied in &def.implies {
+                // The same two rules the declared values obey, applied to the
+                // targets. Checking only `defs.keys()` above left the whole
+                // vocabulary able to reach round the back: an `implies` naming
+                // `peripheral=accel[mpu6050]` puts a centrally-invented part
+                // number on every bench declaring the tag that implies it, and
+                // one naming `name=impostor` mints an identity from a config
+                // file. Neither is a thing anyone is allowed to *declare*.
+                if implied.qualifier().is_some() {
+                    return Err(TagError::Vocabulary(format!(
+                        "{tag} implies {implied}, which carries a [qualifier]; imply \
+                         {}={} and let benches name the part",
+                        implied.key,
+                        implied.base()
+                    )));
+                }
+                if self.open_keys.contains(&implied.key) {
+                    return Err(TagError::Vocabulary(format!(
+                        "{tag} implies {implied}, but {:?} is an open key whose values \
+                         are not the vocabulary's to hand out",
+                        implied.key
+                    )));
+                }
                 if !self.contains(implied) {
                     return Err(TagError::Vocabulary(format!(
                         "{tag} implies unknown tag {implied}"
@@ -395,7 +438,10 @@ impl Vocabulary {
     pub fn check<'a, I: IntoIterator<Item = &'a Tag>>(&self, tags: I) -> Result<(), TagError> {
         for tag in tags {
             if let Some(qualifier) = tag.qualifier() {
-                if !self.open_keys.contains(&tag.key) && !self.qualified_keys.contains(&tag.key) {
+                // Open keys are not exempt. Their values are unbounded, not
+                // structured, and `name=esp32s3-a[spare]` is a second way to
+                // spell an identity that must have exactly one.
+                if !self.qualified_keys.contains(&tag.key) {
                     return Err(TagError::Vocabulary(format!(
                         "{tag}: values on {:?} do not take a [qualifier]",
                         tag.key

@@ -16,6 +16,15 @@ const INVENTORY: &str = include_str!(concat!(
     "/../../examples/inventory.toml"
 ));
 
+/// The vocabulary the coordinator actually deploys. Benches live with their
+/// hosts, so this file has none, but its tag definitions must classify keys the
+/// same way the example inventory does or the lab scores differently from the
+/// tests.
+const COORDINATOR: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../examples/coordinator.toml"
+));
+
 fn inventory() -> Inventory {
     Inventory::from_toml_str(INVENTORY).expect("example inventory should load")
 }
@@ -76,6 +85,26 @@ fn requests_are_not_expanded_only_benches_are() {
 
 // --- best fit --------------------------------------------------------------
 
+/// What each candidate would cost for a single-slot claim, with nothing busy.
+///
+/// Which bench won is only half the story: ties are broken by bench id, so an
+/// assertion naming the winner passes just as happily when the metric says the
+/// two are indistinguishable. These tests assert the margin as well.
+fn costs(inv: &Inventory, req: &ClaimRequest, slot: &str) -> BTreeMap<String, f64> {
+    let counts = inv.tag_counts();
+    let weights = inv.vocabulary.key_weights();
+    inv.enabled_benches()
+        .iter()
+        .filter(|b| req.slots[slot].matches(b))
+        .map(|b| {
+            (
+                b.id.clone(),
+                fit_cost(b, &req.slots[slot], &counts, weights),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn among_adequate_benches_the_least_capable_one_wins() {
     // esp32s3-a has PSRAM, esp32s3-b does not. A request that does not ask for
@@ -84,6 +113,12 @@ fn among_adequate_benches_the_least_capable_one_wins() {
     let req = claim(&[("dut", &["soc=esp32s3"])], Distinct::All);
     let alloc = allocate_in(&inv, &req, &no_one_is_busy()).unwrap();
     assert_eq!(alloc.assignment["dut"], "esp32s3-b");
+
+    let by_bench = costs(&inv, &req, "dut");
+    assert!(
+        by_bench["esp32s3-a"] > by_bench["esp32s3-b"],
+        "the PSRAM board must be the strictly worse fit, not merely the later id: {by_bench:?}"
+    );
 }
 
 #[test]
@@ -96,6 +131,152 @@ fn identity_tags_do_not_make_a_cheap_bench_look_precious() {
     let req = claim(&[("dut", &["family=esp32"])], Distinct::All);
     let alloc = allocate_in(&inv, &req, &no_one_is_busy()).unwrap();
     assert_eq!(alloc.assignment["dut"], "esp32-cp2102");
+
+    // On the metric, and by a margin. The bare UART board and the 8 MiB S3 with
+    // built-in JTAG once scored exactly equal - the penalty for having less
+    // flash cancelling the S3's debug hardware - which left this test passing
+    // on nothing but "esp32-cp2102" sorting before "esp32s3-b".
+    let by_bench = costs(&inv, &req, "dut");
+    let cheap = by_bench["esp32-cp2102"];
+    for (id, cost) in &by_bench {
+        assert!(
+            id == "esp32-cp2102" || *cost > cheap,
+            "{id} costs {cost} against the bare board's {cheap}: the id ordering is \
+             deciding this, not the fit"
+        );
+    }
+}
+
+#[test]
+fn the_least_capable_bench_wins_however_its_id_sorts() {
+    // The same inventory, one bench renamed and nothing else. A pure naming
+    // change must not move an allocation; when it does, the winner was decided
+    // by the tie-break and the scoring was never tested at all.
+    let renamed = INVENTORY.replace("esp32-cp2102", "zz-uart-board");
+    let inv = Inventory::from_toml_str(&renamed).expect("a rename is not a config change");
+    let req = claim(&[("dut", &["family=esp32"])], Distinct::All);
+    let alloc = allocate_in(&inv, &req, &no_one_is_busy()).unwrap();
+    assert_eq!(alloc.assignment["dut"], "zz-uart-board");
+}
+
+#[test]
+fn a_descriptive_key_costs_the_same_whether_it_was_asked_for_or_not() {
+    // flash values are ordered in the world and not in the matcher: scoring
+    // divides by the number of benches carrying that exact value, so 4mb (one
+    // board) was charged twice what 8mb (two boards) was, and "least capable
+    // wins" ran backwards. Weight 0 is what stops flash being priced at all.
+    let inv = inventory();
+    assert_eq!(inv.vocabulary.weight("flash"), 0.0);
+
+    let counts = inv.tag_counts();
+    let weights = inv.vocabulary.key_weights();
+    let bench = &inv.benches["esp32-cp2102"];
+    let asked = Requirement::parse(["family=esp32", "flash=4mb"]).unwrap();
+    let unasked = Requirement::parse(["family=esp32"]).unwrap();
+    assert_eq!(
+        fit_cost(bench, &asked, &counts, weights),
+        fit_cost(bench, &unasked, &counts, weights),
+        "flash describes the board; it is not capability anyone can waste"
+    );
+}
+
+#[test]
+fn no_shipped_tag_value_names_an_absence() {
+    // An absent capability is charged exactly like a real one - `psram=none`
+    // cost the bare board as much as octal PSRAM cost the S3 - so a board
+    // without the hardware omits the key instead. Both shipped vocabularies
+    // have to keep to that, and the rule is easier to break than to notice.
+    for (file, text) in [
+        ("examples/inventory.toml", INVENTORY),
+        ("examples/coordinator.toml", COORDINATOR),
+    ] {
+        let inv = Inventory::from_toml_str(text).expect("shipped config should load");
+        for tag in inv.vocabulary.tags() {
+            assert!(
+                !matches!(tag.value.as_str(), "none" | "no" | "absent" | "unknown"),
+                "{file} declares {tag}, which prices not having something"
+            );
+        }
+        for bench in inv.enabled_benches() {
+            for tag in &bench.tags {
+                assert!(
+                    tag.value != "none",
+                    "{file}: bench {} declares {tag}",
+                    bench.id
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_shipped_vocabularies_agree_on_which_keys_are_capabilities() {
+    // The coordinator deploys one of these files and the tests read the other.
+    // A key that is descriptive in one and contended in the other scores the
+    // lab differently from every test here, silently.
+    let inventory = inventory();
+    let coordinator = Inventory::from_toml_str(COORDINATOR).expect("coordinator config loads");
+    for tag in inventory.vocabulary.tags() {
+        assert_eq!(
+            inventory.vocabulary.weight(&tag.key),
+            coordinator.vocabulary.weight(&tag.key),
+            "the two configs disagree about {:?}",
+            tag.key
+        );
+    }
+}
+
+#[test]
+fn scarcity_is_counted_over_the_benches_a_claim_could_actually_get() {
+    // Three boards carry an external probe and two carry GPS. With two probes
+    // leased out the lab has exactly one left, and a plain soc=esp32s3 claim
+    // must not spend it: counting benches that exist rather than benches that
+    // are free priced that last probe at a third of its worth and handed it to
+    // a request that never mentioned JTAG.
+    let toml = r#"
+        [tags.soc]
+        weight = 0
+        [tags.soc.values.esp32s3]
+
+        [tags.jtag]
+        [tags.jtag.values.external]
+
+        [tags.peripheral]
+        [tags.peripheral.values.gps]
+
+        [benches."j00"]
+        tags = ["soc=esp32s3", "jtag=external"]
+        [benches."j01"]
+        tags = ["soc=esp32s3", "jtag=external"]
+        [benches."j02"]
+        tags = ["soc=esp32s3", "jtag=external"]
+        [benches."g00"]
+        tags = ["soc=esp32s3", "peripheral=gps"]
+        [benches."g01"]
+        tags = ["soc=esp32s3", "peripheral=gps"]
+    "#;
+    let inv = Inventory::from_toml_str(toml).unwrap();
+    let busy: BTreeMap<String, BusyInfo> = ["j00", "j01"]
+        .into_iter()
+        .map(|id| {
+            (
+                id.to_string(),
+                BusyInfo {
+                    owner: "agent-1".into(),
+                    expires_in: Some(60.0),
+                    reason: "flashing".into(),
+                },
+            )
+        })
+        .collect();
+
+    let req = claim(&[("dut", &["soc=esp32s3"])], Distinct::All);
+    let alloc = allocate_in(&inv, &req, &busy).unwrap();
+    assert_eq!(
+        alloc.assignment["dut"], "g00",
+        "the only free probe must be the expensive bench now"
+    );
+    assert_eq!(alloc.cost, 0.5, "one of two free GPS boards");
 }
 
 // --- multi-slot ------------------------------------------------------------
@@ -351,6 +532,11 @@ fn writing_down_a_part_number_does_not_make_a_bench_look_scarcer() {
         recorded, vague,
         "the two boards have the same hardware; only the documentation differs"
     );
+    assert!(
+        recorded > 0.0,
+        "both boards must be charged for the accelerometer the request did not \
+         ask for, or this equality says nothing"
+    );
 }
 
 #[test]
@@ -363,9 +549,15 @@ fn asking_for_a_part_is_not_also_charged_for_the_category_it_implies() {
 
     let exact = Requirement::parse(["peripheral=accel[mpu6050]"]).unwrap();
     let category = Requirement::parse(["peripheral=accel"]).unwrap();
+    let asked_for_the_part = fit_cost(&inv.benches["recorded"], &exact, &counts, weights);
     assert_eq!(
-        fit_cost(&inv.benches["recorded"], &exact, &counts, weights),
+        asked_for_the_part,
         fit_cost(&inv.benches["recorded"], &category, &counts, weights),
+    );
+    assert!(
+        asked_for_the_part > 0.0,
+        "the board's spare flash must still be priced, or this equality is two \
+         zeroes agreeing"
     );
 }
 
@@ -439,6 +631,107 @@ fn a_qualifier_with_a_dash_is_rejected_like_any_other_matchable_value() {
     let msg = err.to_string();
     assert!(msg.contains("must not contain a dash"), "{msg}");
     assert!(msg.contains("[mpu6050]"), "should suggest the fix: {msg}");
+}
+
+#[test]
+fn the_vocabulary_may_not_enumerate_parts_through_an_implication_either() {
+    // Declaring `peripheral=accel[mpu6050]` is refused, so the way round it was
+    // to imply it: every bench declaring board=devkit then carried a part
+    // number nobody looked at the board to establish.
+    let toml = r#"
+        [tags.peripheral]
+        qualified = true
+        [tags.peripheral.values.accel]
+
+        [tags.board]
+        [tags.board.values.devkit]
+        implies = ["peripheral=accel[mpu6050]"]
+    "#;
+    let err = Inventory::from_toml_str(toml).expect_err("an implied part is still a part");
+    let msg = err.to_string();
+    assert!(msg.contains("[qualifier]"), "{msg}");
+    assert!(
+        msg.contains("peripheral=accel"),
+        "should say what to do: {msg}"
+    );
+}
+
+#[test]
+fn the_vocabulary_may_not_imply_an_identity() {
+    // `name=` is an open key because bench ids cannot be enumerated centrally.
+    // That is exactly why the vocabulary must not hand one out: a bench would
+    // arrive carrying an identity it was never given.
+    let toml = r#"
+        [tags.board]
+        [tags.board.values.devkit]
+        implies = ["name=impostor"]
+    "#;
+    let err = Inventory::from_toml_str(toml).expect_err("identity is not the vocabulary's to give");
+    assert!(err.to_string().contains("open key"), "{err}");
+}
+
+#[test]
+fn a_bench_may_not_declare_an_identity_tag() {
+    // Anyone who can reach the coordinator can register a bench (§9), and
+    // `name=` is what operator selection matches on. It is injected from the
+    // bench id, never accepted from whoever is describing the hardware.
+    let toml = r#"
+        [tags.soc]
+        [tags.soc.values.esp32s3]
+
+        [benches.impostor]
+        tags = ["soc=esp32s3", "name=esp32s3-a"]
+    "#;
+    let err = Inventory::from_toml_str(toml).expect_err("a bench must not name itself");
+    let msg = err.to_string();
+    assert!(msg.contains("name=esp32s3-a"), "{msg}");
+    assert!(msg.contains("assigned from the bench id"), "{msg}");
+
+    // And a claim may still ask for one: the rule is about who declares
+    // identity, not about who matches on it.
+    let inv = inventory();
+    inv.vocabulary
+        .check([&Tag::parse("name=esp32s3-a").unwrap()])
+        .expect("an operator may still select a bench by name");
+}
+
+#[test]
+fn an_open_key_does_not_take_a_qualifier_just_because_it_is_open() {
+    // Unbounded values are not structured values. `name=esp32s3-a[spare]` is a
+    // second spelling of an identity that must have exactly one.
+    let inv = inventory();
+    let err = inv
+        .vocabulary
+        .check([&Tag::parse("name=esp32s3-a[spare]").unwrap()])
+        .expect_err("name did not opt into qualifiers");
+    assert!(
+        err.to_string().contains("do not take a [qualifier]"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_weight_that_is_not_a_usable_number_is_rejected() {
+    // A NaN weight makes every cost NaN, every comparison false, and the
+    // branch-and-bound bound inert - best fit silently degenerates into
+    // whichever assignment the search reached last. A negative weight breaks
+    // the non-negativity that bound assumes.
+    for bad in ["nan", "-1.0", "inf"] {
+        let toml = format!(
+            r#"
+            [tags.psram]
+            weight = {bad}
+            [tags.psram.values.octal]
+        "#
+        );
+        let err = Inventory::from_toml_str(&toml)
+            .err()
+            .unwrap_or_else(|| panic!("weight = {bad} must be rejected"));
+        assert!(
+            err.to_string().contains("finite and non-negative"),
+            "weight = {bad}: {err}"
+        );
+    }
 }
 
 #[test]
@@ -581,7 +874,11 @@ fn implication_cycles_are_rejected_at_load_time() {
 }
 
 #[test]
-fn a_disabled_bench_is_invisible_to_the_matcher() {
+fn a_bench_disabled_in_a_loaded_inventory_is_invisible_to_the_matcher() {
+    // The only way the flag can be set: a file-loaded inventory. A host cannot
+    // declare it, because `BenchSpec` has no such field, and the coordinator
+    // builds every registered bench enabled - so this covers the matcher's half
+    // of a feature whose other half does not exist yet.
     let toml = r#"
         [tags.soc]
         [tags.soc.values.esp32]
@@ -594,6 +891,75 @@ fn a_disabled_bench_is_invisible_to_the_matcher() {
     let req = claim(&[("dut", &["soc=esp32"])], Distinct::All);
     let err = allocate_in(&inv, &req, &no_one_is_busy()).unwrap_err();
     assert!(err.unsatisfiable());
+}
+
+#[test]
+fn a_search_that_ran_out_of_budget_is_not_reported_as_impossible() {
+    // Eleven slots over an inventory shaped so the search's first descent is a
+    // dead end: the GPS slot is the most constrained, so it goes first and
+    // takes the board that ten other slots then need. That branch is a
+    // ten-slots-into-nine-benches pigeonhole, and proving it empty costs more
+    // than the node budget allows - so the search stops having found nothing
+    // and having established nothing.
+    //
+    // The claim is satisfiable: give the GPS slot the board with no SoC tag and
+    // every other slot has a home. Reporting this as a distinctness conflict
+    // makes `unsatisfiable()` true, which reaches the agent as
+    // `retryable: false` - "change your request", about a request that was fine.
+    let mut toml = String::from(
+        r#"
+        [tags.soc]
+        weight = 0
+        [tags.soc.values.esp32s3]
+
+        [tags.peripheral]
+        [tags.peripheral.values.gps]
+
+        [tags.jtag]
+        [tags.jtag.values.external]
+
+        [benches."b09"]
+        tags = ["soc=esp32s3", "peripheral=gps"]
+
+        [benches."b10"]
+        tags = ["peripheral=gps", "jtag=external"]
+        "#,
+    );
+    for i in 0..9 {
+        toml.push_str(&format!("[benches.\"b0{i}\"]\ntags = [\"soc=esp32s3\"]\n"));
+    }
+    let inv = Inventory::from_toml_str(&toml).unwrap();
+
+    let mut slots: Vec<(String, Vec<&str>)> = (0..10)
+        .map(|i| (format!("s{i:02}"), vec!["soc=esp32s3"]))
+        .collect();
+    slots.push(("gps".to_string(), vec!["peripheral=gps"]));
+    let req = ClaimRequest {
+        slots: slots
+            .iter()
+            .map(|(name, tags)| {
+                (
+                    name.clone(),
+                    Requirement::parse(tags.iter().copied()).unwrap(),
+                )
+            })
+            .collect(),
+        distinct: Distinct::All,
+        ttl_seconds: 900,
+        reason: "eleven boards".into(),
+    };
+
+    let err = allocate_in(&inv, &req, &no_one_is_busy()).unwrap_err();
+    assert!(err.search_exhausted, "the search should have run out here");
+    assert!(
+        !err.conflict_only,
+        "nothing was proved about distinctness; the search never finished"
+    );
+    assert!(
+        !err.unsatisfiable(),
+        "an unfinished search must be retryable: this claim can be satisfied"
+    );
+    assert!(err.to_string().contains("Retry"), "{err}");
 }
 
 // --- properties ------------------------------------------------------------
@@ -609,43 +975,157 @@ mod properties {
     use benchd_core::tags::TagSet;
     use proptest::prelude::*;
 
+    /// What a bench may declare.
+    ///
+    /// A qualified value and two values that imply a third are in here because
+    /// the shipped vocabulary has both and the scoring treats both specially.
+    /// A generator that produces neither tests the search and nothing else.
+    const POOL: &[&str] = &[
+        "soc=esp32",
+        "soc=esp32s3",
+        "psram=octal",
+        "jtag=builtin",
+        "flash=8mb",
+        "peripheral=accel[mpu6050]",
+        "peripheral=gps",
+    ];
+
+    /// Keys the generator prices, weight 0 included — the entire shipped
+    /// vocabulary leans on weight 0 and an all-ones generator never reaches it.
+    const KEYS: &[&str] = &["soc", "family", "psram", "jtag", "flash", "peripheral"];
+    const WEIGHTS: &[f64] = &[0.0, 1.0, 2.5];
+
+    fn base_of(value: &str) -> &str {
+        value.split_once('[').map_or(value, |(base, _)| base)
+    }
+
+    fn is_qualified(value: &str) -> bool {
+        value.contains('[')
+    }
+
+    /// The bench-side closure: what a soc implies, plus the bare category
+    /// behind a qualified value.
+    ///
+    /// Written out rather than taken from `Vocabulary`, like everything else in
+    /// this module. A reference that shares the implementation's idea of what a
+    /// bench carries, what matches, or what anything costs cannot catch the
+    /// implementation being wrong about it — and every bug this file has ever
+    /// had was in the scoring, which the old reference imported wholesale.
+    fn expand(declared: &[&str]) -> TagSet {
+        let mut tags = TagSet::new();
+        for text in declared {
+            let tag = Tag::parse(text).unwrap();
+            if tag.key == "soc" {
+                tags.insert(Tag::new("family", "esp32"));
+            }
+            if is_qualified(&tag.value) {
+                tags.insert(Tag::new(tag.key.clone(), base_of(&tag.value)));
+            }
+            tags.insert(tag);
+        }
+        tags
+    }
+
     /// Build a bench directly, bypassing config parsing.
-    fn bench(id: &str, tags: &[(&str, &str)]) -> Bench {
-        let mut tagset: TagSet = tags.iter().map(|(k, v)| Tag::new(*k, *v)).collect();
-        tagset.insert(Tag::new("name", id));
+    fn bench(id: &str, declared: &[&str], enabled: bool) -> Bench {
+        let mut tags = expand(declared);
+        tags.insert(Tag::new("name", id));
         Bench {
             id: id.to_string(),
-            tags: tagset,
+            tags,
             resources: Default::default(),
             description: String::new(),
             docs: String::new(),
-            enabled: true,
+            enabled,
         }
     }
 
-    const POOL: &[(&str, &str)] = &[
-        ("soc", "esp32"),
-        ("soc", "esp32s3"),
-        ("psram", "octal"),
-        ("jtag", "builtin"),
-        ("flash", "8mb"),
-    ];
+    /// Superset matching: a bench will do when it carries everything asked for.
+    fn satisfies(bench: &Bench, required: &TagSet) -> bool {
+        required.iter().all(|tag| bench.tags.contains(tag))
+    }
 
-    /// Brute-force reference: does *any* valid assignment exist, and what is the
-    /// cheapest total cost? Deliberately dumb, so it is obviously correct.
-    fn reference(
+    /// Whether this slot may share its bench with another.
+    ///
+    /// `Only` names the slots that must be *pairwise* distinct; a slot outside
+    /// the set is free to sit on the same bench as one inside it. That reading
+    /// is what "these slots must land on different benches" says, and it is
+    /// what the matcher does — worth writing down, because a set of one then
+    /// constrains nothing at all.
+    fn must_be_distinct(distinct: &Distinct, slot: &str) -> bool {
+        match distinct {
+            Distinct::All => true,
+            Distinct::None => false,
+            Distinct::Only(only) => only.contains(slot),
+        }
+    }
+
+    /// The scarcity denominator: benches this claim could actually be given.
+    fn free_counts(benches: &[&Bench], busy: &BTreeMap<String, BusyInfo>) -> BTreeMap<Tag, usize> {
+        let mut counts: BTreeMap<Tag, usize> = BTreeMap::new();
+        for b in benches
+            .iter()
+            .filter(|b| b.enabled && !busy.contains_key(&b.id))
+        {
+            for tag in &b.tags {
+                *counts.entry(tag.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    /// The cost rule, transcribed from the specification.
+    ///
+    /// Each tag the bench carries that the request did not ask for costs
+    /// `weight(key) / free benches carrying that exact tag`. Three things are
+    /// not spare capability and cost nothing: the identity tag, which every
+    /// bench has exactly one of; a qualified value, whose category is charged
+    /// instead, so recording a part number cannot make a board look scarcer
+    /// than an identical undocumented one; and the category behind a part the
+    /// request named, which is the same chip seen from the other side.
+    fn spec_cost(
+        bench: &Bench,
+        required: &TagSet,
+        counts: &BTreeMap<Tag, usize>,
+        weights: &BTreeMap<String, f64>,
+    ) -> f64 {
+        let mut total = 0.0;
+        for tag in &bench.tags {
+            if required.contains(tag) || tag.key == "name" || is_qualified(&tag.value) {
+                continue;
+            }
+            let stands_for_a_requested_part = required.iter().any(|asked| {
+                is_qualified(&asked.value)
+                    && asked.key == tag.key
+                    && base_of(&asked.value) == tag.value
+            });
+            if stands_for_a_requested_part {
+                continue;
+            }
+            if let Some(&count) = counts.get(tag) {
+                if count > 0 {
+                    total += weights.get(&tag.key).copied().unwrap_or(1.0) / count as f64;
+                }
+            }
+        }
+        total
+    }
+
+    /// Cheapest total cost over every assignment, by enumeration. Deliberately
+    /// dumb, so it is obviously correct.
+    fn cheapest(
         request: &ClaimRequest,
         benches: &[&Bench],
         busy: &BTreeMap<String, BusyInfo>,
-        counts: &BTreeMap<Tag, usize>,
         weights: &BTreeMap<String, f64>,
     ) -> Option<f64> {
-        let slots: Vec<&String> = request.slots.keys().collect();
+        let counts = free_counts(benches, busy);
         let free: Vec<&Bench> = benches
             .iter()
             .copied()
             .filter(|b| b.enabled && !busy.contains_key(&b.id))
             .collect();
+        let slots: Vec<&String> = request.slots.keys().collect();
 
         #[allow(clippy::too_many_arguments)] // deliberately dumb, so it is obviously correct
         fn go(
@@ -664,16 +1144,19 @@ mod properties {
                 return;
             }
             let slot = slots[i];
-            let req = &request.slots[slot];
+            let required = &request.slots[slot].tags;
+            let exclusive = must_be_distinct(&request.distinct, slot);
             for b in free {
-                if !req.matches(b) {
+                if !satisfies(b, required) {
                     continue;
                 }
-                if request.distinct.applies_to(slot) && used.contains(&b.id) {
+                if exclusive && used.contains(&b.id) {
                     continue;
                 }
-                used.push(b.id.clone());
-                let c = benchd_core::fit_cost(b, req, counts, weights);
+                if exclusive {
+                    used.push(b.id.clone());
+                }
+                let c = spec_cost(b, required, counts, weights);
                 go(
                     i + 1,
                     slots,
@@ -685,7 +1168,9 @@ mod properties {
                     acc + c,
                     best,
                 );
-                used.pop();
+                if exclusive {
+                    used.pop();
+                }
             }
         }
 
@@ -696,7 +1181,7 @@ mod properties {
             request,
             &free,
             &mut Vec::new(),
-            counts,
+            &counts,
             weights,
             0.0,
             &mut best,
@@ -707,25 +1192,31 @@ mod properties {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(400))]
 
-        /// The matcher succeeds exactly when a valid assignment exists, and when
-        /// it succeeds the assignment it returns is optimal.
+        /// The matcher succeeds exactly when a valid assignment exists; when it
+        /// succeeds the assignment is optimal and the cost it reports is the
+        /// cost of that assignment; and when it fails it says which kind of
+        /// failure it was.
         #[test]
-        fn allocation_agrees_with_brute_force(
-            bench_masks in prop::collection::vec(0u8..32, 1..5),
-            slot_masks in prop::collection::vec(0u8..32, 1..4),
-            distinct_all in any::<bool>(),
+        fn allocation_agrees_with_an_independent_reference(
+            bench_masks in prop::collection::vec(0u8..128, 1..6),
+            slot_masks in prop::collection::vec(0u8..128, 1..4),
+            weight_choices in prop::collection::vec(0usize..3, KEYS.len()),
+            distinct_mode in 0u8..3,
+            distinct_mask in 0u8..8,
+            busy_mask in 0u8..32,
+            disabled_mask in 0u8..32,
         ) {
             let benches: Vec<Bench> = bench_masks
                 .iter()
                 .enumerate()
                 .map(|(i, mask)| {
-                    let tags: Vec<(&str, &str)> = POOL
+                    let declared: Vec<&str> = POOL
                         .iter()
                         .enumerate()
                         .filter(|(j, _)| mask & (1 << j) != 0)
                         .map(|(_, t)| *t)
                         .collect();
-                    bench(&format!("b{i}"), &tags)
+                    bench(&format!("b{i}"), &declared, disabled_mask & (1 << i) == 0)
                 })
                 .collect();
             let refs: Vec<&Bench> = benches.iter().collect();
@@ -738,50 +1229,105 @@ mod properties {
                         .iter()
                         .enumerate()
                         .filter(|(j, _)| mask & (1 << j) != 0)
-                        .map(|(_, (k, v))| Tag::new(*k, *v))
+                        .map(|(_, t)| Tag::parse(t).unwrap())
                         .collect();
                     (format!("s{i}"), Requirement::new(tags))
                 })
                 .collect();
 
+            let distinct = match distinct_mode {
+                0 => Distinct::All,
+                1 => Distinct::None,
+                _ => Distinct::Only(
+                    slots
+                        .keys()
+                        .enumerate()
+                        .filter(|(i, _)| distinct_mask & (1 << i) != 0)
+                        .map(|(_, slot)| slot.clone())
+                        .collect(),
+                ),
+            };
+
+            let weights: BTreeMap<String, f64> = KEYS
+                .iter()
+                .zip(&weight_choices)
+                .map(|(key, choice)| (key.to_string(), WEIGHTS[*choice]))
+                .collect();
+
+            let busy: BTreeMap<String, BusyInfo> = benches
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| busy_mask & (1 << i) != 0)
+                .map(|(_, b)| (b.id.clone(), BusyInfo {
+                    owner: "someone-else".into(),
+                    expires_in: Some(30.0),
+                    reason: "held".into(),
+                }))
+                .collect();
+
             let request = ClaimRequest {
                 slots,
-                distinct: if distinct_all { Distinct::All } else { Distinct::None },
+                distinct,
                 ttl_seconds: 60,
                 reason: String::new(),
             };
 
-            let mut counts: BTreeMap<Tag, usize> = BTreeMap::new();
-            for b in &benches {
-                for t in &b.tags {
-                    *counts.entry(t.clone()).or_insert(0) += 1;
-                }
-            }
-            let weights = BTreeMap::new();
-            let busy = BTreeMap::new();
-
-            let expected = reference(&request, &refs, &busy, &counts, &weights);
-            let actual = allocate(&request, &refs, &busy, &counts, &weights);
+            let expected = cheapest(&request, &refs, &busy, &weights);
+            let actual = allocate(&request, &refs, &busy, &weights);
 
             match (expected, actual) {
-                (None, Err(_)) => {}
                 (Some(best), Ok(alloc)) => {
                     prop_assert!(
                         (alloc.cost - best).abs() < 1e-9,
                         "matcher returned cost {} but optimum is {best}",
                         alloc.cost
                     );
-                    // The returned assignment must actually be valid.
-                    let mut seen: Vec<&String> = Vec::new();
+
+                    // The assignment must be valid, and the cost it was sold
+                    // under must be the cost of the benches it actually names.
+                    let counts = free_counts(&refs, &busy);
+                    let mut charged = 0.0;
+                    let mut used: Vec<&String> = Vec::new();
                     for (slot, bench_id) in &alloc.assignment {
                         let b = benches.iter().find(|b| &b.id == bench_id).unwrap();
-                        prop_assert!(request.slots[slot].matches(b));
-                        if request.distinct.applies_to(slot) {
-                            prop_assert!(!seen.contains(&bench_id));
-                            seen.push(bench_id);
+                        prop_assert!(b.enabled, "{bench_id} is disabled");
+                        prop_assert!(!busy.contains_key(bench_id), "{bench_id} is held");
+                        prop_assert!(satisfies(b, &request.slots[slot].tags));
+                        if must_be_distinct(&request.distinct, slot) {
+                            prop_assert!(!used.contains(&bench_id));
+                            used.push(bench_id);
                         }
+                        charged += spec_cost(b, &request.slots[slot].tags, &counts, &weights);
                     }
                     prop_assert_eq!(alloc.assignment.len(), request.slots.len());
+                    prop_assert!(
+                        (alloc.cost - charged).abs() < 1e-9,
+                        "reported cost {} is not what this assignment costs ({charged})",
+                        alloc.cost
+                    );
+                }
+                (None, Err(err)) => {
+                    prop_assert!(
+                        !err.search_exhausted,
+                        "a handful of benches cannot exhaust the node budget"
+                    );
+                    // Which failure it is, not merely that it failed: an agent
+                    // acts on this. Every slot having a free candidate means
+                    // the slots conflict with each other, which waiting will
+                    // never fix.
+                    let per_slot_candidates = request.slots.iter().all(|(_, requirement)| {
+                        refs.iter().any(|b| {
+                            b.enabled
+                                && !busy.contains_key(&b.id)
+                                && satisfies(b, &requirement.tags)
+                        })
+                    });
+                    prop_assert_eq!(
+                        err.conflict_only,
+                        per_slot_candidates,
+                        "misclassified failure: {}",
+                        err
+                    );
                 }
                 (None, Ok(a)) => prop_assert!(false, "matched {a:?} when nothing should match"),
                 (Some(b), Err(e)) => prop_assert!(false, "no match (cost {b} exists): {e}"),

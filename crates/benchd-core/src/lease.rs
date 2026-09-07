@@ -354,6 +354,8 @@ impl LeaseManager {
         request: &ClaimRequest,
         now: Secs,
     ) -> Result<Granted, ClaimError> {
+        // Benches, not slots: one board held through two slots of one lease is
+        // one board, and `max_benches` counts boards.
         let held = self
             .sessions
             .get(&session)
@@ -361,21 +363,33 @@ impl LeaseManager {
             .leases
             .iter()
             .filter_map(|id| self.leases.get(id))
-            .map(|l| l.slots.len())
-            .sum::<usize>();
+            .flat_map(|l| l.benches())
+            .collect::<BTreeSet<_>>()
+            .len();
 
+        // The fewest benches this claim could take: slots that must differ from
+        // each other need one each, the rest can share. Nothing sharper is
+        // knowable before the matcher has assigned anything, so the assignment
+        // is checked again below.
+        let least_benches = request
+            .slots
+            .keys()
+            .filter(|slot| request.distinct.applies_to(slot))
+            .count()
+            .max(1);
         let ttl = self
             .limits
-            .grant(request.ttl_seconds, request.slots.len(), held)?;
+            .grant(request.ttl_seconds, least_benches, held)?;
 
         let benches = self.inventory.enabled_benches();
         let allocation = allocate(
             request,
             &benches,
             &self.busy(now),
-            &self.inventory.tag_counts(),
             self.inventory.vocabulary.key_weights(),
         )?;
+        let unique: BTreeSet<&String> = allocation.assignment.values().collect();
+        self.limits.check_benches(held, unique.len())?;
 
         let id = LeaseId(self.next_lease);
         self.next_lease += 1;
@@ -389,7 +403,6 @@ impl LeaseManager {
         // the second — and the relay can never pair them.
         let mut epochs = BTreeMap::new();
         let mut effects = Vec::new();
-        let unique: BTreeSet<&String> = allocation.assignment.values().collect();
         for bench in unique {
             let counter = self.bench_epoch.entry(bench.clone()).or_insert(0);
             *counter += 1;

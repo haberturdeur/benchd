@@ -160,6 +160,11 @@ pub struct Bench {
     pub docs: String,
     /// Set false to keep a bench in the inventory but out of the matcher (dead
     /// board, cable being reseated) without deleting its definition.
+    ///
+    /// Only an inventory loaded from a file can set it today. There is no
+    /// `enabled` on [`crate::wire::BenchSpec`], so a host cannot declare one
+    /// and the coordinator — whose inventory arrives entirely by registration —
+    /// always builds benches enabled.
     pub enabled: bool,
 }
 
@@ -186,6 +191,34 @@ impl Bench {
 /// one will hardcode a bench into a test script and reintroduce exactly the
 /// contention this system removes.
 pub const NAME_KEY: &str = "name";
+
+/// Validate the tags a bench *declares*, as opposed to the tags a claim asks
+/// for.
+///
+/// [`Vocabulary::check`] plus one rule: nobody declares their own [`NAME_KEY`].
+/// It is an open key because bench ids cannot be enumerated centrally, which
+/// makes it the one tag a declaration cannot be checked against — and anyone
+/// who can reach the coordinator may register a bench (§9), so a declared
+/// `name=esp32s3-a` simply *is* esp32s3-a everywhere matching happens. The real
+/// one is injected from the bench id, by whoever knows what that id is.
+///
+/// Both places that build a [`Bench`] from declared tags must call this: the
+/// inventory loader below, and the coordinator's host registration.
+pub fn check_declared_tags<'a, I>(vocabulary: &Vocabulary, tags: I) -> Result<(), TagError>
+where
+    I: IntoIterator<Item = &'a Tag>,
+{
+    for tag in tags {
+        if tag.key == NAME_KEY {
+            return Err(TagError::Vocabulary(format!(
+                "{tag}: a bench does not declare {NAME_KEY}=, it is assigned from the \
+                 bench id"
+            )));
+        }
+        vocabulary.check([tag])?;
+    }
+    Ok(())
+}
 
 /// Tags a single slot must satisfy.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -301,6 +334,16 @@ pub struct ClaimRequest {
     pub reason: String,
 }
 
+/// Ceiling on the number of slots in one claim.
+///
+/// Not a policy limit — `max_benches` is that, and it counts benches. This
+/// bounds the *assignment search*, which is exponential in slots and runs
+/// while the coordinator holds its single state lock. Slot-counted admission
+/// used to impose such a ceiling by accident; counting benches, which is what
+/// `max_benches` means, took it away. No real claim names more slots than a
+/// bench has boards on it.
+pub const MAX_SLOTS: usize = 16;
+
 impl ClaimRequest {
     /// Reject anything that could escape a directory once materialised.
     ///
@@ -309,6 +352,12 @@ impl ClaimRequest {
     pub fn validate(&self) -> Result<(), String> {
         if self.slots.is_empty() {
             return Err("a claim must request at least one slot".into());
+        }
+        if self.slots.len() > MAX_SLOTS {
+            return Err(format!(
+                "a claim may name at most {MAX_SLOTS} slots; this one names {}",
+                self.slots.len()
+            ));
         }
         for slot in self.slots.keys() {
             if !valid_component(slot) {
@@ -334,7 +383,9 @@ impl Inventory {
         self.benches.values().filter(|b| b.enabled).collect()
     }
 
-    /// How many enabled benches carry each tag. Drives scarcity scoring.
+    /// How many enabled benches carry each tag, free or not — what `benchd
+    /// tags` reports as the size of the lab. Scarcity scoring needs the free
+    /// count instead and derives its own; see [`crate::matcher::allocate`].
     pub fn tag_counts(&self) -> BTreeMap<Tag, usize> {
         let mut counts = BTreeMap::new();
         for bench in self.benches.values().filter(|b| b.enabled) {
@@ -489,7 +540,7 @@ impl RawInventory {
         let mut benches = BTreeMap::new();
         for (id, body) in self.benches {
             let declared = parse_tags(&body.tags)?;
-            vocabulary.check(&declared)?;
+            check_declared_tags(&vocabulary, &declared)?;
 
             let mut tags = vocabulary.expand(&declared);
             // Inject the bench id as a tag so human/debug selection by name
