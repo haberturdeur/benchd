@@ -4,7 +4,13 @@ Documentation=https://github.com/tom/benchd
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/benchd coordinator --config /etc/benchd/coordinator.toml
+# --report-address is written once the listener is accepting connections, and
+# RuntimeDirectory= takes the file away again when the unit stops. That makes
+# the file's reappearance a readiness signal deploy.sh can wait on, instead of
+# restarting every host and client against a coordinator that has not finished
+# binding and paying a reconnect cycle for each.
+RuntimeDirectory=benchd-coordinator
+ExecStart=/usr/local/bin/benchd coordinator --config /etc/benchd/coordinator.toml --report-address /run/benchd-coordinator/address
 Restart=always
 RestartSec=3
 # Stateless by design (D6): a restart releases every lease, so there is nothing
