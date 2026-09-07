@@ -1,8 +1,13 @@
 //! The local agent socket: where per-agent MCP shims connect.
 //!
-//! Each shim owns one session. The daemon multiplexes them all onto its single
-//! coordinator connection, correlating replies by request id and routing
-//! unsolicited lease events to whichever agent holds the lease.
+//! Each shim owns one session per coordinator. The daemon multiplexes every
+//! shim onto every coordinator link, correlating replies by request id and
+//! routing unsolicited lease events to whichever agent holds the lease.
+//!
+//! This is also where the single-lab illusion is built and where it can break:
+//! the agent must see one merged view, so a request answered by only some of
+//! the coordinators is not an answer, and no request may go unanswered or be
+//! answered twice.
 //!
 //! Requests are forwarded almost verbatim — the daemon rewrites request ids into
 //! its own space and substitutes the session token, but does not interpret
@@ -10,17 +15,37 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::ids::{CoordinatorId, LeaseKey, SessionKey};
 use anyhow::Result;
 use benchd_core::lease::SessionId;
 use benchd_core::wire::{ClientMsg, RequestId, SessionToken, ToClient};
 use futures::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 use crate::materialize::owner_dir;
 use crate::Shared;
+
+/// How long the daemon will wait for the coordinators before answering a
+/// request itself.
+///
+/// Everything below is completed by events — a fanout by its last reply, a
+/// claim by a grant or by running out of coordinators — and a coordinator that
+/// stays connected and simply never answers is not an event. This is the only
+/// deadline on this side of the agent socket: the MCP shim has one, but at 30s
+/// and on the far side, where it can clean nothing up, and `benchd lease` has
+/// none at all and waits for a matching request id forever. Comfortably under
+/// the shim's, so the agent is given a reason rather than a timeout.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How long a request waits for a coordinator that is connected but has not
+/// finished re-registering.
+///
+/// Bounded, because a coordinator that accepts a connection and never completes
+/// the handshake must not hold up every request on the machine.
+const HANDSHAKE_GRACE: Duration = Duration::from_secs(5);
 
 /// One connected MCP shim.
 struct Agent {
@@ -44,6 +69,9 @@ struct Agent {
 #[derive(Default)]
 pub struct Agents {
     inner: Mutex<Inner>,
+    /// Woken whenever a session appears or a registration gives up, so a
+    /// request that arrives mid-handshake can wait for it without polling.
+    registered: Notify,
 }
 
 /// A claim working its way down the coordinator list.
@@ -67,7 +95,8 @@ pub struct ClaimRetry {
 ///
 /// Recorded when the request goes out rather than inferred from the last reply
 /// to arrive, because a fanout also has to be answerable when a coordinator
-/// never replies at all.
+/// never replies at all — whether because the link went down under it, or
+/// because it stayed up and the coordinator said nothing.
 #[derive(Clone, Copy, Default, PartialEq)]
 enum FanoutKind {
     Session,
@@ -83,6 +112,11 @@ enum FanoutKind {
 struct Fanout {
     kind: FanoutKind,
     outstanding: usize,
+    /// How many coordinators were asked, and how many of them will never give a
+    /// usable answer. A merged view is only a view of the whole lab if the
+    /// second is zero.
+    expected: usize,
+    failed: usize,
     tags: BTreeMap<String, benchd_core::wire::TagInfo>,
     leases: Vec<benchd_core::wire::LeaseStatus>,
     /// The first session a coordinator handed back. Registration is fanned out
@@ -94,7 +128,6 @@ struct Fanout {
     /// satisfy is only unsatisfiable if *every* one says so; if any says it is
     /// merely busy, the agent should wait rather than give up (D14).
     error: Option<(String, bool)>,
-    answered: bool,
 }
 
 impl Fanout {
@@ -124,6 +157,9 @@ impl Fanout {
                 },
                 None => failed("no coordinator opened a session"),
             },
+            // A view assembled from part of the lab is not a view of the lab,
+            // and there is nowhere in a `Tags` or a `Status` to say so.
+            FanoutKind::Tags | FanoutKind::Leases if self.failed > 0 => self.incomplete(theirs),
             FanoutKind::Tags => ToClient::Tags {
                 request: theirs,
                 tags: self.tags.values().cloned().collect(),
@@ -132,19 +168,78 @@ impl Fanout {
                 request: theirs,
                 leases: self.leases.clone(),
             },
-            FanoutKind::Ack => match &self.error {
-                Some(_) => failed(""),
-                None => ToClient::Ok { request: theirs },
+            FanoutKind::Ack => match self.failed {
+                0 => ToClient::Ok { request: theirs },
+                _ => failed("a coordinator did not answer"),
             },
         }
     }
+
+    /// What to say when some coordinator could not be seen.
+    ///
+    /// An answer the agent cannot tell apart from a complete one is the worst
+    /// of the options: `benchd mcp` renders an empty lease list as the
+    /// successful "no leases held", so an agent holding a board on the lab
+    /// coordinator that asks the moment the link drops is told, as a success,
+    /// that it holds no hardware — and a short `tag_list` reads as a lab
+    /// without that hardware in it. So an incomplete view is a failure, and
+    /// always a retryable one: a link that dropped and a session a coordinator
+    /// has forgotten are both conditions this daemon repairs by itself, and
+    /// telling the agent otherwise makes the shim advise it not to retry.
+    ///
+    /// Phrased in labs rather than coordinators, and without a count: the agent
+    /// has to be told its picture is incomplete, but not how many authorities
+    /// there are behind it.
+    fn incomplete(&self, theirs: RequestId) -> ToClient {
+        let reason = match &self.error {
+            Some((error, _)) => error.as_str(),
+            None => "no reason given",
+        };
+        let error = if self.failed >= self.expected {
+            format!("the lab could not be reached: {reason}")
+        } else {
+            format!(
+                "part of the lab could not be reached, so this would be a partial \
+                 picture of it rather than the whole one: {reason}"
+            )
+        };
+        ToClient::Error {
+            request: theirs,
+            error,
+            retryable: true,
+        }
+    }
+}
+
+/// Who a request was issued for.
+///
+/// The daemon asks things on its own account — re-registration after a
+/// reconnect, and the `CloseSession` that follows a disconnect — and those
+/// replies are not an agent's to see. `RequestId(0)` used to stand in for
+/// "mine", but zero is a perfectly legal id for an agent to pick, so an agent
+/// with a request outstanding under it swallowed the daemon's re-registration
+/// reply. A variant cannot be collided with.
+#[derive(Clone, Copy, PartialEq)]
+enum Origin {
+    Agent(RequestId),
+    Daemon,
+}
+
+/// One request this daemon has outstanding with one coordinator.
+struct Pending {
+    agent: u64,
+    origin: Origin,
+    to: CoordinatorId,
+    /// Set for `OpenSession`. A request that needs a session waits for one of
+    /// these instead of writing the coordinator off as absent.
+    opening_session: bool,
 }
 
 #[derive(Default)]
 struct Inner {
     agents: BTreeMap<u64, Agent>,
-    /// Our request id -> (agent, the id the agent used, which coordinator).
-    pending: BTreeMap<u64, (u64, RequestId, CoordinatorId)>,
+    /// Our request id -> who it was for and where it went.
+    pending: BTreeMap<u64, Pending>,
     /// Requests fanned out to several coordinators, keyed by the agent's own
     /// request id: how many replies are still outstanding, and what has been
     /// collected so far. Without this a `tag_list` would answer with whichever
@@ -198,14 +293,29 @@ impl Agents {
 
     /// Record that `theirs` was fanned out to `n` coordinators, so the merge
     /// knows when every answer is in.
+    ///
+    /// The entry is always fresh: `forward` refuses a request whose id is
+    /// already outstanding, so two of an agent's requests can never be folded
+    /// into one fanout and answered once between them.
     async fn expect_fanout(&self, agent_id: u64, theirs: RequestId, n: usize, kind: FanoutKind) {
         let mut inner = self.inner.lock().await;
-        let entry = inner
-            .fanout
-            .entry((agent_id, theirs.0))
-            .or_insert_with(Fanout::default);
+        let entry = inner.fanout.entry((agent_id, theirs.0)).or_default();
         entry.kind = kind;
         entry.outstanding += n;
+        entry.expected += n;
+    }
+
+    /// Whether this agent already has a request outstanding under this id.
+    ///
+    /// An id is how a reply finds its question, so reusing one while the first
+    /// is unanswered makes the two indistinguishable — and the second would be
+    /// absorbed into the first's fanout and never answered at all.
+    async fn already_outstanding(&self, agent_id: u64, theirs: RequestId) -> bool {
+        let inner = self.inner.lock().await;
+        inner
+            .pending
+            .values()
+            .any(|p| p.agent == agent_id && p.origin == Origin::Agent(theirs))
     }
 
     /// This agent's session token on one coordinator.
@@ -214,17 +324,145 @@ impl Agents {
         inner.agents.get(&agent_id)?.sessions.get(&to).cloned()
     }
 
+    /// The same, but waiting out a registration that is still in flight.
+    ///
+    /// On a reconnect the link is published before `reregister_all` has a reply,
+    /// so for a moment a coordinator is connected and has no session on it.
+    /// Filtering targets on session presence writes it off as not a target,
+    /// silently and without counting it — which makes `tag_list` describe a
+    /// smaller lab and offers a claim only to whoever finished handshaking
+    /// first, and if none of them can satisfy it the agent is told the request
+    /// is unsatisfiable. Waiting is bounded twice over: by `within`, and by the
+    /// registration itself disappearing from `pending` if it fails.
+    async fn session_soon(
+        &self,
+        agent_id: u64,
+        to: CoordinatorId,
+        within: Duration,
+    ) -> Option<SessionToken> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let woken = self.registered.notified();
+            tokio::pin!(woken);
+            // Enrolled before the look, or a handshake landing between the two
+            // would never wake us.
+            woken.as_mut().enable();
+            {
+                let inner = self.inner.lock().await;
+                if let Some(agent) = inner.agents.get(&agent_id) {
+                    if let Some(token) = agent.sessions.get(&to) {
+                        return Some(token.clone());
+                    }
+                }
+                let handshaking = inner
+                    .pending
+                    .values()
+                    .any(|p| p.agent == agent_id && p.to == to && p.opening_session);
+                if !handshaking {
+                    return None;
+                }
+            }
+            if tokio::time::timeout_at(deadline, woken).await.is_err() {
+                return None;
+            }
+        }
+    }
+
     pub async fn uid_for(&self, session: SessionKey) -> Option<u32> {
         self.inner.lock().await.uids.get(&session).copied()
     }
 
-    /// Rewrite an agent's request into our id space and remember the mapping.
-    async fn track(&self, agent: u64, theirs: RequestId, to: CoordinatorId) -> RequestId {
+    /// Rewrite a request into our id space and remember the mapping.
+    async fn track(
+        &self,
+        agent: u64,
+        origin: Origin,
+        to: CoordinatorId,
+        opening_session: bool,
+    ) -> RequestId {
         let mut inner = self.inner.lock().await;
         inner.next_request += 1;
         let ours = RequestId(inner.next_request);
-        inner.pending.insert(ours.0, (agent, theirs, to));
+        inner.pending.insert(
+            ours.0,
+            Pending {
+                agent,
+                origin,
+                to,
+                opening_session,
+            },
+        );
         ours
+    }
+
+    /// Drop an agent and everything keyed by it, returning the sessions that
+    /// still need closing.
+    ///
+    /// Only the agent row used to go, so the other five maps outlived it — and
+    /// a shim is one process per agent session, which makes that a leak per
+    /// session for the life of a daemon expected to run for months.
+    ///
+    /// `owners` and `uids` go too. A lease this process materialised is
+    /// recorded in the materialiser against the directory it actually used, so
+    /// the teardown that follows the `CloseSession` below does not need them;
+    /// they exist to place a `Materialize` that has not happened yet, and no
+    /// more of those are coming for an agent that has gone.
+    async fn forget_agent(&self, agent_id: u64) -> BTreeMap<CoordinatorId, SessionToken> {
+        let mut inner = self.inner.lock().await;
+        let Some(agent) = inner.agents.remove(&agent_id) else {
+            return BTreeMap::new();
+        };
+        for (coordinator, id) in &agent.internal {
+            let key = SessionKey::new(*coordinator, *id);
+            inner.owners.remove(&key);
+            inner.uids.remove(&key);
+        }
+        inner.fanout.retain(|(a, _), _| *a != agent_id);
+        inner.claims.retain(|(a, _), _| *a != agent_id);
+        inner.pending.retain(|_, p| p.agent != agent_id);
+        inner.lease_owner.retain(|_, a| *a != agent_id);
+        agent.sessions
+    }
+
+    /// Answer a request whose deadline ran out, and forget it.
+    ///
+    /// The backstop for every way a request can stop making progress without
+    /// anything happening: a coordinator that holds the connection open and
+    /// never replies, a claim walking a list of coordinators that all go quiet,
+    /// a `renew` sent to a link that is up but wedged. Answering here is safe
+    /// exactly once, because every path that answers first removes what it
+    /// answered — the fanout entry, the claim, and the `pending` rows behind
+    /// them — so there is nothing left for this to find.
+    async fn expire(&self, agent_id: u64, theirs: RequestId) {
+        let mut inner = self.inner.lock().await;
+        let key = (agent_id, theirs.0);
+        const TIMED_OUT: &str = "a coordinator did not answer in time";
+
+        if let Some(entry) = inner.fanout.get_mut(&key) {
+            entry.failed += entry.outstanding;
+            entry.outstanding = 0;
+            keep_best_error(&mut entry.error, TIMED_OUT, true);
+            settle_fanout(&mut inner, agent_id, theirs);
+            return;
+        }
+        if let Some(attempt) = inner.claims.get_mut(&key) {
+            keep_best_error(&mut attempt.best_error, TIMED_OUT, true);
+            finish_claim(&mut inner, agent_id, theirs);
+            return;
+        }
+        // A lease-bearing request goes to one coordinator and has neither a
+        // fanout nor a claim behind it.
+        if forget_request(&mut inner, agent_id, theirs) {
+            send_to(
+                &inner,
+                agent_id,
+                &ToClient::Error {
+                    request: theirs,
+                    error: TIMED_OUT.into(),
+                    retryable: true,
+                },
+            );
+        }
     }
 
     /// Route a coordinator reply back to the agent that asked, restoring its
@@ -242,9 +480,34 @@ impl Agents {
         };
 
         let mut inner = self.inner.lock().await;
-        let Some((agent_id, theirs, _to)) = inner.pending.remove(&ours) else {
+        let Some(pending) = inner.pending.remove(&ours) else {
             tracing::debug!(ours, "reply for an unknown request");
             return None;
+        };
+        let agent_id = pending.agent;
+
+        let theirs = match pending.origin {
+            Origin::Agent(theirs) => theirs,
+            // Ours, not the agent's. All it leaves behind is the session, and
+            // whoever is waiting for that wants to know either way.
+            Origin::Daemon => {
+                if let ToClient::SessionOpened { session, id, .. } = &msg {
+                    record_session(&mut inner, agent_id, from, session, *id);
+                    // Says nothing about which coordinator: the agent is not
+                    // told there is more than one.
+                    send_event(
+                        &inner,
+                        agent_id,
+                        serde_json::json!({
+                            "msg": "reconnected",
+                            "detail": "a coordinator came back and your session \
+                                       there was re-registered."
+                        }),
+                    );
+                }
+                self.registered.notify_waiters();
+                return None;
+            }
         };
 
         // A claim that one coordinator could not satisfy moves to the next.
@@ -257,41 +520,13 @@ impl Agents {
                 ToClient::Error {
                     error, retryable, ..
                 } => {
-                    let attempt = inner.claims.get_mut(&claim_key).expect("checked");
-                    keep_best_error(&mut attempt.best_error, error, *retryable);
-                    if let Some(next) = attempt.remaining.pop() {
-                        let claim = attempt.claim.clone();
-                        let session = inner
-                            .agents
-                            .get(&agent_id)
-                            .and_then(|a| a.sessions.get(&next).cloned());
-                        if let Some(session) = session {
-                            inner.next_request += 1;
-                            let request = RequestId(inner.next_request);
-                            inner.pending.insert(request.0, (agent_id, theirs, next));
-                            return Some(ClaimRetry {
-                                to: next,
-                                request,
-                                session,
-                                claim,
-                            });
-                        }
+                    if let Some(attempt) = inner.claims.get_mut(&claim_key) {
+                        keep_best_error(&mut attempt.best_error, error, *retryable);
                     }
-                    // Nowhere left to ask: report the most actionable reason.
-                    let attempt = inner.claims.remove(&claim_key).expect("checked");
-                    let (error, retryable) = attempt
-                        .best_error
-                        .unwrap_or_else(|| ("no coordinator could satisfy this".into(), false));
-                    if let Some(agent) = inner.agents.get(&agent_id) {
-                        let reply = ToClient::Error {
-                            request: theirs,
-                            error,
-                            retryable,
-                        };
-                        if let Ok(line) = serde_json::to_string(&reply) {
-                            let _ = agent.out.send(line);
-                        }
+                    if let Some(retry) = next_claim_target(&mut inner, agent_id, theirs) {
+                        return Some(retry);
                     }
+                    finish_claim(&mut inner, agent_id, theirs);
                     return None;
                 }
                 _ => {}
@@ -302,20 +537,8 @@ impl Agents {
         // later events and materialisations can be routed without asking.
         match &msg {
             ToClient::SessionOpened { session, id, .. } => {
-                let name = if let Some(agent) = inner.agents.get_mut(&agent_id) {
-                    agent.sessions.insert(from, session.clone());
-                    agent.internal.insert(from, *id);
-                    agent.name.clone()
-                } else {
-                    String::new()
-                };
-                // Remember where this session's device nodes will live, so a
-                // later Materialize can be placed without another round trip.
-                let key = SessionKey::new(from, *id);
-                inner.owners.insert(key, owner_dir(*id, &name));
-                if let Some(uid) = inner.agents.get(&agent_id).map(|a| a.uid) {
-                    inner.uids.insert(key, uid);
-                }
+                record_session(&mut inner, agent_id, from, session, *id);
+                self.registered.notify_waiters();
             }
             ToClient::Granted { lease, .. } => {
                 inner
@@ -328,16 +551,16 @@ impl Agents {
         // Fanned-out requests are merged rather than raced: `tag_list` and
         // `lease_status` must describe every coordinator, and a request that
         // failed everywhere should report the most actionable reason.
+        //
+        // Whether a reply belongs to a fanout is decided by the fanout table
+        // and not by the shape of the reply. Listing the shapes missed
+        // `ToClient::Ok`, which is precisely what a coordinator answers a
+        // `CloseSession` broadcast with — so every one of them was forwarded
+        // verbatim as a second reply to a request already answered, and the
+        // entry, never decremented, stayed to absorb some later error.
         let fanout_key = (agent_id, theirs.0);
-        let is_fanout = matches!(msg, ToClient::Tags { .. } | ToClient::Status { .. })
-            || (matches!(msg, ToClient::SessionOpened { .. } | ToClient::Error { .. })
-                && inner.fanout.contains_key(&fanout_key));
-
-        if is_fanout {
-            let entry = inner
-                .fanout
-                .entry(fanout_key)
-                .or_insert_with(Fanout::default);
+        if inner.fanout.contains_key(&fanout_key) {
+            let entry = inner.fanout.entry(fanout_key).or_default();
             entry.outstanding = entry.outstanding.saturating_sub(1);
             match &msg {
                 ToClient::SessionOpened { session, id, .. } => {
@@ -357,22 +580,12 @@ impl Agents {
                 ToClient::Error {
                     error, retryable, ..
                 } => {
+                    entry.failed += 1;
                     keep_best_error(&mut entry.error, error, *retryable);
                 }
                 _ => {}
             }
-
-            if entry.outstanding > 0 || entry.answered {
-                return None;
-            }
-            entry.answered = true;
-            let merged = entry.merged(theirs);
-            inner.fanout.remove(&fanout_key);
-            if let Some(agent) = inner.agents.get(&agent_id) {
-                if let Ok(line) = serde_json::to_string(&merged) {
-                    let _ = agent.out.send(line);
-                }
-            }
+            settle_fanout(&mut inner, agent_id, theirs);
             return None;
         }
 
@@ -490,7 +703,6 @@ impl Agents {
     /// version cleared the session and left the shim to notice, but a shim only
     /// registers once at startup and its socket never closed, so a one-second
     /// coordinator restart wedged every agent on the machine permanently.
-    /// Forget everything belonging to ONE coordinator.
     ///
     /// Per coordinator, not global: a lab server restarting must not invalidate
     /// sessions held against the local coordinator that owns this machine's own
@@ -498,41 +710,60 @@ impl Agents {
     pub async fn invalidate(&self, coordinator: CoordinatorId) {
         let mut inner = self.inner.lock().await;
 
-        // A fanned-out request still waiting on this coordinator will never
-        // hear from it, and an agent blocked on the answer would stay blocked
-        // for as long as the link stayed down. Registration is fanned out too,
-        // so without this a coordinator dying at the wrong moment wedges every
-        // agent on the machine at startup.
-        let orphaned: Vec<(u64, u64)> = inner
+        // Every request this coordinator still owes an answer to. It will never
+        // give one, and an agent blocked on it would stay blocked for as long
+        // as the link stayed down. Registration is fanned out too, so without
+        // this a coordinator dying at the wrong moment wedges every agent on
+        // the machine at startup.
+        //
+        // The window is wide, not a race: the reconnect path unmounts and
+        // detaches every resource before it gets here and only removes the link
+        // afterwards, so for those seconds the coordinator still looks live and
+        // still has a session, and every request aimed at it in that time ends
+        // up here.
+        const GONE: &str = "a coordinator went away before answering";
+        let orphaned: Vec<(u64, RequestId)> = inner
             .pending
             .values()
-            .filter(|(_, _, to)| *to == coordinator)
-            .map(|(agent, theirs, _)| (*agent, theirs.0))
+            .filter(|p| p.to == coordinator)
+            .filter_map(|p| match p.origin {
+                Origin::Agent(theirs) => Some((p.agent, theirs)),
+                Origin::Daemon => None,
+            })
             .collect();
-        for key in orphaned {
-            let Some(entry) = inner.fanout.get_mut(&key) else {
+        inner.pending.retain(|_, p| p.to != coordinator);
+
+        for (agent_id, theirs) in orphaned {
+            let key = (agent_id, theirs.0);
+            if let Some(entry) = inner.fanout.get_mut(&key) {
+                entry.outstanding = entry.outstanding.saturating_sub(1);
+                entry.failed += 1;
+                keep_best_error(&mut entry.error, GONE, true);
+                settle_fanout(&mut inner, agent_id, theirs);
                 continue;
-            };
-            entry.outstanding = entry.outstanding.saturating_sub(1);
-            keep_best_error(
-                &mut entry.error,
-                "a coordinator went away before answering",
-                true,
+            }
+            // A claim is deliberately not a fanout — broadcasting one would let
+            // two coordinators satisfy it at once — so it lives in `claims`,
+            // which this used to walk straight past. The claim was then dropped
+            // on the floor: no reply, the remaining coordinators never tried,
+            // and the entry left behind.
+            if let Some(attempt) = inner.claims.get_mut(&key) {
+                keep_best_error(&mut attempt.best_error, GONE, true);
+                finish_claim(&mut inner, agent_id, theirs);
+                continue;
+            }
+            // A lease-bearing request, which only ever went to this one.
+            send_to(
+                &inner,
+                agent_id,
+                &ToClient::Error {
+                    request: theirs,
+                    error: GONE.into(),
+                    retryable: true,
+                },
             );
-            if entry.outstanding > 0 || entry.answered {
-                continue;
-            }
-            entry.answered = true;
-            let merged = entry.merged(RequestId(key.1));
-            inner.fanout.remove(&key);
-            if let Some(agent) = inner.agents.get(&key.0) {
-                if let Ok(line) = serde_json::to_string(&merged) {
-                    let _ = agent.out.send(line);
-                }
-            }
         }
 
-        inner.pending.retain(|_, (_, _, to)| *to != coordinator);
         inner
             .lease_owner
             .retain(|k, _| k.coordinator != coordinator);
@@ -541,14 +772,69 @@ impl Agents {
         for agent in inner.agents.values_mut() {
             if agent.sessions.remove(&coordinator).is_some() {
                 agent.internal.remove(&coordinator);
+                // Which coordinator is deliberately absent: naming it would
+                // tell the agent there is more than one, and let it count them.
                 let msg = serde_json::json!({
                     "msg": "disconnected",
-                    "coordinator": coordinator.to_string(),
                     "detail": "a coordinator restarted; its leases are void. \
                                Your session there is being re-registered."
                 });
                 let _ = agent.out.send(msg.to_string());
             }
+        }
+        drop(inner);
+        // Anything waiting for a handshake on this coordinator is waiting for
+        // one that is no longer in flight.
+        self.registered.notify_waiters();
+    }
+
+    /// Make sure this agent has a session, or one on the way, on every
+    /// coordinator that is up.
+    ///
+    /// A registration can be lost with nothing noticing: a coordinator can
+    /// refuse one, or the reply can be in flight when the link goes down.
+    /// Nothing retried, so that coordinator stayed connected and sessionless
+    /// for the life of the daemon — which used to silently shrink every merged
+    /// view, and now that a short view is reported as a failure would make
+    /// every one of them fail instead. Idempotent, so it is safe on the path of
+    /// every request.
+    async fn ensure_registered(&self, shared: &Arc<Shared>, agent_id: u64) {
+        let name = {
+            let inner = self.inner.lock().await;
+            match inner.agents.get(&agent_id) {
+                // Never registered: there is nothing to restore, and inventing
+                // a registration the agent did not ask for would hand it a
+                // session it does not know it has.
+                Some(agent) if !agent.name.is_empty() => agent.name.clone(),
+                _ => return,
+            }
+        };
+        for to in shared.live_links().await {
+            {
+                let inner = self.inner.lock().await;
+                let known = inner
+                    .agents
+                    .get(&agent_id)
+                    .is_some_and(|a| a.sessions.contains_key(&to));
+                let in_flight = inner
+                    .pending
+                    .values()
+                    .any(|p| p.agent == agent_id && p.to == to && p.opening_session);
+                if known || in_flight {
+                    continue;
+                }
+            }
+            let request = self.track(agent_id, Origin::Daemon, to, true).await;
+            tracing::info!(agent_id, %name, coordinator = %to, "registering again");
+            shared
+                .send(
+                    to,
+                    &ClientMsg::OpenSession {
+                        request,
+                        name: name.clone(),
+                    },
+                )
+                .await;
         }
     }
 
@@ -559,21 +845,156 @@ impl Agents {
     pub async fn reregister_all(&self, shared: &Shared, to: CoordinatorId) {
         let agents: Vec<(u64, String)> = {
             let inner = self.inner.lock().await;
+            let in_flight = |id: &u64| {
+                inner
+                    .pending
+                    .values()
+                    .any(|p| p.agent == *id && p.to == to && p.opening_session)
+            };
             inner
                 .agents
                 .iter()
-                .filter(|(_, a)| !a.sessions.contains_key(&to) && !a.name.is_empty())
+                .filter(|(id, a)| {
+                    !a.sessions.contains_key(&to) && !a.name.is_empty() && !in_flight(id)
+                })
                 .map(|(id, a)| (*id, a.name.clone()))
                 .collect()
         };
         for (agent_id, name) in agents {
-            let request = self.track(agent_id, RequestId(0), to).await;
+            let request = self.track(agent_id, Origin::Daemon, to, true).await;
             tracing::info!(agent_id, %name, coordinator = %to, "re-registering");
             shared
                 .send(to, &ClientMsg::OpenSession { request, name })
                 .await;
         }
     }
+}
+
+/// Remember a session and where its device nodes will live, so a later
+/// `Materialize` can be placed without another round trip.
+fn record_session(
+    inner: &mut Inner,
+    agent_id: u64,
+    from: CoordinatorId,
+    session: &SessionToken,
+    id: SessionId,
+) {
+    let Some(agent) = inner.agents.get_mut(&agent_id) else {
+        return;
+    };
+    agent.sessions.insert(from, session.clone());
+    agent.internal.insert(from, id);
+    let (name, uid) = (agent.name.clone(), agent.uid);
+    let key = SessionKey::new(from, id);
+    inner.owners.insert(key, owner_dir(id, &name));
+    inner.uids.insert(key, uid);
+}
+
+fn send_to(inner: &Inner, agent_id: u64, msg: &ToClient) {
+    let Some(agent) = inner.agents.get(&agent_id) else {
+        return;
+    };
+    if let Ok(line) = serde_json::to_string(msg) {
+        let _ = agent.out.send(line);
+    }
+}
+
+fn send_event(inner: &Inner, agent_id: u64, msg: serde_json::Value) {
+    if let Some(agent) = inner.agents.get(&agent_id) {
+        let _ = agent.out.send(msg.to_string());
+    }
+}
+
+/// Drop whatever is still outstanding under one of an agent's request ids, and
+/// say whether there was anything.
+///
+/// Answering a request means nothing else may answer it, so the rows that would
+/// let a late reply through have to go with the answer.
+fn forget_request(inner: &mut Inner, agent_id: u64, theirs: RequestId) -> bool {
+    let before = inner.pending.len();
+    inner
+        .pending
+        .retain(|_, p| !(p.agent == agent_id && p.origin == Origin::Agent(theirs)));
+    inner.pending.len() != before
+}
+
+/// Answer a fanout, if nothing is left to wait for.
+fn settle_fanout(inner: &mut Inner, agent_id: u64, theirs: RequestId) {
+    let key = (agent_id, theirs.0);
+    let Some(entry) = inner.fanout.get(&key) else {
+        return;
+    };
+    if entry.outstanding > 0 {
+        return;
+    }
+    // Removed before the reply goes out, and with it any coordinator still
+    // holding a place in the merge: this is the only thing that makes the
+    // answer single, and a fanout force-completed early still has siblings that
+    // would otherwise arrive and be forwarded as a second reply.
+    let merged = entry.merged(theirs);
+    inner.fanout.remove(&key);
+    forget_request(inner, agent_id, theirs);
+    send_to(inner, agent_id, &merged);
+}
+
+/// Offer a claim to the next coordinator that can be offered one.
+///
+/// A coordinator whose session went away mid-walk cannot be asked, but the ones
+/// behind it still can. Taking one off the list and giving up if it happened to
+/// be the sessionless one threw away every coordinator after it unexamined —
+/// with three configured and the middle one reconnecting, the third was never
+/// asked for a board it had.
+fn next_claim_target(inner: &mut Inner, agent_id: u64, theirs: RequestId) -> Option<ClaimRetry> {
+    let key = (agent_id, theirs.0);
+    loop {
+        let attempt = inner.claims.get_mut(&key)?;
+        let next = attempt.remaining.pop()?;
+        let claim = attempt.claim.clone();
+        let session = inner
+            .agents
+            .get(&agent_id)
+            .and_then(|a| a.sessions.get(&next).cloned());
+        let Some(session) = session else { continue };
+        inner.next_request += 1;
+        let request = RequestId(inner.next_request);
+        inner.pending.insert(
+            request.0,
+            Pending {
+                agent: agent_id,
+                origin: Origin::Agent(theirs),
+                to: next,
+                opening_session: false,
+            },
+        );
+        return Some(ClaimRetry {
+            to: next,
+            request,
+            session,
+            claim,
+        });
+    }
+}
+
+/// Answer a claim that has nowhere left to go, with the most actionable reason
+/// seen on the way.
+fn finish_claim(inner: &mut Inner, agent_id: u64, theirs: RequestId) {
+    let key = (agent_id, theirs.0);
+    let Some(attempt) = inner.claims.remove(&key) else {
+        return;
+    };
+    forget_request(inner, agent_id, theirs);
+    let (error, retryable) = attempt
+        .best_error
+        .unwrap_or_else(|| ("no coordinator could satisfy this".into(), false));
+    send_to(
+        inner,
+        agent_id,
+        &ToClient::Error {
+            request: theirs,
+            error,
+            retryable,
+        },
+    );
 }
 
 fn with_request(msg: ToClient, request: RequestId) -> ToClient {
@@ -682,21 +1103,16 @@ async fn serve_agent(shared: Arc<Shared>, socket: tokio::net::UnixStream) -> Res
         forward(&shared, agent_id, msg).await;
     }
 
-    // The MCP process exited, so its agent is gone. Closing the session makes
-    // the coordinator release its leases immediately rather than waiting out
-    // their TTLs — nobody is left to warn, so gracing would only idle hardware.
-    // Close the agent's session on every coordinator it had one with, so each
-    // releases that agent's leases immediately rather than waiting out a TTL.
-    let sessions = {
-        let mut inner = shared.agents.inner.lock().await;
-        inner
-            .agents
-            .remove(&agent_id)
-            .map(|a| a.sessions)
-            .unwrap_or_default()
-    };
+    // The MCP process exited, so its agent is gone. Closing the session on
+    // every coordinator it had one with makes each release that agent's leases
+    // immediately rather than waiting out a TTL — nobody is left to warn, so
+    // gracing would only idle hardware.
+    let sessions = shared.agents.forget_agent(agent_id).await;
     for (to, session) in sessions {
-        let request = shared.agents.track(agent_id, RequestId(0), to).await;
+        let request = shared
+            .agents
+            .track(agent_id, Origin::Daemon, to, false)
+            .await;
         shared
             .send(to, &ClientMsg::CloseSession { request, session })
             .await;
@@ -730,6 +1146,25 @@ async fn forward(shared: &Arc<Shared>, agent_id: u64, msg: ClientMsg) {
         return;
     }
 
+    // A lease-bearing request goes to the coordinator that granted it. Anything
+    // else is asked of every coordinator and the answers merged.
+    let theirs = request_of(&msg);
+    let routed = !matches!(msg, ClientMsg::Heartbeat | ClientMsg::Done { .. });
+    if routed && shared.agents.already_outstanding(agent_id, theirs).await {
+        // An id is how a reply finds its question. Two live questions under one
+        // id cannot both be answered, and the second used to be folded into the
+        // first's fanout and never answered at all.
+        reply_error(
+            shared,
+            agent_id,
+            theirs,
+            "a request with this id is already outstanding",
+            false,
+        )
+        .await;
+        return;
+    }
+
     // Registration goes to every coordinator: the agent gets one session on
     // each, and never learns there is more than one.
     if let ClientMsg::OpenSession { request, name } = &msg {
@@ -741,7 +1176,16 @@ async fn forward(shared: &Arc<Shared>, agent_id: u64, msg: ClientMsg) {
         }
         let live = shared.live_links().await;
         if live.is_empty() {
-            reply_error(shared, agent_id, *request, "no coordinator is reachable").await;
+            // Retryable: the reconnect loops are still running, so this is a
+            // wait, not a request the agent should rewrite.
+            reply_error(
+                shared,
+                agent_id,
+                *request,
+                "no coordinator is reachable",
+                true,
+            )
+            .await;
             return;
         }
         // One reply, once every coordinator has answered. An earlier version
@@ -751,12 +1195,21 @@ async fn forward(shared: &Arc<Shared>, agent_id: u64, msg: ClientMsg) {
         // slower than the fastest one. On a laptop with a local coordinator and
         // a lab across the network that is *always* the lab, so every claim for
         // remote hardware failed as unsatisfiable.
+        //
+        // This fences the first registration only. Reconnection reintroduced
+        // the identical race with no guard at all — the link is published
+        // before its `OpenSession` is answered — and what fences that is
+        // `session_soon`, which waits for a handshake in flight instead of
+        // reading it as a coordinator that is not there.
         shared
             .agents
             .expect_fanout(agent_id, *request, live.len(), FanoutKind::Session)
             .await;
         for to in live {
-            let ours = shared.agents.track(agent_id, *request, to).await;
+            let ours = shared
+                .agents
+                .track(agent_id, Origin::Agent(*request), to, true)
+                .await;
             shared
                 .send(
                     to,
@@ -767,41 +1220,61 @@ async fn forward(shared: &Arc<Shared>, agent_id: u64, msg: ClientMsg) {
                 )
                 .await;
         }
+        arm_deadline(shared, agent_id, *request);
         return;
     }
 
-    // A lease-bearing request goes to the coordinator that granted it. Anything
-    // else is asked of every coordinator and the answers merged.
-    let theirs = request_of(&msg);
+    // Everything below needs a session on every coordinator it is going to
+    // reach, and a request is the moment to notice one has gone missing.
+    shared.agents.ensure_registered(shared, agent_id).await;
+
     match msg {
         ClientMsg::Claim { claim, .. } => {
             // Offered to coordinators one at a time, in configuration order:
             // broadcasting would let two of them satisfy it at once and hold
             // hardware the agent never asked for. When one says no, the reply
             // path moves on to the next (see `deliver_reply`).
+            //
+            // A coordinator that is connected but still handshaking is waited
+            // for rather than skipped. Skipping it offered the claim to
+            // whichever coordinators happened to be ready, and if none of those
+            // could satisfy it the merged answer was `retryable: false` — the
+            // shim renders that as "change the request rather than retrying",
+            // so the agent was told to give up because of a coordinator it was
+            // never told existed.
             let mut targets = Vec::new();
             for to in shared.live_links().await {
-                if shared.agents.session_on(agent_id, to).await.is_some() {
-                    targets.push(to);
+                if let Some(session) = shared
+                    .agents
+                    .session_soon(agent_id, to, HANDSHAKE_GRACE)
+                    .await
+                {
+                    targets.push((to, session));
                 }
             }
             if targets.is_empty() {
-                reply_error(shared, agent_id, theirs, "no coordinator is reachable").await;
+                reply_error(
+                    shared,
+                    agent_id,
+                    theirs,
+                    "no coordinator is reachable",
+                    true,
+                )
+                .await;
                 return;
             }
-            let first = targets.remove(0);
+            let (first, session) = targets.remove(0);
             // Reversed so `pop` walks them in configuration order.
             targets.reverse();
+            let rest = targets.into_iter().map(|(to, _)| to).collect();
             shared
                 .agents
-                .begin_claim(agent_id, theirs, claim.clone(), targets)
+                .begin_claim(agent_id, theirs, claim.clone(), rest)
                 .await;
-            let session = shared
+            let ours = shared
                 .agents
-                .session_on(agent_id, first)
-                .await
-                .expect("checked");
-            let ours = shared.agents.track(agent_id, theirs, first).await;
+                .track(agent_id, Origin::Agent(theirs), first, false)
+                .await;
             shared
                 .send(
                     first,
@@ -812,6 +1285,7 @@ async fn forward(shared: &Arc<Shared>, agent_id: u64, msg: ClientMsg) {
                     },
                 )
                 .await;
+            arm_deadline(shared, agent_id, theirs);
         }
         ClientMsg::Renew { lease, extra, .. } => {
             route_by_lease(
@@ -884,20 +1358,42 @@ async fn route_by_lease(
     build: impl Fn(RequestId, SessionToken, benchd_core::lease::LeaseId) -> ClientMsg,
 ) {
     let key = LeaseKey::from_public(public.0);
-    let Some(session) = shared.agents.session_on(agent_id, key.coordinator).await else {
+    let session = shared
+        .agents
+        .session_soon(agent_id, key.coordinator, HANDSHAKE_GRACE)
+        .await;
+    let Some(session) = session else {
+        // Says nothing about coordinators. The old wording announced that there
+        // were several and that this id belonged to one of them, which both
+        // breaks the single-lab view and lets an agent enumerate them by
+        // feeding ids in and reading the two different refusals apart.
         reply_error(
             shared,
             agent_id,
             theirs,
-            "that lease belongs to a coordinator this machine is not connected to",
+            &format!("no lease {} is held here", public.0),
+            false,
         )
         .await;
         return;
     };
-    let ours = shared.agents.track(agent_id, theirs, key.coordinator).await;
+    let ours = shared
+        .agents
+        .track(agent_id, Origin::Agent(theirs), key.coordinator, false)
+        .await;
     shared
         .send(key.coordinator, &build(ours, session, key.lease))
         .await;
+    arm_deadline(shared, agent_id, theirs);
+}
+
+/// Promise the agent an answer to `theirs`, whatever the coordinators do.
+fn arm_deadline(shared: &Arc<Shared>, agent_id: u64, theirs: RequestId) {
+    let shared = Arc::clone(shared);
+    tokio::spawn(async move {
+        tokio::time::sleep(REQUEST_DEADLINE).await;
+        shared.agents.expire(agent_id, theirs).await;
+    });
 }
 
 /// Ask every connected coordinator; `deliver_reply` merges the answers.
@@ -910,14 +1406,30 @@ async fn broadcast(
 ) {
     let live = shared.live_links().await;
     if live.is_empty() {
-        reply_error(shared, agent_id, theirs, "no coordinator is reachable").await;
+        reply_error(
+            shared,
+            agent_id,
+            theirs,
+            "no coordinator is reachable",
+            true,
+        )
+        .await;
         return;
     }
 
+    // A coordinator mid-handshake is waited for, not passed over: a merged view
+    // that quietly leaves one out is the thing this whole path exists to
+    // prevent.
     let mut targets = Vec::new();
+    let mut absent = 0;
     for to in live {
-        if let Some(session) = shared.agents.session_on(agent_id, to).await {
-            targets.push((to, session));
+        match shared
+            .agents
+            .session_soon(agent_id, to, HANDSHAKE_GRACE)
+            .await
+        {
+            Some(session) => targets.push((to, session)),
+            None => absent += 1,
         }
     }
     if targets.is_empty() {
@@ -926,6 +1438,19 @@ async fn broadcast(
             agent_id,
             theirs,
             "not registered with any coordinator",
+            true,
+        )
+        .await;
+        return;
+    }
+    if absent > 0 {
+        reply_error(
+            shared,
+            agent_id,
+            theirs,
+            "part of the lab is still coming back after a restart, so this \
+             would be a partial picture of it rather than the whole one",
+            true,
         )
         .await;
         return;
@@ -938,9 +1463,13 @@ async fn broadcast(
         .expect_fanout(agent_id, theirs, targets.len(), kind)
         .await;
     for (to, session) in targets {
-        let ours = shared.agents.track(agent_id, theirs, to).await;
+        let ours = shared
+            .agents
+            .track(agent_id, Origin::Agent(theirs), to, false)
+            .await;
         shared.send(to, &build(ours, session)).await;
     }
+    arm_deadline(shared, agent_id, theirs);
 }
 
 async fn send_to_agent(shared: &Arc<Shared>, agent_id: u64, msg: &ToClient) {
@@ -967,19 +1496,27 @@ fn request_of(msg: &ClientMsg) -> RequestId {
     }
 }
 
-async fn reply_error(shared: &Arc<Shared>, agent_id: u64, request: RequestId, error: &str) {
+/// `retryable` is the machine-readable unsatisfiable-versus-contended
+/// distinction (D14), and both front ends turn it into advice: a false here
+/// tells the agent to rewrite its request rather than repeat it, so anything
+/// the daemon will repair by itself has to say true.
+async fn reply_error(
+    shared: &Arc<Shared>,
+    agent_id: u64,
+    request: RequestId,
+    error: &str,
+    retryable: bool,
+) {
     let inner = shared.agents.inner.lock().await;
-    let Some(agent) = inner.agents.get(&agent_id) else {
-        return;
-    };
-    let msg = ToClient::Error {
-        request,
-        error: error.into(),
-        retryable: false,
-    };
-    if let Ok(line) = serde_json::to_string(&msg) {
-        let _ = agent.out.send(line);
-    }
+    send_to(
+        &inner,
+        agent_id,
+        &ToClient::Error {
+            request,
+            error: error.into(),
+            retryable,
+        },
+    );
 }
 
 /// Fold one coordinator's tag list into the merged view.
@@ -1052,6 +1589,67 @@ mod tests {
         }
     }
 
+    fn refused(request: RequestId, error: &str) -> ToClient {
+        ToClient::Error {
+            request,
+            error: error.into(),
+            retryable: false,
+        }
+    }
+
+    /// An agent request on its way to one coordinator.
+    async fn sent(agents: &Agents, agent: u64, theirs: RequestId, to: CoordinatorId) -> RequestId {
+        agents.track(agent, Origin::Agent(theirs), to, false).await
+    }
+
+    /// A registration on its way to one coordinator.
+    async fn registering(
+        agents: &Agents,
+        agent: u64,
+        theirs: RequestId,
+        to: CoordinatorId,
+    ) -> RequestId {
+        agents.track(agent, Origin::Agent(theirs), to, true).await
+    }
+
+    /// An agent that already holds a session on one coordinator.
+    async fn with_session(agents: &Agents, agent: u64, to: CoordinatorId, id: u64) {
+        let mut inner = agents.inner.lock().await;
+        let entry = inner.agents.get_mut(&agent).expect("connected");
+        entry
+            .sessions
+            .insert(to, SessionToken(format!("token-{id}")));
+        entry.internal.insert(to, SessionId(id));
+    }
+
+    fn a_claim() -> benchd_core::wire::ClaimSpec {
+        benchd_core::wire::ClaimSpec {
+            slots: [("dut".to_string(), vec!["soc=esp32s3".to_string()])]
+                .into_iter()
+                .collect(),
+            ttl: 900,
+            reason: "wifi reconnect regression".into(),
+            distinct: true,
+        }
+    }
+
+    fn reply(out: &mut mpsc::UnboundedReceiver<String>) -> ToClient {
+        let line = out.try_recv().expect("an answer");
+        serde_json::from_str(&line).expect("a protocol reply")
+    }
+
+    fn a_lease(id: u64) -> benchd_core::wire::LeaseStatus {
+        benchd_core::wire::LeaseStatus {
+            lease: benchd_core::lease::LeaseId(id),
+            slots: [("dut".to_string(), "bench-7".to_string())]
+                .into_iter()
+                .collect(),
+            expires_at: 1000,
+            remaining: 600,
+            state: "active".into(),
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn registration_is_answered_only_once_every_coordinator_has_a_session() {
         // The race this guards: a claim is only offered to coordinators the
@@ -1068,8 +1666,8 @@ mod tests {
         agents
             .expect_fanout(agent, theirs, 2, FanoutKind::Session)
             .await;
-        let for_lab = agents.track(agent, theirs, lab).await;
-        let for_local = agents.track(agent, theirs, local).await;
+        let for_lab = registering(&agents, agent, theirs, lab).await;
+        let for_local = registering(&agents, agent, theirs, local).await;
 
         agents.deliver_reply(local, opened(for_local, 7)).await;
         assert!(
@@ -1106,21 +1704,14 @@ mod tests {
         agents
             .expect_fanout(agent, theirs, 2, FanoutKind::Session)
             .await;
-        let good = agents.track(agent, theirs, CoordinatorId(0)).await;
-        let bad = agents.track(agent, theirs, CoordinatorId(1)).await;
+        let good = registering(&agents, agent, theirs, CoordinatorId(0)).await;
+        let bad = registering(&agents, agent, theirs, CoordinatorId(1)).await;
 
         agents
             .deliver_reply(CoordinatorId(0), opened(good, 1))
             .await;
         agents
-            .deliver_reply(
-                CoordinatorId(1),
-                ToClient::Error {
-                    request: bad,
-                    error: "no".into(),
-                    retryable: false,
-                },
-            )
+            .deliver_reply(CoordinatorId(1), refused(bad, "no"))
             .await;
 
         let line = out.try_recv().expect("an answer");
@@ -1128,6 +1719,391 @@ mod tests {
         assert!(
             matches!(reply, ToClient::SessionOpened { .. }),
             "got {reply:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lab_nobody_could_be_asked_about_is_not_an_empty_lab() {
+        // Both coordinators want a fresh session, so nothing is known about any
+        // bench anywhere — and the answer used to be a successful, empty tag
+        // list, which reads as a lab with no hardware in it.
+        let agents = Agents::default();
+        let (agent, mut out) = connect(&agents).await;
+
+        let theirs = RequestId(2);
+        agents
+            .expect_fanout(agent, theirs, 2, FanoutKind::Tags)
+            .await;
+        let lab = sent(&agents, agent, theirs, CoordinatorId(0)).await;
+        let local = sent(&agents, agent, theirs, CoordinatorId(1)).await;
+
+        agents
+            .deliver_reply(
+                CoordinatorId(0),
+                refused(lab, "unknown session; register again"),
+            )
+            .await;
+        agents
+            .deliver_reply(
+                CoordinatorId(1),
+                refused(local, "unknown session; register again"),
+            )
+            .await;
+
+        match reply(&mut out) {
+            ToClient::Error {
+                request, retryable, ..
+            } => {
+                assert_eq!(request, theirs);
+                assert!(retryable, "the daemon re-registers by itself");
+            }
+            other => panic!("a total failure must not be a successful answer: {other:?}"),
+        }
+        assert!(out.try_recv().is_err(), "exactly one answer");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lab_only_half_of_which_could_be_seen_is_not_the_whole_lab() {
+        // The frequent case, and the more dangerous one: an agent holding a
+        // board on the coordinator that failed is handed a lease list without
+        // it in, which `benchd mcp` renders as the successful "no leases held".
+        let agents = Agents::default();
+        let (agent, mut out) = connect(&agents).await;
+
+        let theirs = RequestId(3);
+        agents
+            .expect_fanout(agent, theirs, 2, FanoutKind::Leases)
+            .await;
+        let lab = sent(&agents, agent, theirs, CoordinatorId(0)).await;
+        let local = sent(&agents, agent, theirs, CoordinatorId(1)).await;
+
+        agents
+            .deliver_reply(
+                CoordinatorId(0),
+                refused(lab, "unknown session; register again"),
+            )
+            .await;
+        agents
+            .deliver_reply(
+                CoordinatorId(1),
+                ToClient::Status {
+                    request: local,
+                    leases: vec![a_lease(1)],
+                },
+            )
+            .await;
+
+        match reply(&mut out) {
+            ToClient::Error {
+                request,
+                error,
+                retryable,
+            } => {
+                assert_eq!(request, theirs);
+                assert!(retryable);
+                assert!(error.contains("part of the lab"), "got {error}");
+                assert!(
+                    !error.contains('2'),
+                    "the agent is not told how many authorities there are: {error}"
+                );
+            }
+            other => panic!("a partial view must not look complete: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_drop_answers_the_claim_it_stranded() {
+        // A claim is not a fanout, and `invalidate` only rescued fanouts — so
+        // the claim was dropped on the floor: never answered, the remaining
+        // coordinators never tried, the entry never removed. Through the shim
+        // that is a 30s timeout blaming "the coordinator"; through
+        // `benchd lease`, which has no timeout, it hangs forever.
+        let agents = Agents::default();
+        let (agent, mut out) = connect(&agents).await;
+        let lab = CoordinatorId(0);
+        let local = CoordinatorId(1);
+        with_session(&agents, agent, lab, 1).await;
+        with_session(&agents, agent, local, 2).await;
+
+        let theirs = RequestId(4);
+        agents
+            .begin_claim(agent, theirs, a_claim(), vec![local])
+            .await;
+        let _ = sent(&agents, agent, theirs, lab).await;
+
+        agents.invalidate(lab).await;
+
+        match reply(&mut out) {
+            ToClient::Error {
+                request, retryable, ..
+            } => {
+                assert_eq!(request, theirs);
+                assert!(retryable, "nothing was granted; asking again is the fix");
+            }
+            other => panic!("the claim must be answered: {other:?}"),
+        }
+        let inner = agents.inner.lock().await;
+        assert!(inner.claims.is_empty(), "and not left behind");
+        assert!(inner.pending.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claim_keeps_asking_past_a_coordinator_that_has_no_session() {
+        // Three coordinators, the middle one reconnecting, and the third has
+        // the board. Taking the middle one off the list and giving up there
+        // discarded the third unexamined.
+        let agents = Agents::default();
+        let (agent, mut out) = connect(&agents).await;
+        let (first, middle, last) = (CoordinatorId(0), CoordinatorId(1), CoordinatorId(2));
+        with_session(&agents, agent, first, 1).await;
+        with_session(&agents, agent, last, 3).await;
+
+        let theirs = RequestId(5);
+        // Reversed, as `forward` leaves it, so `pop` walks in configuration
+        // order: the middle one first, then the last.
+        agents
+            .begin_claim(agent, theirs, a_claim(), vec![last, middle])
+            .await;
+        let ours = sent(&agents, agent, theirs, first).await;
+
+        let retry = agents
+            .deliver_reply(
+                first,
+                refused(ours, "no bench exists matching {soc=esp32s3}"),
+            )
+            .await
+            .expect("the coordinator that has one must still be asked");
+        assert_eq!(retry.to, last);
+        assert!(out.try_recv().is_err(), "and no failure reported yet");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_a_session_is_answered_once_and_leaves_nothing_behind() {
+        // `Ok` is what a coordinator answers a `CloseSession` broadcast with,
+        // and it was not counted as a reply: each one was forwarded verbatim,
+        // so one request got two answers, and the entry stayed in the map to
+        // swallow the next error that happened to bear the same id.
+        let agents = Agents::default();
+        let (agent, mut out) = connect(&agents).await;
+        let (lab, local) = (CoordinatorId(0), CoordinatorId(1));
+
+        let theirs = RequestId(6);
+        agents
+            .expect_fanout(agent, theirs, 2, FanoutKind::Ack)
+            .await;
+        let to_lab = sent(&agents, agent, theirs, lab).await;
+        let to_local = sent(&agents, agent, theirs, local).await;
+
+        agents
+            .deliver_reply(lab, ToClient::Ok { request: to_lab })
+            .await;
+        assert!(out.try_recv().is_err(), "not until both have answered");
+        agents
+            .deliver_reply(local, ToClient::Ok { request: to_local })
+            .await;
+
+        assert!(matches!(reply(&mut out), ToClient::Ok { request } if request == theirs));
+        assert!(out.try_recv().is_err(), "one request, one answer");
+        assert!(
+            agents.inner.lock().await.fanout.is_empty(),
+            "a dead fanout swallows the next error under this id"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_daemons_own_replies_are_not_an_agents_to_swallow() {
+        // Zero is a legal request id for an agent to choose, and it was also
+        // the daemon's marker for "mine", so an agent with a request
+        // outstanding under it absorbed the re-registration reply.
+        let agents = Agents::default();
+        let (agent, mut out) = connect(&agents).await;
+        let local = CoordinatorId(1);
+
+        let theirs = RequestId(0);
+        agents
+            .expect_fanout(agent, theirs, 1, FanoutKind::Tags)
+            .await;
+        let _ = sent(&agents, agent, theirs, local).await;
+
+        let mine = agents.track(agent, Origin::Daemon, local, true).await;
+        agents.deliver_reply(local, opened(mine, 9)).await;
+
+        assert!(
+            agents.inner.lock().await.fanout.contains_key(&(agent, 0)),
+            "the agent's request is still outstanding"
+        );
+        let line = out.try_recv().expect("an event about the reconnection");
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(event["msg"], "reconnected");
+        assert!(
+            event.get("coordinator").is_none(),
+            "naming it would tell the agent how many there are"
+        );
+        assert!(
+            agents.session_on(agent, local).await.is_some(),
+            "the session it opened is still recorded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_coordinator_that_simply_never_answers_is_answered_for() {
+        // Nothing else here is driven by time, and a connected coordinator that
+        // says nothing is not an event.
+        let agents = Agents::default();
+        let (agent, mut out) = connect(&agents).await;
+        let (lab, local) = (CoordinatorId(0), CoordinatorId(1));
+
+        let theirs = RequestId(7);
+        agents
+            .expect_fanout(agent, theirs, 2, FanoutKind::Tags)
+            .await;
+        let to_lab = sent(&agents, agent, theirs, lab).await;
+        let quiet = sent(&agents, agent, theirs, local).await;
+
+        agents
+            .deliver_reply(
+                lab,
+                ToClient::Tags {
+                    request: to_lab,
+                    tags: vec![tag("soc=esp32s3", 3, 2)],
+                },
+            )
+            .await;
+        agents.expire(agent, theirs).await;
+
+        match reply(&mut out) {
+            ToClient::Error {
+                request, retryable, ..
+            } => {
+                assert_eq!(request, theirs);
+                assert!(retryable);
+            }
+            other => panic!("a half-answered list must not be served whole: {other:?}"),
+        }
+
+        // The straggler turning up afterwards must not answer a second time.
+        agents
+            .deliver_reply(
+                local,
+                ToClient::Tags {
+                    request: quiet,
+                    tags: vec![tag("soc=rp2040", 1, 1)],
+                },
+            )
+            .await;
+        assert!(out.try_recv().is_err(), "exactly one answer, ever");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claim_that_goes_quiet_is_answered_too() {
+        let agents = Agents::default();
+        let (agent, mut out) = connect(&agents).await;
+        let lab = CoordinatorId(0);
+        with_session(&agents, agent, lab, 1).await;
+
+        let theirs = RequestId(8);
+        agents.begin_claim(agent, theirs, a_claim(), vec![]).await;
+        let _ = sent(&agents, agent, theirs, lab).await;
+        agents.expire(agent, theirs).await;
+
+        assert!(matches!(
+            reply(&mut out),
+            ToClient::Error { request, .. } if request == theirs
+        ));
+        assert!(agents.inner.lock().await.claims.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_coordinator_mid_handshake_is_waited_for_rather_than_skipped() {
+        // On a reconnect the link is live before the session exists. Treating
+        // that as "not a target" is what makes a claim come back unsatisfiable
+        // because of a coordinator the agent was never told about.
+        let agents = Arc::new(Agents::default());
+        let (agent, _out) = connect(&agents).await;
+        let local = CoordinatorId(1);
+        let ours = agents.track(agent, Origin::Daemon, local, true).await;
+
+        let waiting = {
+            let agents = Arc::clone(&agents);
+            tokio::spawn(async move {
+                agents
+                    .session_soon(agent, local, Duration::from_secs(5))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        agents.deliver_reply(local, opened(ours, 4)).await;
+
+        assert!(
+            waiting.await.unwrap().is_some(),
+            "the handshake landed inside the grace window"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_coordinator_with_no_handshake_in_flight_is_not_waited_for() {
+        // The other half: one coordinator that never finishes registering must
+        // not hold up every request on the machine.
+        let agents = Agents::default();
+        let (agent, _out) = connect(&agents).await;
+
+        let started = tokio::time::Instant::now();
+        let session = agents
+            .session_soon(agent, CoordinatorId(1), Duration::from_secs(30))
+            .await;
+        assert!(session.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "there is nothing in flight to wait for"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_that_leaves_takes_its_bookkeeping_with_it() {
+        let agents = Agents::default();
+        let (agent, _out) = connect(&agents).await;
+        let lab = CoordinatorId(0);
+
+        let ours = registering(&agents, agent, RequestId(1), lab).await;
+        agents
+            .expect_fanout(agent, RequestId(1), 1, FanoutKind::Session)
+            .await;
+        agents.deliver_reply(lab, opened(ours, 2)).await;
+        agents
+            .begin_claim(agent, RequestId(9), a_claim(), vec![])
+            .await;
+        let _ = sent(&agents, agent, RequestId(9), lab).await;
+        {
+            let mut inner = agents.inner.lock().await;
+            inner
+                .lease_owner
+                .insert(LeaseKey::new(lab, benchd_core::lease::LeaseId(1)), agent);
+        }
+
+        let sessions = agents.forget_agent(agent).await;
+        assert_eq!(sessions.len(), 1, "its session still needs closing");
+
+        let inner = agents.inner.lock().await;
+        assert!(inner.owners.is_empty(), "owners");
+        assert!(inner.uids.is_empty(), "uids");
+        assert!(inner.claims.is_empty(), "claims");
+        assert!(inner.fanout.is_empty(), "fanout");
+        assert!(inner.pending.is_empty(), "pending");
+        assert!(inner.lease_owner.is_empty(), "lease_owner");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_id_already_in_use_is_refused_rather_than_merged() {
+        let agents = Agents::default();
+        let (agent, _out) = connect(&agents).await;
+
+        let theirs = RequestId(11);
+        assert!(!agents.already_outstanding(agent, theirs).await);
+        let _ = sent(&agents, agent, theirs, CoordinatorId(0)).await;
+        assert!(agents.already_outstanding(agent, theirs).await);
+        assert!(
+            !agents.already_outstanding(agent, RequestId(12)).await,
+            "only the id that is in use"
         );
     }
 
