@@ -98,6 +98,14 @@ fn binary() -> std::path::PathBuf {
 
 impl Harness {
     fn start(tag: &str) -> Harness {
+        Harness::start_with(tag, &[])
+    }
+
+    /// A coordinator with extra flags.
+    ///
+    /// The liveness reaper and the teardown deadline are both measured in tens
+    /// of seconds by default, which is right in a lab and useless in a test.
+    fn start_with(tag: &str, extra: &[&str]) -> Harness {
         let dir = tempdir::TempDir::new(tag).expect("temp dir");
         let config = dir.path().join("coordinator.toml");
         std::fs::write(&config, CONFIG).expect("write config");
@@ -117,6 +125,7 @@ impl Harness {
             .arg("127.0.0.1:0")
             .arg("--report-address")
             .arg(&address)
+            .args(extra)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -171,6 +180,208 @@ impl Drop for Harness {
     fn drop(&mut self) {
         let _ = self.coordinator.kill();
         let _ = self.coordinator.wait();
+    }
+}
+
+/// One connection to the coordinator, held open across a whole conversation.
+///
+/// The tests above open a socket per exchange. The ones at the bottom of this
+/// file are about *who* is on the other end of a connection — which host
+/// registered a bench, which peer an instruction was sent to, who is entitled
+/// to report on it — so the connection has to persist to be the subject.
+struct Peer {
+    write: TcpStream,
+    read: BufReader<TcpStream>,
+}
+
+/// What came back, or why nothing did. Silence and a closed socket mean very
+/// different things here: hanging up is how the coordinator tells a host its
+/// bench has been withdrawn.
+#[derive(Debug)]
+enum Incoming {
+    Line(String),
+    Closed,
+    Silent,
+}
+
+impl Peer {
+    fn connect(h: &Harness) -> Peer {
+        let stream = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
+        stream.set_nodelay(true).ok();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .expect("timeout");
+        Peer {
+            write: stream.try_clone().expect("clone"),
+            read: BufReader::new(stream),
+        }
+    }
+
+    /// Shorten the read timeout, for the assertions that want silence.
+    fn expect_silence_within(&mut self, timeout: std::time::Duration) {
+        self.read
+            .get_ref()
+            .set_read_timeout(Some(timeout))
+            .expect("timeout");
+    }
+
+    fn send(&mut self, line: &str) {
+        writeln!(self.write, "{line}").expect("write");
+        self.write.flush().expect("flush");
+    }
+
+    fn next(&mut self) -> Incoming {
+        let mut line = String::new();
+        match self.read.read_line(&mut line) {
+            Ok(0) => Incoming::Closed,
+            Ok(_) => Incoming::Line(line.trim().to_string()),
+            Err(_) => Incoming::Silent,
+        }
+    }
+
+    fn recv(&mut self) -> String {
+        match self.next() {
+            Incoming::Line(line) => line,
+            other => panic!("expected a reply, got {other:?}"),
+        }
+    }
+
+    fn open_session(&mut self, name: &str) -> String {
+        self.send(&format!(
+            r#"{{"msg":"open_session","request":1,"name":"{name}"}}"#
+        ));
+        let reply = self.recv();
+        reply
+            .split("\"session\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap_or_else(|| panic!("no session token in {reply}"))
+            .to_string()
+    }
+
+    fn claim(&mut self, token: &str, request: u64, tags: &str) -> String {
+        self.send(&format!(
+            r#"{{"msg":"claim","request":{request},"session":"{token}","claim":{{"slots":{{"dut":["{tags}"]}},"ttl":60}}}}"#
+        ));
+        self.recv()
+    }
+
+    /// A round trip on this connection, so that everything sent before it has
+    /// certainly been handled — and anything unsolicited that was queued
+    /// behind it has been read.
+    ///
+    /// The coordinator serves each peer in its own task, so a message sent on
+    /// one connection and a message sent on another are not ordered against
+    /// each other. A test that assumes they are passes or fails on the
+    /// scheduler.
+    fn barrier(&mut self, token: &str) {
+        self.send(&format!(
+            r#"{{"msg":"status","request":9999,"session":"{token}"}}"#
+        ));
+        loop {
+            if self.recv().contains("\"request\":9999") {
+                return;
+            }
+        }
+    }
+}
+
+/// A registration for a bench with one serial resource.
+fn registration(id: &str) -> String {
+    format!(
+        r#"{{"msg":"register","bench":{{"id":"{id}","description":"","tags":["soc=esp32s3"],"resources":{{"console":{{"kind":"serial","path":"/dev/null"}}}}}}}}"#
+    )
+}
+
+/// The `request` an instruction carries, so a reply can be correlated the way
+/// a real executor correlates it.
+fn request_of(line: &str) -> u64 {
+    line.split("\"request\":")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or_else(|| panic!("no request id in {line}"))
+}
+
+fn lease_of(line: &str) -> u64 {
+    line.split("\"lease\":")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or_else(|| panic!("no lease id in {line}"))
+}
+
+fn done_ok(request: u64) -> String {
+    format!(r#"{{"msg":"done","request":{request},"result":{{"outcome":"ok"}}}}"#)
+}
+
+fn done_failed(request: u64) -> String {
+    format!(
+        r#"{{"msg":"done","request":{request},"result":{{"outcome":"failed","detail":"forged"}}}}"#
+    )
+}
+
+/// A bench with a live lease on it: the host and the holder both connected,
+/// both instructions delivered and neither answered yet.
+///
+/// Unanswered is deliberate. It is the state a lease is really in for most of
+/// its setup — a client serialises every materialisation behind one mutex held
+/// across a USB/IP import, so its `Done` can be tens of seconds away — and it
+/// is the window in which an instruction can be answered by the wrong peer.
+struct Leased {
+    host: Peer,
+    agent: Peer,
+    token: String,
+    lease: u64,
+    export: u64,
+    materialize: u64,
+}
+
+impl Leased {
+    fn new(h: &Harness, bench: &str) -> Leased {
+        let mut host = Peer::connect(h);
+        host.send(&registration(bench));
+        let reply = host.recv();
+        assert!(reply.contains("registered"), "{reply}");
+
+        let mut agent = Peer::connect(h);
+        let token = agent.open_session("agent-1");
+        let granted = agent.claim(&token, 2, "soc=esp32s3");
+        assert!(granted.contains("granted"), "{granted}");
+        let lease = lease_of(&granted);
+
+        let materialize = agent.recv();
+        assert!(
+            materialize.contains("\"msg\":\"materialize\""),
+            "{materialize}"
+        );
+        let export = host.recv();
+        assert!(export.contains("\"msg\":\"export\""), "{export}");
+
+        Leased {
+            host,
+            agent,
+            token,
+            lease,
+            export: request_of(&export),
+            materialize: request_of(&materialize),
+        }
+    }
+
+    /// Both executors report success, as they would on a lease that came up.
+    fn settle(&mut self) {
+        let (export, materialize) = (self.export, self.materialize);
+        self.host.send(&done_ok(export));
+        self.agent.send(&done_ok(materialize));
+    }
+
+    fn release(&mut self) {
+        let (token, lease) = (self.token.clone(), self.lease);
+        self.agent.send(&format!(
+            r#"{{"msg":"release","request":3,"session":"{token}","lease":{lease}}}"#
+        ));
+        let ok = self.agent.recv();
+        assert!(ok.contains("\"msg\":\"ok\""), "{ok}");
     }
 }
 
@@ -541,4 +752,323 @@ fn prepare_owner_is_refused_by_the_coordinator() {
     let reply = h.exchange(r#"{"msg":"prepare_owner","request":1,"name":"x"}"#);
     assert!(reply.contains("error"), "{reply}");
     assert!(reply.contains("client-daemon"), "{reply}");
+}
+
+// --- who is allowed to report on an instruction ----------------------------
+
+#[test]
+#[ignore = "spawns daemons"]
+fn only_the_peer_an_instruction_was_sent_to_may_report_on_it() {
+    // Request ids come from one counter shared between host exports and client
+    // materialisations and start at 1, and the pending table recorded only the
+    // lease. So a connection that had never opened a session and held no token
+    // could say `{"msg":"done","request":1,...}` and have lease 1 dropped under
+    // its holder — the holder told `failed` and `ended`, the host told to
+    // unexport — and a sweep of the first twenty ids cleared the lab.
+    let h = Harness::start("forged-done");
+    let mut held = Leased::new(&h, "board");
+
+    // A stranger walking the low request ids, exactly as the reproduction did.
+    // It has sent nothing else, so the coordinator knows it only as a client
+    // connection with no session at all.
+    let mut stranger = Peer::connect(&h);
+    for request in 1..=20 {
+        stranger.send(&done_failed(request));
+    }
+    // A round trip of its own, so the sweep is known to have been handled
+    // rather than merely sent.
+    stranger.open_session("stranger");
+
+    // The holder must hear nothing, and the host must not be told to tear down.
+    held.agent
+        .expect_silence_within(std::time::Duration::from_secs(2));
+    if let Incoming::Line(line) = held.agent.next() {
+        panic!("a forged report reached the holder: {line}");
+    }
+    held.host
+        .expect_silence_within(std::time::Duration::from_secs(2));
+    if let Incoming::Line(line) = held.host.next() {
+        panic!("a forged report had the host tear its bench down: {line}");
+    }
+
+    let state = h.exchange(r#"{"msg":"inspect"}"#);
+    assert!(
+        !state.contains("\"leases\":[]"),
+        "a forged report destroyed the lease: {state}"
+    );
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn a_forged_success_cannot_hide_a_real_failure() {
+    // The other half of the same hole. A forged `ok` used to take the pending
+    // entry with it, so when the real executor reported that it could not carry
+    // the instruction out, the coordinator no longer knew which lease that was
+    // about — and the agent kept a lease whose hardware was never exported.
+    let h = Harness::start("forged-ok");
+    let mut held = Leased::new(&h, "board");
+
+    let mut stranger = Peer::connect(&h);
+    stranger.send(&done_ok(held.export));
+    // A round trip on the stranger's own connection, so the forged report is
+    // known to have been handled before the real one is sent. Otherwise the
+    // test races the two and passes for the wrong reason.
+    stranger.open_session("stranger");
+
+    let export = held.export;
+    held.host.send(&format!(
+        r#"{{"msg":"done","request":{export},"result":{{"outcome":"failed","detail":"usbip bind failed"}}}}"#
+    ));
+
+    let failed = held.agent.recv();
+    assert!(
+        failed.contains("\"msg\":\"failed\""),
+        "the holder must still be told its lease never came up: {failed}"
+    );
+    assert!(failed.contains("usbip bind failed"), "{failed}");
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn a_host_cannot_answer_for_a_client_nor_a_client_for_a_host() {
+    // The same check from the other direction: both peers here are real
+    // executors holding real connections, and each answers the instruction the
+    // other was given.
+    let h = Harness::start("crossed-done");
+    let mut held = Leased::new(&h, "board");
+
+    let (export, materialize) = (held.export, held.materialize);
+    held.host.send(&done_failed(materialize));
+    held.agent.send(&done_failed(export));
+
+    held.agent
+        .expect_silence_within(std::time::Duration::from_secs(2));
+    if let Incoming::Line(line) = held.agent.next() {
+        panic!("an instruction answered by the wrong peer ended the lease: {line}");
+    }
+    let state = h.exchange(r#"{"msg":"inspect"}"#);
+    assert!(!state.contains("\"leases\":[]"), "{state}");
+}
+
+// --- a bench that comes back -----------------------------------------------
+
+#[test]
+#[ignore = "spawns daemons"]
+fn a_host_gets_a_withdrawn_bench_back_by_registering_again() {
+    // There was no path back from a withdrawn bench. Heartbeats found no entry
+    // to touch, and a second `register` on a live connection was discarded — so
+    // a host that lost its bench stayed connected, heartbeating and physically
+    // holding the hardware, with no way to offer it again.
+    let h = Harness::start("reregister");
+
+    let mut host = Peer::connect(&h);
+    host.send(&registration("board"));
+    assert!(host.recv().contains("registered"));
+
+    // Withdraw the bench without disturbing the connection.
+    host.send(r#"{"msg":"device_lost","resource":"console","detail":"unplugged"}"#);
+    let mut withdrawn = false;
+    for _ in 0..100 {
+        if !h.exchange(r#"{"msg":"inspect"}"#).contains("\"board\"") {
+            withdrawn = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(withdrawn, "the bench should have been withdrawn");
+
+    host.send(&registration("board"));
+    let reply = host.recv();
+    assert!(
+        reply.contains("registered"),
+        "a repeat registration must be answered, not discarded: {reply}"
+    );
+
+    // Listed again, and claimable again rather than merely listed.
+    let state = h.exchange(r#"{"msg":"inspect"}"#);
+    assert!(state.contains("\"board\""), "{state}");
+
+    let mut agent = Peer::connect(&h);
+    let token = agent.open_session("agent-1");
+    let granted = agent.claim(&token, 2, "soc=esp32s3");
+    assert!(granted.contains("granted"), "{granted}");
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn a_host_declared_dead_is_told_to_unexport_and_then_hung_up_on() {
+    // Two failures in one path. The reaper forgot the route to the host before
+    // dispatching the teardown, so `Unexport` found nobody and was skipped:
+    // harmless for a host that really is dead, but one wrongly declared dead is
+    // alive on an open socket and was never told, and kept its device
+    // stub-bound and its relay socket pumping for a lease the coordinator had
+    // forgotten while the client was told to unmaterialise. And nothing closed
+    // the connection either, so a host that had merely been slow had no route
+    // back at all.
+    let h = Harness::start_with("declared-dead", &["--host-timeout-seconds", "8"]);
+    let mut held = Leased::new(&h, "board");
+    held.settle();
+
+    // No heartbeats from here on: the reaper will decide this host is gone.
+    let unexport = held.host.recv();
+    assert!(
+        unexport.contains("\"msg\":\"unexport\""),
+        "a host declared dead must still be told to let go: {unexport}"
+    );
+    assert!(
+        matches!(held.host.next(), Incoming::Closed),
+        "and then hung up on, because nothing else can tell it its bench is gone"
+    );
+
+    // The holder learns about it too, as it always did.
+    let unmaterialize = held.agent.recv();
+    assert!(
+        unmaterialize.contains("\"msg\":\"unmaterialize\""),
+        "{unmaterialize}"
+    );
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn a_disconnecting_host_does_not_take_a_bench_another_one_still_serves() {
+    // A second host may claim a bench id already held, by design, so a
+    // restarted host can take its own bench back. That left the first host
+    // connected and still physically holding the hardware but forgotten — so
+    // when the second disconnected, the bench went with it and never came back.
+    // No race and no timeout involved.
+    let h = Harness::start("standby");
+
+    let mut first = Peer::connect(&h);
+    first.send(&registration("board"));
+    assert!(first.recv().contains("registered"));
+
+    let mut second = Peer::connect(&h);
+    second.send(&registration("board"));
+    assert!(second.recv().contains("registered"));
+
+    // A lease on the bench, so the disconnect below has an observable
+    // consequence to wait for rather than a sleep to guess at.
+    let mut agent = Peer::connect(&h);
+    let token = agent.open_session("agent-1");
+    let granted = agent.claim(&token, 2, "soc=esp32s3");
+    assert!(granted.contains("granted"), "{granted}");
+    let materialize = agent.recv();
+    agent.send(&done_ok(request_of(&materialize)));
+    let export = second.recv();
+    assert!(export.contains("\"msg\":\"export\""), "{export}");
+
+    drop(second);
+
+    // The lease dies with the connection that was exporting it; that is the
+    // signal the disconnect has been processed.
+    let unmaterialize = agent.recv();
+    assert!(
+        unmaterialize.contains("\"msg\":\"unmaterialize\""),
+        "{unmaterialize}"
+    );
+    agent.send(&done_ok(request_of(&unmaterialize)));
+    let ended = agent.recv();
+    assert!(ended.contains("\"msg\":\"ended\""), "{ended}");
+
+    let state = h.exchange(r#"{"msg":"inspect"}"#);
+    assert!(
+        state.contains("\"board\""),
+        "the bench left with a host that was not the only one serving it: {state}"
+    );
+
+    // And it is the host that is still there which gets the next export.
+    let granted = agent.claim(&token, 3, "soc=esp32s3");
+    assert!(granted.contains("granted"), "{granted}");
+    let export = first.recv();
+    assert!(
+        export.contains("\"msg\":\"export\""),
+        "the export must reach the host that is still connected: {export}"
+    );
+}
+
+// --- letting go before handing on -------------------------------------------
+
+#[test]
+#[ignore = "spawns daemons"]
+fn a_bench_is_not_handed_on_until_its_holder_has_let_go() {
+    // "Unmaterialise before unexport" was only ever an ordering of *sends*. The
+    // lease left the lease table before either instruction went out, so the
+    // bench left the busy set at the same moment and the next claim could be
+    // granted it — and the host told to export it — while the previous holder
+    // was still inside an unmaterialisation it serialises behind one global
+    // mutex held across a USB/IP operation.
+    let h = Harness::start("drain");
+    let mut held = Leased::new(&h, "board");
+    held.settle();
+    held.release();
+
+    let unmaterialize = held.agent.recv();
+    assert!(
+        unmaterialize.contains("\"msg\":\"unmaterialize\""),
+        "{unmaterialize}"
+    );
+    let unexport = held.host.recv();
+    assert!(unexport.contains("\"msg\":\"unexport\""), "{unexport}");
+
+    // Deliberately not acknowledged yet: this is the window.
+    let mut second = Peer::connect(&h);
+    let other = second.open_session("agent-2");
+    let refused = second.claim(&other, 2, "soc=esp32s3");
+    assert!(
+        refused.contains("\"msg\":\"error\""),
+        "the bench was handed on before its holder had let go: {refused}"
+    );
+    assert!(
+        refused.contains("still being released"),
+        "the refusal should say why: {refused}"
+    );
+    assert!(
+        refused.contains("\"retryable\":true"),
+        "a bench that is seconds away must not be reported as one that will \
+         never exist: {refused}"
+    );
+
+    // Now it has let go.
+    held.agent.send(&done_ok(request_of(&unmaterialize)));
+    held.agent.barrier(&held.token);
+    let granted = second.claim(&other, 3, "soc=esp32s3");
+    assert!(
+        granted.contains("granted"),
+        "the bench should be allocatable the moment its holder answers: {granted}"
+    );
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn a_holder_that_never_answers_does_not_strand_the_bench() {
+    // The bounded escape. A bench waiting for a `Done` that will never come is
+    // a worse bug than the stale mount the wait exists to prevent, and a client
+    // can die mid-teardown or fail the unmaterialisation outright.
+    let h = Harness::start_with("drain-timeout", &["--teardown-ack-seconds", "2"]);
+    let mut held = Leased::new(&h, "board");
+    held.settle();
+    held.release();
+
+    let unmaterialize = held.agent.recv();
+    assert!(
+        unmaterialize.contains("\"msg\":\"unmaterialize\""),
+        "{unmaterialize}"
+    );
+
+    // Never answered.
+    let mut second = Peer::connect(&h);
+    let other = second.open_session("agent-2");
+    let refused = second.claim(&other, 2, "soc=esp32s3");
+    assert!(
+        refused.contains("still being released"),
+        "the hold should be in force to begin with, or this proves nothing: {refused}"
+    );
+
+    for _ in 0..40 {
+        if second.claim(&other, 3, "soc=esp32s3").contains("granted") {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    panic!("the bench was still waiting for an acknowledgement that will never come");
 }

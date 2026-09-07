@@ -47,6 +47,18 @@ pub struct CoordinatorArgs {
     /// Should be a few times the executors' heartbeat interval.
     #[arg(long, default_value_t = 45)]
     host_timeout_seconds: u64,
+
+    /// How long a bench waits for its holder to acknowledge a teardown before
+    /// it may be claimed again.
+    ///
+    /// A client serialises materialisation and unmaterialisation behind one
+    /// mutex held across a USB/IP operation, so an acknowledgement can be tens
+    /// of seconds late; the wait is what keeps the next holder from being
+    /// handed a bench the previous one has not let go of. It is bounded
+    /// because a bench waiting for a reply that will never come is a worse
+    /// failure than the stale mount it prevents.
+    #[arg(long, default_value_t = 60)]
+    teardown_ack_seconds: u64,
 }
 
 pub struct Shared {
@@ -92,7 +104,7 @@ pub async fn run(args: CoordinatorArgs) -> Result<()> {
         "limits"
     );
 
-    let state = State::new(limits, vocabulary);
+    let state = State::new(limits, vocabulary, args.teardown_ack_seconds);
     let shared = Arc::new(Shared {
         state: Mutex::new(state),
         relay: Arc::new(crate::relay::Relay::default()),
@@ -110,7 +122,16 @@ pub async fn run(args: CoordinatorArgs) -> Result<()> {
                 ticker.tick().await;
                 let outgoing = {
                     let mut state = shared.state.lock().await;
-                    let mut effects = state.leases.tick(now());
+
+                    // Teardowns nobody is going to acknowledge. This is the
+                    // bounded escape behind the hold a teardown puts on its
+                    // benches: it races voluntary releases, so it must be
+                    // idempotent, and it must never leave a bench waiting for
+                    // a `Done` that will never arrive.
+                    state.expire_holds(now());
+
+                    let effects = state.leases.tick(now());
+                    let mut outgoing = state.dispatch(effects);
 
                     // A host that has stopped answering cannot be trusted to
                     // still own its hardware, so its bench stops being matched
@@ -123,21 +144,26 @@ pub async fn run(args: CoordinatorArgs) -> Result<()> {
                         timeout,
                         "liveness check"
                     );
-                    for bench in silent {
-                        tracing::warn!(%bench, "host has gone silent; withdrawing its bench");
-                        state.hosts.remove(&bench);
-                        state.leases.inventory_mut().benches.remove(&bench);
-                        let doomed: Vec<_> = state
-                            .leases
-                            .leases()
-                            .filter(|l| l.benches().any(|b| b == &bench))
-                            .map(|l| l.id)
-                            .collect();
-                        for lease in doomed {
-                            effects.extend(state.leases.drop_lease(lease));
-                        }
+                    for conn_id in silent {
+                        let Some(host) = state.hosts.get(&conn_id) else {
+                            continue;
+                        };
+                        tracing::warn!(
+                            bench = %host.bench.id, conn_id,
+                            "host has gone silent; withdrawing its bench"
+                        );
+                        // Hang up as well as withdrawing. The protocol has no
+                        // way to say "your bench is gone", and a host that was
+                        // only slow has no other route back: its registration
+                        // has been forgotten, so the heartbeats it is still
+                        // sending land on nothing and a claim for its
+                        // capability comes back as one that will never be
+                        // satisfiable. A closed connection it already handles.
+                        host.hangup.notify_one();
+                        let withdrawn = handlers::withdraw_host(&mut state, conn_id);
+                        outgoing.extend(withdrawn);
                     }
-                    state.dispatch(effects)
+                    outgoing
                 };
                 for msg in outgoing {
                     msg.send();
