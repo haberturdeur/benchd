@@ -308,13 +308,19 @@ pub async fn run(args: ClientArgs) -> Result<()> {
                         coordinator = %coordinator.name, ?err, "link failed"
                     );
                 }
+                // Retire the link first. Tearing down its leases below unmounts
+                // and detaches per resource, which takes seconds, and until the
+                // sender is gone `live_links` still offers this coordinator as
+                // a target — so every request routed during the teardown would
+                // be written into a channel whose receiver died with `link`,
+                // and answered by nobody.
+                shared.links.lock().await.remove(&coordinator.id);
                 // Only this coordinator's leases are void.
                 {
                     let mut m = shared.materializer.lock().await;
                     m.clear_coordinator(coordinator.id).await;
                 }
                 shared.agents.invalidate(coordinator.id).await;
-                shared.links.lock().await.remove(&coordinator.id);
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 tracing::info!(coordinator = %coordinator.name, "reconnecting");
             }

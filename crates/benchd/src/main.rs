@@ -72,6 +72,10 @@ enum Command {
 ///
 /// The default filter names the crate the subcommand lives in, which is what it
 /// named before the merge: `RUST_LOG=benchd_host=debug` still selects the host.
+/// The two components that drive sysfs name `benchd_core` as well, because that
+/// is where the kernel diagnostics live — a wedged usbip driver, a device left
+/// with no driver — and a release that fails silently is worse than one that
+/// fails.
 fn logging(default: &str) {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -90,8 +94,8 @@ async fn main() -> ExitCode {
     // log line in front of it is noise on a terminal rather than context.
     match &args.command {
         Command::Coordinator(_) => logging("benchd_coordinator=info"),
-        Command::Host(_) => logging("benchd_host=info"),
-        Command::Client(_) => logging("benchd_client=info"),
+        Command::Host(_) => logging("benchd_host=info,benchd_core=info"),
+        Command::Client(_) => logging("benchd_client=info,benchd_core=info"),
         Command::Mcp(_) => logging("benchd_mcp=info"),
         Command::Lease(_) | Command::Operator(_) => {}
     }

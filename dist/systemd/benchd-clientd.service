@@ -3,6 +3,14 @@ Description=benchd client daemon
 After=network.target
 
 [Service]
+# A lease is a real device node, created here with the same major/minor as the
+# imported one. /run is nodev on any systemd machine, and a node on a nodev
+# filesystem opens with EACCES -- so the tree needs a filesystem of its own that
+# permits devices. Never unmounted: the record of which vhci ports this daemon
+# attached lives in the tree, and losing it across a restart would leave
+# imported devices attached with nothing left that knows to detach them.
+ExecStartPre=/bin/mkdir -p /run/benchd
+ExecStartPre=/bin/sh -c 'mountpoint -q /run/benchd || mount -t tmpfs -o mode=0755,nosuid,dev,size=8M benchd-leases /run/benchd'
 ExecStart=/usr/local/bin/benchd client --coordinator ${BENCHD_COORDINATOR} --root /run/benchd
 # Loopback default so a single-machine install needs no configuration. To add a
 # shared lab server the client needs a second --coordinator, which means
@@ -16,11 +24,13 @@ ExecStart=/usr/local/bin/benchd client --coordinator ${BENCHD_COORDINATOR} --roo
 Environment=BENCHD_COORDINATOR=127.0.0.1:4711
 Restart=always
 RestartSec=3
-# Root: bind-mounting a device inode needs CAP_SYS_ADMIN, and usbip attach needs
-# root. The agent stays unprivileged, which is the point (D8).
+# Root: creating a device node needs CAP_MKNOD, giving it away needs CAP_CHOWN,
+# and usbip attach needs the sysfs writes. The agent stays unprivileged, which
+# is the point (D8).
 User=root
-# The materialiser must see mounts propagate into agent sandboxes.
-MountFlags=shared
+# No MountFlags=, deliberately. It would put this service in its own mount
+# namespace, and the lease tree it mounts above has to be the one an agent's
+# sandbox binds -- which is a different process, in the host's namespace.
 
 [Install]
 WantedBy=multi-user.target

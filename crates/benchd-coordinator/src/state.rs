@@ -420,7 +420,12 @@ impl State {
 
         let vocabulary = &self.leases.inventory().vocabulary;
         let declared: benchd_core::tags::TagSet = spec.tags.iter().cloned().collect();
-        vocabulary.check(&declared).map_err(|e| e.to_string())?;
+        // Not `Vocabulary::check`: a host must not declare a `name=` tag, which
+        // the coordinator appends below from the id the host registered under.
+        // Nothing stops a host on the LAN claiming to be another bench, and a
+        // forged identity would be indistinguishable from the real one.
+        benchd_core::model::check_declared_tags(vocabulary, &declared)
+            .map_err(|e| e.to_string())?;
 
         let mut tags = vocabulary.expand(&declared);
         let name_tag = benchd_core::tags::Tag::parse(&format!("name={}", spec.id))
