@@ -51,13 +51,18 @@ description = "Bluetooth / BLE"
 
 [tags.psram]
 description = "External PSRAM fitted"
-[tags.psram.values.none]
-description = "No PSRAM"
+# No psram=none, for the same reason there is no jtag=none below: a board with
+# no PSRAM omits the key.
 [tags.psram.values.octal]
 description = "Octal-SPI PSRAM"
 
 [tags.flash]
 description = "Flash size"
+# weight 0: description, not a contended capability. Flash values are ordinal,
+# and scoring prices a tag by how few benches carry that exact value - so a
+# 4 MiB board looked scarcer than an 8 MiB one and "least capable wins" ran
+# backwards. A claim that needs 8 MiB asks for flash=8mb and matches exactly.
+weight = 0
 [tags.flash.values."4mb"]
 description = "4 MiB"
 [tags.flash.values."8mb"]
@@ -110,15 +115,15 @@ by_id = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_30:ED:A0:EC:
 
 [benches."esp32s3-b"]
 description = "ESP32-S3 devkit, native USB-JTAG"
-tags = ["soc=esp32s3", "psram=none", "flash=8mb", "console=usbjtag", "jtag=builtin"]
+tags = ["soc=esp32s3", "flash=8mb", "console=usbjtag", "jtag=builtin"]
 [benches."esp32s3-b".resources.console]
 kind = "serial"
 by_id = "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_3C:84:27:40:98:90-if00"
 
 [benches."esp32-cp2102"]
 description = "Classic ESP32 devkit behind a CP2102N bridge"
-# No jtag key: the board exposes no debug interface on this bench.
-tags = ["soc=esp32", "console=uart", "psram=none", "flash=4mb"]
+# No jtag or psram key: the board has neither on this bench.
+tags = ["soc=esp32", "console=uart", "flash=4mb"]
 [benches."esp32-cp2102".resources.console]
 kind = "serial"
 by_id = "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_8642368df26cef11bddfc5a7c169b110-if00-port0"

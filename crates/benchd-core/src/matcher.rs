@@ -152,6 +152,14 @@ pub struct NoMatch {
     /// True when every slot is individually available, but no assignment
     /// satisfies them all at once under the distinctness rule.
     pub conflict_only: bool,
+    /// True when the assignment search hit its node limit before reaching any
+    /// complete assignment, so nothing is known about whether one exists.
+    ///
+    /// Kept apart from `conflict_only` because the two say opposite things to
+    /// an agent. "No assignment exists" means change the request; "we stopped
+    /// looking" means try again, and conflating them told an agent its
+    /// perfectly satisfiable claim was impossible.
+    pub search_exhausted: bool,
 }
 
 impl NoMatch {
@@ -162,7 +170,13 @@ impl NoMatch {
     /// that, because nothing is busy. Reporting it as merely contended told an
     /// agent to retry a request that can never succeed, which is precisely the
     /// spin D14 exists to prevent.
+    ///
+    /// An exhausted search is the mirror image: we proved nothing, so the only
+    /// honest answer is "retryable".
     pub fn unsatisfiable(&self) -> bool {
+        if self.search_exhausted {
+            return false;
+        }
         self.conflict_only
             || self
                 .slots
@@ -193,6 +207,14 @@ impl fmt::Display for NoMatch {
                  sharing one bench is acceptable."
             )?;
         }
+        if self.search_exhausted {
+            writeln!(
+                f,
+                "the search for an assignment gave up after {SEARCH_NODE_LIMIT} steps \
+                 without finishing, so this is not a claim that no assignment exists. \
+                 Retry, or ask for fewer slots at once."
+            )?;
+        }
         for (i, slot) in self.slots.iter().enumerate() {
             if i > 0 {
                 writeln!(f)?;
@@ -209,15 +231,32 @@ impl std::error::Error for NoMatch {}
 ///
 /// Every capability the bench has that the requirement did not ask for
 /// contributes `weight(key) / (benches carrying that tag)`. A capability only
-/// one bench in the lab has is expensive to squander; one every bench has is
-/// free. Lower is a better fit.
+/// one bench in the lab can supply is expensive to squander; one every bench
+/// has is free. `tag_counts` must therefore count *allocatable* benches, not
+/// every bench that exists — see [`allocate`]. Lower is a better fit.
 ///
-/// The per-key weight matters more than it looks. Scarcity alone conflates
-/// *rare* with *valuable*: being the lab's only CP2102N board makes
-/// `usb=cp2102n` unique but not precious, and unweighted scoring would
-/// therefore protect the cheapest board most. Identity keys (soc, arch, usb)
-/// should be weighted 0; genuinely contended peripherals (JTAG probes, RF
-/// chambers, PSRAM) keep weight 1.
+/// The per-key weight matters more than it looks, and it is the only knob:
+/// there are no per-value weights and no ordering between values, because
+/// matching is exact per tag and nothing here knows that 8mb is "more" than
+/// 4mb.
+///
+/// Two things follow, and the vocabulary has to hold up both ends:
+///
+/// * Scarcity conflates *rare* with *valuable*. Being the lab's only CP2102N
+///   board makes `console=uart` unique but not precious, and unweighted
+///   scoring would therefore protect the cheapest board most. So keys that
+///   *describe* a board — soc, family, arch, console, flash — carry weight 0,
+///   and only keys naming a capability a claim can waste (peripheral, jtag,
+///   psram, sdmux) keep weight 1.
+/// * The denominator counts benches carrying that exact `key=value`, so a key
+///   whose values are ordinal prices the rarity of the value rather than any
+///   capability: `flash=4mb` on one board cost twice `flash=8mb` on two, which
+///   is "least capable wins" running backwards. Such a key belongs at weight 0.
+///
+/// A value naming the *absence* of something (`psram=none`, `jtag=none`) is
+/// charged exactly like a real capability and so must not exist; a board
+/// without the hardware omits the key. The shipped vocabularies say so where
+/// the temptation is.
 pub fn fit_cost(
     bench: &Bench,
     requirement: &Requirement,
@@ -258,15 +297,27 @@ pub fn fit_cost(
 }
 
 /// Assign every slot in `request` to a distinct free bench, or explain why not.
+///
+/// The scarcity counts the scoring needs are derived here rather than passed
+/// in, because they have to be taken over the benches this call could actually
+/// hand out: `busy` is the difference between "the lab owns two JTAG boards"
+/// and "one JTAG board is available", and pricing the last free one at half
+/// its worth spends it on a claim that never asked for JTAG.
 pub fn allocate(
     request: &ClaimRequest,
     benches: &[&Bench],
     busy: &BTreeMap<String, BusyInfo>,
-    tag_counts: &BTreeMap<Tag, usize>,
     weights: &BTreeMap<String, f64>,
 ) -> Result<Allocation, NoMatch> {
     let enabled: Vec<&Bench> = benches.iter().copied().filter(|b| b.enabled).collect();
     let by_id: BTreeMap<&str, &Bench> = enabled.iter().map(|b| (b.id.as_str(), *b)).collect();
+
+    let mut tag_counts: BTreeMap<Tag, usize> = BTreeMap::new();
+    for bench in enabled.iter().filter(|b| !busy.contains_key(&b.id)) {
+        for tag in &bench.tags {
+            *tag_counts.entry(tag.clone()).or_insert(0) += 1;
+        }
+    }
 
     // Per-slot candidate sets.
     let mut matching: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -310,14 +361,17 @@ pub fn allocate(
                 })
                 .collect(),
             conflict_only: false,
+            search_exhausted: false,
         });
     }
 
-    match best_assignment(request, &free, &by_id, tag_counts, weights) {
-        Some((assignment, cost)) => Ok(Allocation { assignment, cost }),
+    let searched = best_assignment(request, &free, &by_id, &tag_counts, weights);
+    match searched.best {
+        Some(allocation) => Ok(allocation),
         None => {
-            // Every slot had a free candidate, so this is purely a distinctness
-            // conflict: e.g. two slots that both only match the same bench.
+            // Every slot had a free candidate, so unless the search gave up
+            // early this is purely a distinctness conflict: e.g. two slots that
+            // both only match the same bench.
             Err(NoMatch {
                 slots: request
                     .slots
@@ -333,10 +387,19 @@ pub fn allocate(
                         )
                     })
                     .collect(),
-                conflict_only: true,
+                conflict_only: !searched.exhausted,
+                search_exhausted: searched.exhausted,
             })
         }
     }
+}
+
+/// What one assignment search came back with.
+struct Searched {
+    best: Option<Allocation>,
+    /// The node budget ran out, so `best` is whatever had been found by then
+    /// and `None` means only that the search stopped looking.
+    exhausted: bool,
 }
 
 /// Exact minimum-cost assignment under the distinctness constraint.
@@ -345,13 +408,18 @@ pub fn allocate(
 /// conflicts surface at shallow depth. Exhaustive rather than greedy because
 /// greedy can report failure for a request that *is* satisfiable, and a false
 /// "no bench available" is the worst possible answer here.
+///
+/// Whether the search finished is as much of an answer as what it found: with
+/// an assignment in hand a truncated search only risks a suboptimal fit, but
+/// with none it has proved nothing at all, and the caller must not report that
+/// as "impossible".
 fn best_assignment(
     request: &ClaimRequest,
     free: &BTreeMap<&str, Vec<String>>,
     by_id: &BTreeMap<&str, &Bench>,
     tag_counts: &BTreeMap<Tag, usize>,
     weights: &BTreeMap<String, f64>,
-) -> Option<(BTreeMap<String, String>, f64)> {
+) -> Searched {
     let mut cost: BTreeMap<(&str, &str), f64> = BTreeMap::new();
     for (slot, requirement) in &request.slots {
         for bench_id in &free[slot.as_str()] {
@@ -384,8 +452,9 @@ fn best_assignment(
         candidates: BTreeMap<&'a str, Vec<&'a str>>,
         cost: BTreeMap<(&'a str, &'a str), f64>,
         distinct: &'a crate::model::Distinct,
-        best: Option<(BTreeMap<String, String>, f64)>,
+        best: Option<Allocation>,
         nodes: u64,
+        exhausted: bool,
     }
 
     fn recurse(
@@ -397,15 +466,21 @@ fn best_assignment(
     ) {
         s.nodes += 1;
         if s.nodes > SEARCH_NODE_LIMIT {
-            return; // safety valve; the caller sees whatever bound we found
+            // Safety valve; the caller sees whatever bound we found, and is
+            // told the answer is incomplete.
+            s.exhausted = true;
+            return;
         }
-        if let Some((_, best_cost)) = &s.best {
-            if total >= *best_cost {
+        if let Some(best) = &s.best {
+            if total >= best.cost {
                 return;
             }
         }
         if index == s.order.len() {
-            s.best = Some((acc.clone(), total));
+            s.best = Some(Allocation {
+                assignment: acc.clone(),
+                cost: total,
+            });
             return;
         }
         let slot = s.order[index];
@@ -433,6 +508,7 @@ fn best_assignment(
         distinct: &request.distinct,
         best: None,
         nodes: 0,
+        exhausted: false,
     };
     recurse(
         &mut search,
@@ -441,7 +517,10 @@ fn best_assignment(
         &mut BTreeMap::new(),
         0.0,
     );
-    search.best
+    Searched {
+        best: search.best,
+        exhausted: search.exhausted,
+    }
 }
 
 /// Classify a slot failure as unsatisfiable or merely contended.
