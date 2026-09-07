@@ -17,16 +17,36 @@
 //! reintroduced through the back door. With the lease id in the path, a stale
 //! reference fails with `ENOENT`.
 //!
-//! Bind mounts rather than symlinks. The original reason was that an agent ran
-//! in a sandbox with no `/dev`, where a symlink to `/dev/ttyACM0` would dangle.
-//! That no longer holds — hiding happens at the host now (D22), so no sandbox
-//! is required and the agent has an ordinary `/dev` — but a bind mount puts the
-//! real inode at the destination and behaves exactly as the device does,
-//! because it *is* the device. Symlinks would work today and would cost this
-//! daemon its `CAP_SYS_ADMIN`; that swap is worth making and has not been made.
+//! **A private node per lease, not a bind mount of the one in `/dev`.** A bind
+//! mount of a file shares the source inode, so every permission change made to
+//! hand the device to an agent lands on `/dev/ttyACM0` machine-wide: the node
+//! becomes the agent's uid — which two agents commonly share, and separating
+//! those is the only thing the sandbox is still for — while keeping the group
+//! and mode it had, so `dialout` (a human's own account, on a workstation) can
+//! open whatever is currently leased. `mknod` with the source's type and
+//! major/minor addresses the same driver and behaves exactly as the device
+//! does, while being reachable only through the lease directory.
+//!
+//! The imported node in `/dev` is then locked to root for as long as the lease
+//! lasts and put back on release, so the lease directory really is the only way
+//! to a leased board rather than merely the intended one. Locking it is safe
+//! precisely because it is not this machine's hardware: every node this module
+//! touches belongs to a device that exists here only because this lease
+//! imported it (see [`benchd_core::sysfs::wait_for_vhci_node`]).
+//!
+//! That needs the tree to be on a filesystem mounted **without** `nodev`, which
+//! `/run` is not by default — a node can be created on a `nodev` mount but not
+//! opened. [`Materializer::check_root`] says so loudly at startup rather than
+//! leaving an agent with a node and an `EACCES` it cannot explain.
+//!
+//! `mknod` is spawned rather than called: this crate forbids `unsafe`, and
+//! `mknod(2)` has no safe binding in std. It does mean the daemon no longer
+//! needs `CAP_SYS_ADMIN` for materialisation, only `CAP_MKNOD` and
+//! `CAP_CHOWN` — the symlink swap that would have dropped the last of them is
+//! no longer possible at all, because a symlink cannot have its own ownership.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::ids::LeaseKey;
 use benchd_core::lease::SessionId;
@@ -36,8 +56,23 @@ use benchd_core::wire::{ChannelHello, ChannelSide, Outcome, ResourceHandle, Want
 use futures::SinkExt;
 use tokio_util::codec::{FramedWrite, LinesCodec};
 
-/// A device node and the uid/gid it had before an agent was given it.
-type OwnershipToRestore = (PathBuf, (u32, u32));
+/// Every directory this daemon creates under its root.
+///
+/// Explicit because nothing sets a umask and the systemd unit does not either,
+/// so `create_dir_all` would take `0o777 & ~umask` — which is `0755` today and
+/// world-writable the first time someone debugs the daemon from a shell with
+/// `umask 0`. An agent that can write a lease directory can plant a symlink
+/// where root will create the next one.
+const DIR_MODE: u32 = 0o755;
+
+/// A device node an agent has been given, and the ownership it had first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BorrowedNode {
+    path: PathBuf,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
 
 pub struct Materializer {
     root: PathBuf,
@@ -47,25 +82,66 @@ pub struct Materializer {
     /// Highest epoch seen per lease. The client is an executor too, and a
     /// delayed instruction for a superseded lease must be dropped rather than
     /// obeyed — obeying it would expose hardware whose lease is gone (D7).
-    /// Until now only the host fenced, and the client relied on TCP ordering.
+    ///
+    /// This is *not* what keeps a lease's own instructions in order: every
+    /// instruction for one lease carries the same epoch (a lease's epochs never
+    /// change after the claim), so the fence can never separate a `Materialize`
+    /// from the `Unmaterialize` that undoes it. The dispatcher's per-lease queue
+    /// does that. What is left for the fence is an instruction carrying an
+    /// epoch older than one already obeyed, which means a coordinator
+    /// incarnation this daemon has since stopped believing.
     seen: BTreeMap<LeaseKey, benchd_core::lease::Epoch>,
     active: BTreeMap<LeaseKey, PathBuf>,
     /// vhci ports this lease imported, needing an explicit detach.
     imported: BTreeMap<LeaseKey, Vec<u32>>,
-    /// Device ownership to put back on release. A bind mount shares the source
-    /// inode, so handing a device to an agent changes it in `/dev` too.
-    restore: BTreeMap<LeaseKey, Vec<OwnershipToRestore>>,
+    /// Imported `/dev` nodes locked to root for the duration of a lease, and
+    /// what to put back on release. Locking them is what makes the lease path
+    /// the only way to a leased board; this is what stops that being permanent.
+    restore: BTreeMap<LeaseKey, Vec<BorrowedNode>>,
+    /// The same two things, on disk, so a restarted daemon can undo its own
+    /// work and only its own.
+    ledger: Ledger,
 }
 
 impl Materializer {
     pub fn new(root: impl Into<PathBuf>, coordinators: Vec<crate::Coordinator>) -> Self {
+        let root = root.into();
         Materializer {
-            root: root.into(),
+            ledger: Ledger::new(&root),
+            root,
             coordinators,
             seen: BTreeMap::new(),
             active: BTreeMap::new(),
             restore: BTreeMap::new(),
             imported: BTreeMap::new(),
+        }
+    }
+
+    /// Complain at startup if the lease tree cannot carry device nodes.
+    ///
+    /// `mknod` succeeds on a `nodev` mount and the node is then unopenable, so
+    /// the symptom without this is every lease reporting success and every tool
+    /// the agent runs failing with `EACCES` on a node that looks perfectly
+    /// correct in `ls -l`. `/run` is `nosuid,nodev` on any systemd machine, so
+    /// this is the expected state of a deployment that has not been told.
+    pub async fn check_root(&self) {
+        let Ok(mountinfo) = tokio::fs::read_to_string("/proc/self/mountinfo").await else {
+            return;
+        };
+        let root = tokio::fs::canonicalize(&self.root)
+            .await
+            .unwrap_or_else(|_| self.root.clone());
+        let Some(options) = mount_options_for(&mountinfo, &root) else {
+            return;
+        };
+        if !honours_device_nodes(options) {
+            tracing::error!(
+                root = %self.root.display(), options,
+                "the lease tree is on a nodev filesystem: device nodes can be created \
+                 there but never opened, so every lease will hand the agent a node it \
+                 cannot use. Give the root its own tmpfs mounted `dev`, and bind it \
+                 into agent sandboxes in a way that keeps devices (`bwrap --dev-bind`)"
+            );
         }
     }
 
@@ -143,11 +219,6 @@ impl Materializer {
             .join(format!("{}-{}", lease.coordinator, lease.lease))
     }
 
-    /// Remove everything under our root.
-    ///
-    /// Bind mounts are kernel state and outlive the process that made them, so
-    /// without this a restart would leave hardware reachable by an agent whose
-    /// lease is gone (D6).
     /// Forget everything belonging to ONE coordinator, and release its devices.
     ///
     /// Per coordinator, not global: a blip on the shared lab server must not
@@ -170,6 +241,10 @@ impl Materializer {
     }
 
     /// Clear everything, including kernel state left by a previous process.
+    ///
+    /// Device nodes and vhci attachments outlive the process that made them, so
+    /// without this a restart would leave hardware reachable by an agent whose
+    /// lease is gone (D6).
     pub async fn clear_stale(&mut self) {
         // Every lease every coordinator granted is void, so none of the
         // bookkeeping about them means anything either.
@@ -188,24 +263,50 @@ impl Materializer {
         self.imported.clear();
         self.restore.clear();
 
-        // Imported devices are kernel state too, and outlive us just as mounts do.
+        // What a previous incarnation did to this machine. Not the same
+        // question as what the machine currently has attached: an engineer's
+        // hand-run `usbip attach`, a second client daemon and a co-located host
+        // all present as a port in `VDEV_ST_USED` and none of them is ours to
+        // take away. Detaching the lot cost someone their debugging session
+        // every time `deploy.sh` restarted this daemon.
+        let previous = self.ledger.recover().await;
+
+        // Ownership first: detaching a port takes its node with it, and then
+        // there is nothing left to give back.
+        for node in &previous.nodes {
+            if let Err(err) = restore_node(node).await {
+                tracing::warn!(path = %node.path.display(), ?err, "could not unlock a device left over from a previous run");
+            }
+        }
         for port in sysfs::attached_ports().await {
+            if !previous.ports.contains(&port) {
+                tracing::info!(
+                    port,
+                    "leaving an imported device alone: this daemon did not attach it"
+                );
+                continue;
+            }
             tracing::warn!(
                 port,
                 "detaching a stale imported device from a previous run"
             );
             sysfs::vhci_detach(port).await;
         }
+        self.ledger.clear().await;
+
         let Ok(mut owners) = tokio::fs::read_dir(&self.root).await else {
             return;
         };
         while let Ok(Some(owner)) = owners.next_entry().await {
+            if owner.file_name() == LEDGER_DIR {
+                continue;
+            }
             let Ok(mut leases) = tokio::fs::read_dir(owner.path()).await else {
                 continue;
             };
             while let Ok(Some(lease)) = leases.next_entry().await {
                 tracing::warn!(path = %lease.path().display(), "clearing a stale lease directory");
-                unmount_tree(&lease.path()).await;
+                remove_tree(&lease.path()).await;
             }
         }
     }
@@ -238,11 +339,10 @@ impl Materializer {
         }
         let dir = self.lease_dir(owner, lease);
 
-        // Resolve everything before mounting anything: a half-materialised
+        // Resolve everything before creating anything: a half-materialised
         // lease is worse than a failed one, because the agent would find some
         // of its devices and reasonably assume it had them all.
         let mut plan: Vec<(PathBuf, PathBuf)> = Vec::new();
-        let mut ports: Vec<u32> = Vec::new();
         // USB/IP forwards whole devices, so resources that share a channel share
         // one import: a USB-SD-Mux arrives once and yields both the SCSI node
         // that switches the card and the block node that holds it. Importing per
@@ -251,16 +351,15 @@ impl Materializer {
         let mut imported: BTreeMap<&benchd_core::wire::ChannelKey, (u32, u32)> = BTreeMap::new();
         for (slot, resources) in slots {
             for (name, handle) in resources {
-                // This process is root and about to call mount(2) on a path
-                // built from these names. They arrive from the coordinator,
-                // which validates them — but a privileged daemon that trusts
-                // its input has no business being privileged, so check again.
+                // This process is root and about to create a device node at a
+                // path built from these names. They arrive from the
+                // coordinator, which validates them — but a privileged daemon
+                // that trusts its input has no business being privileged, so
+                // check again.
                 if !benchd_core::model::valid_component(slot)
                     || !benchd_core::model::valid_component(name)
                 {
-                    for port in &ports {
-                        sysfs::vhci_detach(*port).await;
-                    }
+                    self.roll_back(lease, owner).await;
                     return Outcome::Failed {
                         detail: format!(
                             "refusing to materialise {slot:?}/{name:?}: \
@@ -277,14 +376,18 @@ impl Materializer {
                     Some(&already) => already,
                     None => match self.import(lease.coordinator, channel, busid).await {
                         Ok(fresh) => {
-                            ports.push(fresh.0);
+                            // Remembered before anything else can fail. An
+                            // attach nothing knows about is a device left
+                            // reachable with no lease behind it, and the
+                            // startup sweep can only undo what it can
+                            // recognise as ours.
+                            self.imported.entry(lease).or_default().push(fresh.0);
+                            self.ledger.record_port(lease, fresh.0).await;
                             imported.insert(channel, fresh);
                             fresh
                         }
                         Err(detail) => {
-                            for port in &ports {
-                                sysfs::vhci_detach(*port).await;
-                            }
+                            self.roll_back(lease, owner).await;
                             return Outcome::Failed {
                                 detail: format!("{slot}/{name}: {detail}"),
                             };
@@ -306,9 +409,7 @@ impl Materializer {
                 {
                     Some(source) => plan.push((source, dir.join(slot).join(name))),
                     None => {
-                        for port in &ports {
-                            sysfs::vhci_detach(*port).await;
-                        }
+                        self.roll_back(lease, owner).await;
                         return Outcome::Failed {
                             detail: format!("{slot}/{name}: {}", missing_node(port, *node)),
                         };
@@ -318,45 +419,85 @@ impl Materializer {
         }
 
         for (source, dest) in &plan {
-            if let Err(detail) = bind_mount(&self.root, source, dest).await {
+            if let Err(detail) = self.take_over(lease, source, dest, uid).await {
                 // Roll back, so a failure never leaves a partial lease behind.
-                unmount_tree(&dir).await;
-                for port in &ports {
-                    sysfs::vhci_detach(*port).await;
-                }
+                self.roll_back(lease, owner).await;
                 return Outcome::Failed { detail };
             }
         }
 
-        // Hand the devices to the agent that asked for them. Without this the
-        // node keeps the source device's `root:uucp 0660` and the unprivileged
-        // agent cannot open the hardware it just leased — which fails the one
-        // promise the whole system makes.
-        if let Some(uid) = uid {
-            for (_, dest) in &plan {
-                match previous_owner(dest).await {
-                    Some(prev) => {
-                        self.restore
-                            .entry(lease)
-                            .or_default()
-                            .push((dest.clone(), prev));
-                        if let Err(err) = chown(dest, uid).await {
-                            tracing::warn!(path = %dest.display(), ?err, "could not hand the device to the agent");
-                        }
-                    }
-                    None => {
-                        tracing::warn!(path = %dest.display(), "could not read device ownership")
-                    }
-                }
+        self.active.insert(lease, dir.clone());
+        tracing::info!(%lease, %owner, path = %dir.display(), nodes = plan.len(), "materialized");
+        Outcome::Ok
+    }
+
+    /// Give one imported device to the agent that leased it.
+    ///
+    /// Two halves, and both are needed: a node under the lease directory that
+    /// only the agent's uid can open, and the imported node in `/dev` taken
+    /// away from everyone but root until the lease ends. The first without the
+    /// second would leave the board openable by anyone in the group udev gave
+    /// it, which is the whole population of `dialout` or `disk`.
+    async fn take_over(
+        &mut self,
+        lease: LeaseKey,
+        source: &Path,
+        dest: &Path,
+        uid: Option<u32>,
+    ) -> Result<(), String> {
+        let facts = node_facts(source)
+            .await
+            .ok_or_else(|| format!("{} is not a device node", source.display()))?;
+        make_node(&self.root, &facts, dest, uid).await?;
+
+        let borrowed = self.restore.entry(lease).or_default();
+        if needs_locking(borrowed, source) {
+            let borrowed = BorrowedNode {
+                path: source.to_path_buf(),
+                uid: facts.uid,
+                gid: facts.gid,
+                mode: facts.mode,
+            };
+            // Recorded before the change is made, not after: a crash in between
+            // must leave a record that restores the original, never one that
+            // has forgotten a node it locked.
+            self.restore
+                .entry(lease)
+                .or_default()
+                .push(borrowed.clone());
+            self.ledger.record_node(lease, &borrowed).await;
+            if let Err(err) = lock_source(source).await {
+                // Not fatal: the agent has its node either way, and the usual
+                // cause is the device having just been unplugged, which the
+                // next open reports far better than a failed lease would.
+                tracing::warn!(path = %source.display(), ?err, "could not take the imported device away from the rest of the machine");
             }
         }
+        Ok(())
+    }
 
-        self.active.insert(lease, dir.clone());
-        if !ports.is_empty() {
-            self.imported.insert(lease, ports);
+    /// Undo everything done for one lease, whether or not it ever completed.
+    async fn roll_back(&mut self, lease: LeaseKey, owner: &str) {
+        // Give the devices back first: after the detach below the nodes are
+        // gone and there is nothing left to give back to.
+        for node in self.restore.remove(&lease).unwrap_or_default() {
+            if let Err(err) = restore_node(&node).await {
+                tracing::warn!(path = %node.path.display(), ?err, "could not unlock a device");
+            }
         }
-        tracing::info!(%lease, %owner, path = %dir.display(), mounts = plan.len(), "materialized");
-        Outcome::Ok
+        // Fall back to the computed path so a restarted daemon can still clean
+        // up a lease it does not remember.
+        let dir = self
+            .active
+            .remove(&lease)
+            .unwrap_or_else(|| self.lease_dir(owner, lease));
+        remove_tree(&dir).await;
+        // Detach last: the node is what the agent holds, and the vhci port is
+        // what the kernel holds.
+        for port in self.imported.remove(&lease).unwrap_or_default() {
+            sysfs::vhci_detach(port).await;
+        }
+        self.ledger.forget(lease).await;
     }
 
     pub async fn unmaterialize(
@@ -373,25 +514,11 @@ impl Materializer {
 
     /// Teardown without fencing, for paths that already know the lease is dead
     /// (a failed setup, or clearing state at startup).
+    ///
+    /// Idempotent: the reaper races voluntary releases, and neither path may
+    /// fail.
     pub async fn unmaterialize_now(&mut self, lease: LeaseKey, owner: &str) -> Outcome {
-        // Give the device back before unmounting: afterwards the path is gone
-        // and the inode is unreachable from here.
-        for (path, (uid, gid)) in self.restore.remove(&lease).unwrap_or_default() {
-            let _ = chown_gid(&path, uid, gid).await;
-        }
-        // Idempotent: the reaper races voluntary releases, and neither path may
-        // fail. Fall back to the computed path so a restarted daemon can still
-        // clean up a lease it does not remember.
-        let dir = self
-            .active
-            .remove(&lease)
-            .unwrap_or_else(|| self.lease_dir(owner, lease));
-        unmount_tree(&dir).await;
-        // Detach after unmounting: the mount is what the agent holds, and the
-        // vhci port is what the kernel holds.
-        for port in self.imported.remove(&lease).unwrap_or_default() {
-            sysfs::vhci_detach(port).await;
-        }
+        self.roll_back(lease, owner).await;
         tracing::info!(%lease, %owner, "unmaterialized");
         Outcome::Ok
     }
@@ -425,54 +552,298 @@ fn missing_node(port: u32, want: WantedNode) -> String {
     format!("imported on vhci port {port} but {what} appeared: {hint}")
 }
 
-async fn bind_mount(root: &Path, source: &Path, dest: &Path) -> Result<(), String> {
-    // Belt and braces. Name validation should already make this impossible; if
-    // it ever does not, the failure is a root-privileged mount at an arbitrary
-    // location, so it is worth one comparison.
-    if !dest.starts_with(root) {
-        return Err(format!(
-            "refusing to mount outside {}: {}",
-            root.display(),
-            dest.display()
-        ));
-    }
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-    }
-    // The mount target must exist and be file-like; a device node is mounted
-    // over a plain file perfectly happily.
-    if tokio::fs::metadata(dest).await.is_err() {
-        tokio::fs::write(dest, b"")
-            .await
-            .map_err(|e| format!("touch {}: {e}", dest.display()))?;
+/// Whether a source node still has to be taken away from the machine.
+///
+/// One lease can reach the same node twice. The USB-SD-Mux is the reason the
+/// case exists at all — one physical device backing two resources — and there
+/// the two nodes differ, but nothing stops a bench naming the same one for two
+/// slots. Locking it twice would record `root:root 0600` as the state to
+/// restore, and release would then leave a board only root can open, which is a
+/// bench quietly lost.
+fn needs_locking(borrowed: &[BorrowedNode], source: &Path) -> bool {
+    !borrowed.iter().any(|node| node.path == source)
+}
+
+/// Create the agent's own device node for an imported device.
+async fn make_node(
+    root: &Path,
+    facts: &NodeFacts,
+    dest: &Path,
+    uid: Option<u32>,
+) -> Result<(), String> {
+    let dest = resolved_dest(root, dest).await?;
+    // A lease directory can outlive the daemon that made it, and `mknod`
+    // refuses a path that exists.
+    if let Err(err) = tokio::fs::remove_file(&dest).await {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("clearing {}: {err}", dest.display()));
+        }
     }
 
-    let status = tokio::process::Command::new("mount")
-        .arg("--bind")
-        .arg(source)
-        .arg(dest)
+    let (major, minor) = major_minor(facts.rdev);
+    let output = tokio::process::Command::new("mknod")
+        .arg("--mode=0600")
+        .arg(&dest)
+        .arg(facts.kind)
+        .arg(major.to_string())
+        .arg(minor.to_string())
         .output()
         .await
-        .map_err(|e| format!("failed to run mount: {e}"))?;
-
-    if !status.status.success() {
+        .map_err(|e| format!("failed to run mknod: {e}"))?;
+    if !output.status.success() {
         return Err(format!(
-            "mount --bind {} {}: {}",
-            source.display(),
+            "mknod {} {} {major} {minor}: {}",
             dest.display(),
-            String::from_utf8_lossy(&status.stderr).trim()
+            facts.kind,
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
+    }
+    // Pinned rather than trusted: `mknod`'s mode is a request, and the source
+    // node's own group and mode are deliberately *not* copied — that group is
+    // `dialout` or `disk`, and copying it would hand the board to everyone in
+    // it exactly as the bind mount used to.
+    set_mode(&dest, 0o600)
+        .await
+        .map_err(|e| format!("chmod {}: {e}", dest.display()))?;
+
+    // Without this the node is root's and the unprivileged agent cannot open
+    // the hardware it just leased — which fails the one promise the whole
+    // system makes.
+    match uid {
+        Some(uid) => chown(&dest, uid, 0)
+            .await
+            .map_err(|e| format!("giving {} to uid {uid}: {e}", dest.display()))?,
+        // Fails closed. The alternative — copying the source's group and mode
+        // so that group access happens to work — is the defect this is fixing.
+        None => tracing::warn!(
+            path = %dest.display(),
+            "no uid known for the session holding this lease: the node stays \
+             root-only and the agent will not be able to open it"
+        ),
     }
     Ok(())
 }
 
-/// Unmount everything under `dir`, then remove it.
+/// Where a resource's node really goes, with the whole path resolved.
+///
+/// `Path::starts_with` compares unresolved components, so a symlink planted at
+/// any component of the destination passes it while root creates a device node
+/// somewhere else entirely. Every component is therefore created here, refused
+/// if it is anything but a real directory, and the result checked again after
+/// resolution — cheap, and the only version of this check that means anything.
+async fn resolved_dest(root: &Path, dest: &Path) -> Result<PathBuf, String> {
+    let outside = || {
+        format!(
+            "refusing to create a device node outside {}: {}",
+            root.display(),
+            dest.display()
+        )
+    };
+    // Lexical first, so an obviously wrong path never reaches `mkdir`.
+    if !dest.starts_with(root) {
+        return Err(outside());
+    }
+    let (Some(parent), Some(name)) = (dest.parent(), dest.file_name()) else {
+        return Err(outside());
+    };
+    create_tree(root, parent).await?;
+
+    let real_root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|e| format!("resolving {}: {e}", root.display()))?;
+    let real_parent = tokio::fs::canonicalize(parent)
+        .await
+        .map_err(|e| format!("resolving {}: {e}", parent.display()))?;
+    if !real_parent.starts_with(&real_root) {
+        return Err(format!(
+            "refusing to create a device node outside {}: {} resolves to {}",
+            root.display(),
+            dest.display(),
+            real_parent.join(name).display()
+        ));
+    }
+    Ok(real_parent.join(name))
+}
+
+/// Create the lease and slot directories, one component at a time.
+///
+/// Component by component so that each can be given an explicit mode and
+/// checked for being a directory rather than a symlink to one; `create_dir_all`
+/// can do neither.
+async fn create_tree(root: &Path, dir: &Path) -> Result<(), String> {
+    let relative = dir
+        .strip_prefix(root)
+        .map_err(|_| format!("{} is not under {}", dir.display(), root.display()))?;
+    let mut at = root.to_path_buf();
+    for part in relative.components() {
+        let Component::Normal(part) = part else {
+            return Err(format!(
+                "refusing to create {}: {:?} is not a plain path component",
+                dir.display(),
+                part.as_os_str()
+            ));
+        };
+        at.push(part);
+        match tokio::fs::DirBuilder::new()
+            .mode(DIR_MODE)
+            .create(&at)
+            .await
+        {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(format!("mkdir {}: {err}", at.display())),
+        }
+        // A component that is not a directory is one somebody else put there —
+        // and a symlink is the interesting case, because root would follow it.
+        let meta = tokio::fs::symlink_metadata(&at)
+            .await
+            .map_err(|e| format!("stat {}: {e}", at.display()))?;
+        if !meta.is_dir() {
+            return Err(format!("{} is not a directory", at.display()));
+        }
+        // `mkdir`'s mode is masked by the umask and an existing directory keeps
+        // whatever mode it already had, so neither is enough on its own.
+        set_mode(&at, DIR_MODE)
+            .await
+            .map_err(|e| format!("chmod {}: {e}", at.display()))?;
+    }
+    Ok(())
+}
+
+/// Take a leased device node away from everyone but root.
+///
+/// The lease is exclusive over the bench, so for as long as it lasts nothing
+/// else on this machine has any business opening the imported node directly.
+/// The agent reaches it through the lease directory, and a second agent sharing
+/// the same uid does not reach it at all.
+async fn lock_source(source: &Path) -> std::io::Result<()> {
+    // Mode first: it closes group access while the node is still root's, so
+    // there is no instant at which it is both group-readable and owned by
+    // somebody new.
+    set_mode(source, 0o600).await?;
+    chown(source, 0, 0).await
+}
+
+/// Put a borrowed device node back the way it was found.
+///
+/// A node that is simply gone is the ordinary case rather than an error: a
+/// device unplugged while leased takes its node with it, and so does detaching
+/// the vhci port the import landed on.
+async fn restore_node(node: &BorrowedNode) -> std::io::Result<()> {
+    let result = async {
+        chown(&node.path, node.uid, node.gid).await?;
+        set_mode(&node.path, node.mode).await
+    }
+    .await;
+    match result {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(path = %node.path.display(), "the device is gone; nothing to give back");
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+async fn chown(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || std::os::unix::fs::chown(&path, Some(uid), Some(gid)))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+async fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    tokio::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode)).await
+}
+
+/// What a device node is and where it points, as the kernel has it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NodeFacts {
+    /// `c` or `b`, the letter `mknod` takes.
+    kind: &'static str,
+    rdev: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+async fn node_facts(path: &Path) -> Option<NodeFacts> {
+    use std::os::unix::fs::MetadataExt;
+    // Not `metadata`: a source that is a symlink is not a device node worth
+    // copying, and following one would copy whatever it happens to point at.
+    let meta = tokio::fs::symlink_metadata(path).await.ok()?;
+    Some(NodeFacts {
+        kind: node_kind(&meta)?,
+        rdev: meta.rdev(),
+        uid: meta.uid(),
+        gid: meta.gid(),
+        mode: meta.mode() & 0o7777,
+    })
+}
+
+/// The `mknod` type letter for a device node, and nothing for anything else.
+fn node_kind(meta: &std::fs::Metadata) -> Option<&'static str> {
+    use std::os::unix::fs::FileTypeExt;
+    let kind = meta.file_type();
+    if kind.is_char_device() {
+        Some("c")
+    } else if kind.is_block_device() {
+        Some("b")
+    } else {
+        None
+    }
+}
+
+/// Split a `dev_t` into the major/minor pair `mknod` takes.
+///
+/// Linux packs them unevenly and not contiguously — 12 bits of major, 20 of
+/// minor, in four pieces — so this is glibc's `major`/`minor` rather than a
+/// shift by eight. It matters on exactly the machines this daemon runs on: a
+/// block device with a minor above 255 would otherwise produce a node
+/// addressing a different driver, silently.
+fn major_minor(rdev: u64) -> (u32, u32) {
+    let major = ((rdev >> 8) as u32 & 0xfff) | ((rdev >> 32) as u32 & !0xfff);
+    let minor = (rdev as u32 & 0xff) | ((rdev >> 12) as u32 & !0xff);
+    (major, minor)
+}
+
+/// The mount options of the filesystem a path is on, from `mountinfo` text.
+///
+/// Longest mount point wins, and the last line wins among equals: a dedicated
+/// tmpfs at `/run/benchd` overrides the `/run` line above it, and an
+/// over-mounted point overrides the one it hides.
+fn mount_options_for<'a>(mountinfo: &'a str, path: &Path) -> Option<&'a str> {
+    let mut best: Option<(usize, &'a str)> = None;
+    for line in mountinfo.lines() {
+        // `id parent major:minor root mount-point options ...`
+        let mut fields = line.split(' ').skip(4);
+        let (Some(point), Some(options)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        // Mount points with whitespace are octal-escaped in mountinfo, which
+        // this does not decode: a lease root with a space in it would simply
+        // find no line and go unchecked.
+        let point = Path::new(point);
+        if !path.starts_with(point) {
+            continue;
+        }
+        let depth = point.components().count();
+        if best.is_none_or(|(deepest, _)| depth >= deepest) {
+            best = Some((depth, options));
+        }
+    }
+    best.map(|(_, options)| options)
+}
+
+/// Whether a filesystem will let anything open a device node created on it.
+fn honours_device_nodes(options: &str) -> bool {
+    !options.split(',').any(|option| option == "nodev")
+}
+
+/// Remove a lease directory and everything in it.
 ///
 /// Failures are logged, never propagated: the reaper must always be able to
 /// finish, and a stuck unmount must not wedge the daemon.
-async fn unmount_tree(dir: &Path) {
+async fn remove_tree(dir: &Path) {
     let Ok(mut slots) = tokio::fs::read_dir(dir).await else {
         return;
     };
@@ -481,6 +852,14 @@ async fn unmount_tree(dir: &Path) {
             continue;
         };
         while let Ok(Some(resource)) = resources.next_entry().await {
+            // A node this daemon created is an ordinary file on the same
+            // filesystem as its directory and is just unlinked below. This is
+            // for the other case: a lease directory left behind by a build that
+            // still bind-mounted the device inode, which `remove_dir_all` would
+            // fail on for as long as the mount existed.
+            if !mounted_over(&slot.path(), &resource.path()).await {
+                continue;
+            }
             // Lazy: an agent still holding the fd must not block teardown. Its
             // next read fails, which is exactly what "your lease ended" should
             // feel like.
@@ -494,6 +873,21 @@ async fn unmount_tree(dir: &Path) {
     if let Err(err) = tokio::fs::remove_dir_all(dir).await {
         tracing::debug!(path = %dir.display(), ?err, "could not remove lease directory");
     }
+}
+
+/// Whether something is mounted at `path` rather than being a file in `parent`.
+///
+/// A mount point is on a different filesystem than the directory it sits in,
+/// which is exactly what a bind mount of a `/dev` inode looks like from here.
+async fn mounted_over(parent: &Path, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(parent), Ok(path)) = (
+        tokio::fs::symlink_metadata(parent).await,
+        tokio::fs::symlink_metadata(path).await,
+    ) else {
+        return false;
+    };
+    parent.dev() != path.dev()
 }
 
 /// The path an agent should use for a materialised resource.
@@ -537,28 +931,225 @@ pub fn owner_dir(session: SessionId, name: &str) -> String {
     }
 }
 
-async fn chown(path: &Path, uid: u32) -> std::io::Result<()> {
-    let gid = previous_owner(path).await.map(|(_, g)| g).unwrap_or(0);
-    chown_gid(path, uid, gid).await
+/// Where the ledger lives, under the root.
+///
+/// The colon is deliberate and load-bearing: [`owner_dir`] filters it out, so
+/// no agent identity can ever name this directory and collide with it.
+const LEDGER_DIR: &str = "kernel:undo";
+
+/// What this daemon has done to the machine that outlives the process.
+///
+/// Two things need undoing after an unclean shutdown, and neither is visible
+/// from a fresh process: the vhci ports it attached, and the `/dev` nodes whose
+/// ownership it took away. The kernel remembers both but not who is
+/// responsible — the vhci status table says a port is in `VDEV_ST_USED` and
+/// nothing more, so an engineer's hand-run `usbip attach`, a second client
+/// daemon and a co-located host all look exactly like our own leftovers.
+///
+/// One file per lease, appended to as the lease is built up, so a crash halfway
+/// through leaves a record of what had already happened rather than nothing.
+///
+/// Lives under the root, which is a tmpfs in every real deployment — so the
+/// record has precisely the lifetime of the kernel state it describes, because
+/// a reboot clears both. On a root that is *not* a tmpfs it survives a reboot
+/// and describes ports that no longer exist, which costs one skipped detach
+/// each and nothing else.
+struct Ledger {
+    dir: PathBuf,
 }
 
-async fn chown_gid(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || std::os::unix::fs::chown(&path, Some(uid), Some(gid)))
-        .await
-        .map_err(std::io::Error::other)?
+/// Kernel state a previous incarnation of this daemon left behind.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Abandoned {
+    ports: Vec<u32>,
+    nodes: Vec<BorrowedNode>,
 }
 
-/// The uid/gid a device node currently has.
-async fn previous_owner(path: &Path) -> Option<(u32, u32)> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = tokio::fs::metadata(path).await.ok()?;
-    Some((meta.uid(), meta.gid()))
+impl Ledger {
+    fn new(root: &Path) -> Ledger {
+        Ledger {
+            dir: root.join(LEDGER_DIR),
+        }
+    }
+
+    /// Create the directory, root-only: it names every device this machine has
+    /// imported and where its node is, and no agent has any use for that.
+    async fn prepare(&self) -> std::io::Result<()> {
+        match tokio::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&self.dir)
+            .await
+        {
+            Err(err) if err.kind() != std::io::ErrorKind::AlreadyExists => return Err(err),
+            _ => {}
+        }
+        set_mode(&self.dir, 0o700).await
+    }
+
+    fn file(&self, lease: LeaseKey) -> PathBuf {
+        self.dir
+            .join(format!("{}-{}", lease.coordinator, lease.lease))
+    }
+
+    async fn record_port(&self, lease: LeaseKey, port: u32) {
+        self.append(lease, &format!("port {port}\n")).await;
+    }
+
+    async fn record_node(&self, lease: LeaseKey, node: &BorrowedNode) {
+        // The path goes last, so a path containing a space still parses.
+        self.append(
+            lease,
+            &format!(
+                "node {} {} {:o} {}\n",
+                node.uid,
+                node.gid,
+                node.mode,
+                node.path.display()
+            ),
+        )
+        .await;
+    }
+
+    async fn append(&self, lease: LeaseKey, line: &str) {
+        if let Err(err) = self.try_append(lease, line).await {
+            // Not fatal, but it does mean an unclean shutdown will leave this
+            // behind: worth saying out loud rather than at debug level.
+            tracing::warn!(%lease, ?err, "could not record what this lease has attached");
+        }
+    }
+
+    async fn try_append(&self, lease: LeaseKey, line: &str) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.prepare().await?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(self.file(lease))
+            .await?;
+        file.write_all(line.as_bytes()).await?;
+        // Flushed, not synced: the record only has to beat this process's own
+        // death, and `/run` is a tmpfs where a sync means nothing anyway.
+        file.flush().await
+    }
+
+    async fn forget(&self, lease: LeaseKey) {
+        if let Err(err) = tokio::fs::remove_file(self.file(lease)).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%lease, ?err, "could not drop a lease's record");
+            }
+        }
+    }
+
+    /// Everything a previous incarnation left attached or locked.
+    async fn recover(&self) -> Abandoned {
+        let mut found = Abandoned::default();
+        let Ok(mut entries) = tokio::fs::read_dir(&self.dir).await else {
+            return found;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(text) = tokio::fs::read_to_string(entry.path()).await else {
+                continue;
+            };
+            parse_records(&text, &mut found);
+        }
+        found
+    }
+
+    async fn clear(&self) {
+        let Ok(mut entries) = tokio::fs::read_dir(&self.dir).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
+/// Read one ledger file. Unparseable lines are skipped rather than fatal: a
+/// half-written last line is exactly what a crash leaves behind.
+fn parse_records(text: &str, into: &mut Abandoned) {
+    for line in text.lines() {
+        let mut fields = line.split(' ');
+        match fields.next() {
+            Some("port") => {
+                if let Some(port) = fields.next().and_then(|p| p.parse().ok()) {
+                    into.ports.push(port);
+                }
+            }
+            Some("node") => {
+                let (Some(uid), Some(gid), Some(mode)) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
+                    continue;
+                };
+                let rest: Vec<&str> = fields.collect();
+                let (Ok(uid), Ok(gid), Ok(mode)) =
+                    (uid.parse(), gid.parse(), u32::from_str_radix(mode, 8))
+                else {
+                    continue;
+                };
+                if rest.is_empty() {
+                    continue;
+                }
+                into.nodes.push(BorrowedNode {
+                    path: PathBuf::from(rest.join(" ")),
+                    uid,
+                    gid,
+                    mode,
+                });
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A directory to make a mess in, removed when the test ends.
+    ///
+    /// Hand-rolled because this crate has no dev-dependencies and adding
+    /// `tempfile` is a manifest change; it needs to do very little.
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new(what: &str) -> TempTree {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "benchd-{what}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            TempTree(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    fn lease(n: u64) -> LeaseKey {
+        LeaseKey::new(crate::ids::CoordinatorId(0), benchd_core::lease::LeaseId(n))
+    }
 
     #[test]
     fn an_owner_directory_cannot_escape_the_root() {
@@ -588,5 +1179,294 @@ mod tests {
     #[test]
     fn an_empty_name_still_yields_a_directory() {
         assert_eq!(owner_dir(SessionId(7), "!!!"), "s7");
+    }
+
+    #[test]
+    fn no_agent_identity_can_name_the_ledger_directory() {
+        // The ledger sits beside the owner directories, and the sweep skips it
+        // by name. An agent that could take that name would have its leases
+        // parsed as records and its directory cleared out from under it.
+        assert_ne!(owner_dir(SessionId(1), LEDGER_DIR), LEDGER_DIR);
+        assert!(!benchd_core::model::valid_component(LEDGER_DIR));
+    }
+
+    /// glibc's `makedev`, to build the values the kernel would report.
+    fn makedev(major: u64, minor: u64) -> u64 {
+        ((major & 0xfff) << 8) | (minor & 0xff) | ((major & !0xfff) << 32) | ((minor & !0xff) << 12)
+    }
+
+    #[test]
+    fn a_device_number_splits_the_way_the_kernel_packed_it() {
+        // The ones this actually sees: a CDC-ACM tty, a usb-serial bridge, the
+        // SD-mux's block and SCSI generic nodes.
+        assert_eq!(major_minor(makedev(166, 0)), (166, 0));
+        assert_eq!(major_minor(makedev(188, 3)), (188, 3));
+        assert_eq!(major_minor(makedev(8, 0)), (8, 0));
+        assert_eq!(major_minor(makedev(21, 0)), (21, 0));
+
+        // And the ones that catch a naive `>> 8`: a minor above 255 spills into
+        // a second field, and a node built from the wrong halves addresses a
+        // different driver rather than failing.
+        assert_eq!(major_minor(makedev(8, 300)), (8, 300));
+        assert_eq!(major_minor(makedev(259, 1)), (259, 1));
+        assert_eq!(major_minor(makedev(0xfff, 0xfffff)), (0xfff, 0xfffff));
+    }
+
+    #[test]
+    fn a_regular_file_is_not_a_device_and_is_not_copied() {
+        // The source always comes from `wait_for_vhci_node`, so this should be
+        // unreachable — but the thing being copied is a *device address*, and
+        // `mknod`ing one from something that is not a device would produce a
+        // node pointing at whatever driver happened to be at rdev 0.
+        let tree = TempTree::new("notadevice");
+        let file = tree.path().join("console");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(node_kind(&std::fs::symlink_metadata(&file).unwrap()), None);
+    }
+
+    #[tokio::test]
+    async fn the_lease_tree_gets_explicit_modes_rather_than_the_umask() {
+        // Nothing in the daemon sets a umask and the unit file does not either,
+        // so `create_dir_all` would take whatever the shell that started it
+        // had. Run it by hand with `umask 0` and the lease directories become
+        // world-writable, which is a symlink planted where root creates the
+        // next lease.
+        let tree = TempTree::new("dirmodes");
+        let root = tree.path();
+        let slot = root.join("pi-4f2a").join("c0-l7").join("dut");
+        create_tree(root, &slot).await.unwrap();
+
+        for dir in [
+            root.join("pi-4f2a"),
+            root.join("pi-4f2a").join("c0-l7"),
+            slot.clone(),
+        ] {
+            assert_eq!(mode_of(&dir), DIR_MODE, "{}", dir.display());
+        }
+
+        // A directory left too loose by an earlier run is tightened, not
+        // inherited: the mode is pinned every time, not only at creation.
+        std::fs::set_permissions(&slot, PermissionsExt::from_mode(0o777)).unwrap();
+        create_tree(root, &slot).await.unwrap();
+        assert_eq!(mode_of(&slot), DIR_MODE);
+    }
+
+    #[tokio::test]
+    async fn a_planted_symlink_cannot_move_a_device_node_out_of_the_root() {
+        // The containment check used to be `dest.starts_with(root)`, which is a
+        // comparison of unresolved components: a symlink at any component of
+        // the path passes it while root creates the node wherever it points.
+        let tree = TempTree::new("symlink");
+        let root = tree.path().join("run");
+        let elsewhere = tree.path().join("elsewhere");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("pi-4f2a")).unwrap();
+
+        let dest = root
+            .join("pi-4f2a")
+            .join("c0-l7")
+            .join("dut")
+            .join("console");
+        let err = resolved_dest(&root, &dest).await.expect_err("must refuse");
+        assert!(err.contains("pi-4f2a"), "{err}");
+        assert!(
+            !elsewhere.join("c0-l7").exists(),
+            "nothing may be created through the symlink"
+        );
+
+        // ...while an ordinary path resolves and is accepted.
+        let plain = root
+            .join("pi-9a1c")
+            .join("c0-l7")
+            .join("dut")
+            .join("console");
+        let resolved = resolved_dest(&root, &plain).await.unwrap();
+        assert!(resolved.starts_with(std::fs::canonicalize(&root).unwrap()));
+        assert_eq!(resolved.file_name().unwrap(), "console");
+    }
+
+    #[tokio::test]
+    async fn nothing_is_created_outside_the_root() {
+        let tree = TempTree::new("outside");
+        let root = tree.path().join("run");
+        std::fs::create_dir_all(&root).unwrap();
+        for hostile in ["/etc/cron.d/x", "../elsewhere/x"] {
+            let dest = PathBuf::from(hostile);
+            assert!(
+                resolved_dest(&root, &dest).await.is_err(),
+                "{hostile} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn one_device_behind_two_resources_is_only_taken_away_once() {
+        // The USB-SD-Mux arrives as one device and yields two nodes, and those
+        // two are locked separately. What must not happen twice is one *node*
+        // reached twice: the second record would capture the locked-down
+        // ownership as the state to put back, and release would leave a board
+        // nobody but root can open.
+        let sg = BorrowedNode {
+            path: PathBuf::from("/dev/sg0"),
+            uid: 0,
+            gid: 6,
+            mode: 0o660,
+        };
+        assert!(needs_locking(&[], Path::new("/dev/sg0")));
+        assert!(
+            needs_locking(std::slice::from_ref(&sg), Path::new("/dev/sda")),
+            "the block node is a different node and needs locking too"
+        );
+        assert!(!needs_locking(
+            std::slice::from_ref(&sg),
+            Path::new("/dev/sg0")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_device_that_vanished_while_leased_is_not_a_failed_release() {
+        // Unplug a board mid-lease and its node is gone; so is the node of an
+        // imported device once its vhci port is detached. Release must not
+        // report that as an error, or a reaper would log a failure on every
+        // ordinary teardown.
+        let tree = TempTree::new("vanished");
+        let gone = BorrowedNode {
+            path: tree.path().join("ttyACM0"),
+            uid: 0,
+            gid: 986,
+            mode: 0o660,
+        };
+        restore_node(&gone).await.expect("a missing node is fine");
+    }
+
+    #[tokio::test]
+    async fn a_released_node_gets_its_mode_back() {
+        // The ownership half needs root, so it is the mode that is checked
+        // here: a lease that put a node back as 0600 would leave a board that
+        // only root can open, which is a bench lost until someone notices.
+        let tree = TempTree::new("restore");
+        let node = tree.path().join("ttyACM0");
+        std::fs::write(&node, b"").unwrap();
+        std::fs::set_permissions(&node, PermissionsExt::from_mode(0o660)).unwrap();
+
+        let facts = node_facts(&node).await;
+        assert!(facts.is_none(), "a plain file is not a device node");
+
+        let meta = std::fs::symlink_metadata(&node).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let borrowed = BorrowedNode {
+            path: node.clone(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+            mode: 0o660,
+        };
+        set_mode(&node, 0o600).await.unwrap();
+        assert_eq!(mode_of(&node), 0o600);
+        restore_node(&borrowed).await.unwrap();
+        assert_eq!(mode_of(&node), 0o660);
+    }
+
+    #[tokio::test]
+    async fn the_sweep_only_knows_about_ports_this_daemon_attached() {
+        // The defect: `clear_stale` detached every port in VDEV_ST_USED,
+        // including a board an engineer had attached by hand for debugging and
+        // anything a second daemon or a co-located host had imported. Restarting
+        // the client daemon — which `deploy.sh` does — took them all away.
+        let tree = TempTree::new("ledger");
+        let ledger = Ledger::new(tree.path());
+        ledger.prepare().await.unwrap();
+        assert_eq!(mode_of(&tree.path().join(LEDGER_DIR)), 0o700);
+
+        ledger.record_port(lease(7), 3).await;
+        ledger.record_port(lease(7), 4).await;
+        ledger
+            .record_node(
+                lease(7),
+                &BorrowedNode {
+                    path: PathBuf::from("/dev/ttyACM0"),
+                    uid: 0,
+                    gid: 986,
+                    mode: 0o660,
+                },
+            )
+            .await;
+        ledger.record_port(lease(9), 5).await;
+
+        // Sorted because `read_dir` yields the leases in no particular order.
+        let mut found = ledger.recover().await;
+        found.ports.sort_unstable();
+        assert_eq!(found.ports, vec![3, 4, 5]);
+        assert_eq!(found.nodes.len(), 1);
+        assert_eq!(found.nodes[0].path, PathBuf::from("/dev/ttyACM0"));
+        assert_eq!(found.nodes[0].mode, 0o660);
+        // Port 6 is somebody else's and must survive the sweep.
+        assert!(!found.ports.contains(&6));
+
+        // A released lease stops being the sweep's business immediately.
+        ledger.forget(lease(7)).await;
+        assert_eq!(ledger.recover().await.ports, vec![5]);
+        ledger.forget(lease(7)).await;
+
+        ledger.clear().await;
+        assert_eq!(ledger.recover().await, Abandoned::default());
+    }
+
+    #[test]
+    fn a_half_written_record_does_not_lose_the_rest() {
+        // A crash mid-append is exactly the case the ledger exists for, so the
+        // last line is routinely truncated garbage.
+        let mut found = Abandoned::default();
+        parse_records(
+            "port 3\nnode 0 986 660 /dev/ttyACM0\nnonsense\nnode 0 986\npo",
+            &mut found,
+        );
+        assert_eq!(found.ports, vec![3]);
+        assert_eq!(found.nodes.len(), 1);
+        assert_eq!(found.nodes[0].gid, 986);
+    }
+
+    /// A real `/proc/self/mountinfo`, trimmed.
+    const MOUNTINFO: &str = "\
+24 31 0:22 / /proc rw,nosuid,nodev,noexec,relatime shared:5 - proc proc rw
+29 31 0:26 / /run rw,nosuid,nodev,relatime shared:12 - tmpfs run rw,mode=755
+31 1 0:31 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw
+33 24 0:24 / /dev rw,nosuid,relatime shared:2 - devtmpfs dev rw,mode=755";
+
+    #[test]
+    fn a_lease_root_that_cannot_carry_device_nodes_is_recognised() {
+        // /run is nosuid,nodev on every systemd machine, and a device node on a
+        // nodev mount can be created and then never opened. Without noticing,
+        // the daemon reports every lease as materialised and the agent gets
+        // EACCES from a node that looks perfectly correct.
+        let run = mount_options_for(MOUNTINFO, Path::new("/run/benchd/pi-4f2a")).unwrap();
+        assert!(!honours_device_nodes(run), "{run}");
+        // The fix is a tmpfs of its own, mounted `dev`, and the deepest mount
+        // point has to win for that to be visible here.
+        let with_own_mount = format!(
+            "{MOUNTINFO}\n99 29 0:44 / /run/benchd rw,nosuid,relatime shared:99 - tmpfs benchd rw,mode=755"
+        );
+        let benchd = mount_options_for(&with_own_mount, Path::new("/run/benchd/pi-4f2a")).unwrap();
+        assert!(honours_device_nodes(benchd), "{benchd}");
+
+        // A root somewhere else entirely is judged by its own filesystem, not
+        // by a mount point that merely shares a prefix as a string.
+        let home = mount_options_for(MOUNTINFO, Path::new("/runners/benchd")).unwrap();
+        assert!(honours_device_nodes(home), "{home}");
+        assert!(mount_options_for("", Path::new("/run/benchd")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_node_in_its_own_directory_is_not_mistaken_for_a_mount() {
+        // Teardown only shells out to `umount` for a leftover bind mount from
+        // an older build. Doing it for every node would be two processes per
+        // resource on every release, and would hide a real failure to unlink.
+        let tree = TempTree::new("mountcheck");
+        let slot = tree.path().join("dut");
+        std::fs::create_dir_all(&slot).unwrap();
+        let node = slot.join("console");
+        std::fs::write(&node, b"").unwrap();
+        assert!(!mounted_over(&slot, &node).await);
+        assert!(!mounted_over(&slot, &slot.join("missing")).await);
     }
 }
