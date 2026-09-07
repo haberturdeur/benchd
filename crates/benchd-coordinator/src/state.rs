@@ -11,6 +11,7 @@
 //! can never stall the reaper.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use benchd_core::lease::{Effect, Epoch, LeaseId, LeaseManager, SessionId};
 use benchd_core::model::{Bench, Inventory};
@@ -18,20 +19,28 @@ use benchd_core::wire::{
     BenchSpec, ChannelKey, RequestId, ResourceHandle, SessionToken, ToClient, ToHost, WantedNode,
 };
 use benchd_core::Limits;
+use tokio::sync::Notify;
 
 use crate::conn::Outbox;
 
-/// A connected host, and the bench it owns.
+/// A connected host, and the bench it registered.
 pub struct HostConn {
-    pub bench: String,
-    /// Which connection owns this entry.
+    /// The bench as accepted at registration.
     ///
-    /// Hosts are keyed by bench, so without this a lingering old connection's
-    /// heartbeats are credited to its replacement (hiding a wedged host from
-    /// the liveness reaper) and its eventual disconnect removes the replacement
-    /// instead of itself.
-    pub conn_id: u64,
+    /// Kept whole rather than by id so a bench withdrawn from one connection
+    /// can be handed straight back to another that is still registered for it,
+    /// without waiting for that host to say anything.
+    pub bench: Bench,
     pub out: Outbox,
+    /// Fires when the coordinator has stopped believing this connection serves
+    /// its bench and wants it closed.
+    ///
+    /// There is no "your bench has been withdrawn" message, and a host that
+    /// was merely slow has no other way back: its registration is gone, so the
+    /// heartbeats it is still sending land on nothing. Losing the connection
+    /// is a state it already recovers from, by releasing its exports and
+    /// registering again.
+    pub hangup: Arc<Notify>,
     /// When we last heard anything from this host. A TCP connection can stay
     /// open long after the peer stops functioning — a wedged process, a
     /// half-open connection after a machine sleeps — so silence, not a socket
@@ -45,21 +54,104 @@ pub struct ClientConn {
     pub last_seen: u64,
 }
 
+/// An outstanding instruction: which lease it belongs to, and who was told to
+/// carry it out.
+#[derive(Clone, Copy, Debug)]
+pub struct Pending {
+    pub lease: LeaseId,
+    pub replier: Replier,
+}
+
+/// The peer an instruction was sent to.
+///
+/// Connection ids come from one counter, so the number alone identifies the
+/// peer; the kind travels with it because a client answering for a host is a
+/// different mistake from a reply that arrived late, and the log should say
+/// which. It is also what a failure is attributed to when it is passed on to
+/// the holder — that used to be hardcoded per handler, so a host's failed
+/// export was reported to the agent as the client's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Replier {
+    Host(u64),
+    Client(u64),
+}
+
+impl Replier {
+    /// How to name this peer to the lease holder.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Replier::Host(_) => "host",
+            Replier::Client(_) => "client",
+        }
+    }
+}
+
+impl std::fmt::Display for Replier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Replier::Host(conn) => write!(f, "host on connection {conn}"),
+            Replier::Client(conn) => write!(f, "client on connection {conn}"),
+        }
+    }
+}
+
+/// A teardown its holder has not yet acknowledged.
+///
+/// "Unmaterialise before unexport" was only ever an ordering of *sends*. The
+/// lease leaves the lease table before either instruction goes out, so the
+/// bench leaves the busy set at the same moment and the very next claim can
+/// have the host export it while the previous holder is still unwinding its
+/// import — which the client serialises behind one global mutex held across a
+/// USB/IP operation, so the window is tens of seconds rather than microseconds.
+///
+/// Holding the bench out of the matcher until the holder answers is what makes
+/// the invariant real. The deadline is what stops the cure being worse than the
+/// disease: a bench waiting for a `Done` that will never come is a worse bug
+/// than the stale mount it prevents.
+struct Drain {
+    benches: Vec<String>,
+    deadline: u64,
+}
+
 pub struct State {
     pub leases: LeaseManager,
-    /// bench id -> the host that owns it
-    pub hosts: BTreeMap<String, HostConn>,
+    /// connection id -> the host on it
+    ///
+    /// Keyed by connection, not by bench. Two connections can be registered
+    /// for one bench: [`State::register_bench`] deliberately lets a restarted
+    /// host take its bench back while its half-open predecessor is still
+    /// there. Keyed by bench, the loser was forgotten — so when the winner
+    /// disconnected the bench went with it, and the host that was still
+    /// connected, still heartbeating and still holding the hardware never got
+    /// it back.
+    pub hosts: BTreeMap<u64, HostConn>,
+    /// bench id -> the connection currently exporting it
+    pub bench_host: BTreeMap<String, u64>,
     /// connection id -> client daemon
     pub clients: BTreeMap<u64, ClientConn>,
     /// public token -> internal id, so an agent never sees a guessable integer
     pub tokens: BTreeMap<SessionToken, SessionId>,
     /// internal id -> which client connection owns it
     pub session_conn: BTreeMap<SessionId, u64>,
-    /// Which lease each outstanding instruction belongs to, so an executor
-    /// reporting failure can be traced back to the lease that must be undone.
-    /// Without this a failed export produces a lease the agent believes is
-    /// good, and a failed materialisation parks a bench for its whole TTL.
-    pub pending: BTreeMap<RequestId, LeaseId>,
+    /// Instructions we are waiting to hear about, and who owes us the answer.
+    ///
+    /// The lease is here so an executor reporting failure can be traced back to
+    /// the lease that must be undone: without it a failed export produces a
+    /// lease the agent believes is good, and a failed materialisation parks a
+    /// bench for its whole TTL.
+    ///
+    /// The replier is here because request ids come from one counter shared
+    /// between host exports and client materialisations, and start at 1.
+    /// Without it any connection at all — one that has never opened a session
+    /// and holds no token — could say `{"msg":"done","request":1,...}` and have
+    /// the coordinator tear a lease down under its holder; a sweep of the first
+    /// twenty ids cleared the lab.
+    pub pending: BTreeMap<RequestId, Pending>,
+    /// Teardowns whose holder has not answered yet, keyed by the instruction
+    /// we are waiting on. See [`Drain`].
+    drains: BTreeMap<RequestId, Drain>,
+    /// How long a bench waits for its holder to acknowledge a teardown.
+    teardown_ack: u64,
     /// Rendezvous keys in flight, so the host's `Export` and the client's
     /// `Materialize` name the same channel. Generated once here because the
     /// keys are random (unguessable) rather than derived, and dropped when the
@@ -73,7 +165,11 @@ impl State {
     /// The vocabulary is central and known at startup; benches are not. They
     /// arrive by host registration (D9), so an unreachable host simply has no
     /// allocatable bench rather than a bench that fails at claim time.
-    pub fn new(limits: Limits, vocabulary: benchd_core::tags::Vocabulary) -> Self {
+    pub fn new(
+        limits: Limits,
+        vocabulary: benchd_core::tags::Vocabulary,
+        teardown_ack: u64,
+    ) -> Self {
         let inventory = Inventory {
             benches: Default::default(),
             vocabulary,
@@ -81,10 +177,13 @@ impl State {
         State {
             leases: LeaseManager::new(inventory, limits),
             hosts: BTreeMap::new(),
+            bench_host: BTreeMap::new(),
             clients: BTreeMap::new(),
             tokens: BTreeMap::new(),
             session_conn: BTreeMap::new(),
             pending: BTreeMap::new(),
+            drains: BTreeMap::new(),
+            teardown_ack,
             channels: BTreeMap::new(),
             next_request: 1,
             next_conn: 1,
@@ -92,23 +191,59 @@ impl State {
     }
 
     /// Note that a peer is alive.
-    pub fn touch_host(&mut self, bench: &str, conn_id: u64, now: u64) {
-        if let Some(host) = self.hosts.get_mut(bench) {
-            if host.conn_id == conn_id {
-                host.last_seen = now;
-            }
+    ///
+    /// Keyed by connection, so a heartbeat still counts while another
+    /// connection owns the bench — and, more importantly, so a host whose
+    /// bench was withdrawn is still visibly alive rather than silently
+    /// untouchable.
+    pub fn touch_host(&mut self, conn_id: u64, now: u64) {
+        if let Some(host) = self.hosts.get_mut(&conn_id) {
+            host.last_seen = now;
         }
     }
 
-    /// Remove a host entry only if this connection still owns it.
-    pub fn remove_host(&mut self, bench: &str, conn_id: u64) -> bool {
-        match self.hosts.get(bench) {
-            Some(host) if host.conn_id == conn_id => {
-                self.hosts.remove(bench);
-                true
-            }
-            _ => false,
-        }
+    /// Make this connection the host of a bench, displacing nothing.
+    ///
+    /// Callers deal with the incumbent first; this only installs the route.
+    pub fn register_host(
+        &mut self,
+        conn_id: u64,
+        mut bench: Bench,
+        out: Outbox,
+        hangup: Arc<Notify>,
+        now: u64,
+    ) {
+        // A bench arrives matchable, unless a teardown by its previous holder
+        // is still outstanding. That holder's mount does not go away because
+        // the host reconnected, so neither does the hold.
+        bench.enabled = !self.held_by_a_teardown(&bench.id);
+        self.bench_host.insert(bench.id.clone(), conn_id);
+        self.leases
+            .inventory_mut()
+            .benches
+            .insert(bench.id.clone(), bench.clone());
+        self.hosts.insert(
+            conn_id,
+            HostConn {
+                bench,
+                out,
+                hangup,
+                last_seen: now,
+            },
+        );
+    }
+
+    /// Another live connection registered for this bench, most recent first.
+    ///
+    /// This is what stops a bench leaving with whichever connection happened to
+    /// own it last: a host displaced by a re-registration is still connected,
+    /// still heartbeating, and still physically holding the hardware.
+    pub fn standby_host(&self, bench: &str) -> Option<u64> {
+        self.hosts
+            .iter()
+            .rev()
+            .find(|(_, host)| host.bench.id == bench)
+            .map(|(conn_id, _)| *conn_id)
     }
 
     pub fn touch_client(&mut self, conn_id: u64, now: u64) {
@@ -117,15 +252,95 @@ impl State {
         }
     }
 
-    /// Benches whose host has stopped answering.
+    /// Host connections that have stopped answering.
     ///
-    /// Returned rather than acted on, so the caller can drop the benches and
-    /// their leases with the usual effect ordering.
-    pub fn silent_hosts(&self, now: u64, timeout: u64) -> Vec<String> {
+    /// Returned rather than acted on, so the caller can withdraw them with the
+    /// usual effect ordering.
+    pub fn silent_hosts(&self, now: u64, timeout: u64) -> Vec<u64> {
         self.hosts
+            .iter()
+            .filter(|(_, host)| now.saturating_sub(host.last_seen) > timeout)
+            .map(|(conn_id, _)| *conn_id)
+            .collect()
+    }
+
+    /// Hold `benches` out of the matcher until `request` is answered.
+    ///
+    /// `enabled` is the flag the inventory already has for "in the inventory
+    /// but not matchable", and nothing else in the coordinator writes it: a
+    /// bench arrives by registration and arrives enabled.
+    fn hold(&mut self, request: RequestId, benches: Vec<String>, now: u64) {
+        for id in &benches {
+            if let Some(bench) = self.leases.inventory_mut().benches.get_mut(id) {
+                bench.enabled = false;
+            }
+        }
+        let deadline = now + self.teardown_ack;
+        self.drains.insert(request, Drain { benches, deadline });
+    }
+
+    /// The holder has answered: its benches can be allocated again.
+    ///
+    /// Idempotent, because the reaper races voluntary releases and neither path
+    /// may fail.
+    pub fn release_hold(&mut self, request: RequestId) {
+        if let Some(drain) = self.drains.remove(&request) {
+            self.reenable(&drain.benches);
+        }
+    }
+
+    /// Give up on holds nobody is going to answer.
+    ///
+    /// The bounded escape: a client that never replies — because it died, or
+    /// because its unmaterialisation failed outright — costs its bench this
+    /// wait and no more.
+    pub fn expire_holds(&mut self, now: u64) {
+        let overdue: Vec<RequestId> = self
+            .drains
+            .iter()
+            .filter(|(_, drain)| now >= drain.deadline)
+            .map(|(request, _)| *request)
+            .collect();
+        for request in overdue {
+            let drain = self.drains.remove(&request).expect("just listed");
+            tracing::warn!(
+                request = request.0, benches = ?drain.benches,
+                "no acknowledgement of a teardown; allowing the bench to be claimed anyway"
+            );
+            self.reenable(&drain.benches);
+        }
+    }
+
+    fn reenable(&mut self, benches: &[String]) {
+        for id in benches {
+            // Not while another teardown still holds it. A bench can be
+            // withdrawn and re-registered while a drain on it is outstanding,
+            // which leaves two overlapping.
+            if self.held_by_a_teardown(id) {
+                continue;
+            }
+            if let Some(bench) = self.leases.inventory_mut().benches.get_mut(id) {
+                bench.enabled = true;
+            }
+        }
+    }
+
+    fn held_by_a_teardown(&self, bench: &str) -> bool {
+        self.drains
             .values()
-            .filter(|h| now.saturating_sub(h.last_seen) > timeout)
-            .map(|h| h.bench.clone())
+            .any(|drain| drain.benches.iter().any(|id| id == bench))
+    }
+
+    /// Benches held out of the matcher by an unacknowledged teardown.
+    ///
+    /// The claim path needs these: to the matcher a held bench is
+    /// indistinguishable from one that does not exist, and that answer tells an
+    /// agent the capability will never appear when in fact it is seconds away.
+    pub fn draining_benches(&self) -> Vec<&Bench> {
+        self.drains
+            .values()
+            .flat_map(|drain| &drain.benches)
+            .filter_map(|id| self.leases.inventory().benches.get(id))
             .collect()
     }
 
@@ -165,11 +380,14 @@ impl State {
         // dropped along with its leases, since whoever holds them can no longer
         // be sure the hardware is theirs.
         //
-        // Two hosts genuinely configured for one bench will flap, which is
-        // loud, visible in the log, and a configuration error worth seeing.
-        if let Some(old) = self.hosts.get(&spec.id) {
+        // The displaced connection is kept as a standby rather than forgotten,
+        // so two hosts genuinely configured for one bench take turns. Without
+        // that they did not flap either, whatever this warning used to claim:
+        // the bench simply left with whichever of them disconnected first and
+        // never came back.
+        if let Some(&old) = self.bench_host.get(&spec.id) {
             tracing::warn!(
-                bench = %spec.id, old = old.conn_id,
+                bench = %spec.id, old,
                 "re-registering a bench that was already claimed by another connection"
             );
         }
@@ -225,6 +443,20 @@ impl State {
     /// unmaterialise before unexport, so a client never holds a device node the
     /// host believes is free.
     pub fn dispatch(&mut self, effects: Vec<Effect>) -> Vec<Outgoing> {
+        // Which benches each teardown in this batch covers.
+        //
+        // `Effect::Unmaterialize` names only the lease, and by the time
+        // teardown effects exist the lease has already left the lease table, so
+        // there is nothing left to ask. The `Unexport`s beside it name the
+        // benches, and teardown always emits the two together.
+        let mut torn_down: BTreeMap<LeaseId, Vec<String>> = BTreeMap::new();
+        for effect in &effects {
+            if let Effect::Unexport { bench, lease, .. } = effect {
+                torn_down.entry(*lease).or_default().push(bench.clone());
+            }
+        }
+
+        let now = crate::now();
         let mut out = Vec::new();
         for effect in effects {
             match effect {
@@ -234,7 +466,7 @@ impl State {
                     epoch,
                     session,
                 } => {
-                    let Some(host_out) = self.hosts.get(&bench).map(|h| h.out.clone()) else {
+                    let Some((conn_id, host_out)) = self.host_for(&bench) else {
                         tracing::warn!(%bench, "export for a bench whose host has gone");
                         continue;
                     };
@@ -269,7 +501,13 @@ impl State {
                         channels.insert(name, key);
                     }
                     let request = self.next_request();
-                    self.pending.insert(request, lease);
+                    self.pending.insert(
+                        request,
+                        Pending {
+                            lease,
+                            replier: Replier::Host(conn_id),
+                        },
+                    );
                     out.push(Outgoing::Host {
                         out: host_out,
                         msg: ToHost::Export {
@@ -288,7 +526,7 @@ impl State {
                 } => {
                     self.channels
                         .retain(|(l, b, _), _| !(*l == lease && *b == bench));
-                    let Some(host_out) = self.hosts.get(&bench).map(|h| h.out.clone()) else {
+                    let Some((_, host_out)) = self.host_for(&bench) else {
                         continue;
                     };
                     let request = self.next_request();
@@ -306,13 +544,19 @@ impl State {
                     session,
                     slots,
                 } => {
-                    let Some(conn) = self.client_for(session) else {
+                    let Some((conn_id, conn)) = self.client_for(session) else {
                         continue;
                     };
                     let epoch = self.lease_epoch(lease);
                     let handles = self.handles_for(&slots, lease);
                     let request = self.next_request();
-                    self.pending.insert(request, lease);
+                    self.pending.insert(
+                        request,
+                        Pending {
+                            lease,
+                            replier: Replier::Client(conn_id),
+                        },
+                    );
                     out.push(Outgoing::Client {
                         out: conn,
                         msg: ToClient::Materialize {
@@ -329,10 +573,30 @@ impl State {
                     session,
                     epoch,
                 } => {
-                    let Some(conn) = self.client_for(session) else {
+                    let Some((conn_id, conn)) = self.client_for(session) else {
+                        // Nobody to ask, so nothing to wait for. Holding the
+                        // bench for an acknowledgement that cannot arrive
+                        // would strand it for the whole deadline.
                         continue;
                     };
                     let request = self.next_request();
+                    self.pending.insert(
+                        request,
+                        Pending {
+                            lease,
+                            replier: Replier::Client(conn_id),
+                        },
+                    );
+                    // The benches this lease held do not go back into the
+                    // allocatable pool until the client says it has let go.
+                    // Sending this before the `Unexport` is not enough on its
+                    // own: the lease is already out of the lease table, so
+                    // without the hold the next claim can be granted the bench
+                    // and the host told to export it again while the previous
+                    // holder is still inside a USB/IP detach.
+                    if let Some(benches) = torn_down.remove(&lease) {
+                        self.hold(request, benches, now);
+                    }
                     out.push(Outgoing::Client {
                         out: conn,
                         msg: ToClient::Unmaterialize {
@@ -344,7 +608,7 @@ impl State {
                     });
                 }
                 Effect::Notify { session, event } => {
-                    let Some(conn) = self.client_for(session) else {
+                    let Some((_, conn)) = self.client_for(session) else {
                         continue;
                     };
                     // `Granted` is delivered by the claim handler, which knows
@@ -359,9 +623,17 @@ impl State {
         out
     }
 
-    fn client_for(&self, session: SessionId) -> Option<Outbox> {
-        let conn_id = self.session_conn.get(&session)?;
-        self.clients.get(conn_id).map(|c| c.out.clone())
+    fn client_for(&self, session: SessionId) -> Option<(u64, Outbox)> {
+        let conn_id = *self.session_conn.get(&session)?;
+        let client = self.clients.get(&conn_id)?;
+        Some((conn_id, client.out.clone()))
+    }
+
+    /// The connection currently exporting a bench.
+    fn host_for(&self, bench: &str) -> Option<(u64, Outbox)> {
+        let conn_id = *self.bench_host.get(bench)?;
+        let host = self.hosts.get(&conn_id)?;
+        Some((conn_id, host.out.clone()))
     }
 
     /// One epoch for a whole lease, for the client to fence on.

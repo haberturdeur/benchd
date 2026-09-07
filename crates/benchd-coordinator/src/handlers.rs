@@ -11,15 +11,16 @@ use anyhow::Result;
 use benchd_core::lease::{ClaimError, LeaseError, SessionId};
 use benchd_core::model::{ClaimRequest, Distinct, Requirement, NAME_KEY};
 use benchd_core::wire::{
-    BenchView, ChannelHello, ClaimSpec, ClientMsg, HostMsg, LeaseStatus, LeaseView, OperatorMsg,
-    Outcome, RequestId, TagInfo, ToClient, ToHost, ToOperator,
+    BenchSpec, BenchView, ChannelHello, ClaimSpec, ClientMsg, HostMsg, LeaseStatus, LeaseView,
+    OperatorMsg, Outcome, RequestId, TagInfo, ToClient, ToHost, ToOperator,
 };
 use futures::StreamExt;
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 use crate::conn::{spawn_writer, Outbox};
-use crate::state::{ClientConn, HostConn};
+use crate::state::{ClientConn, Replier, State};
 use crate::{now, Shared};
 
 pub async fn serve(shared: Arc<Shared>, socket: TcpStream, peer: SocketAddr) -> Result<()> {
@@ -94,56 +95,37 @@ async fn serve_host(
     mut lines: FramedRead<tokio::net::tcp::OwnedReadHalf, LinesCodec>,
     out: Outbox,
     peer: SocketAddr,
-    spec: benchd_core::wire::BenchSpec,
+    spec: BenchSpec,
 ) -> Result<()> {
     let bench_id = spec.id.clone();
     let conn_id = shared.state.lock().await.next_conn();
+    let hangup = Arc::new(Notify::new());
 
     {
         let mut state = shared.state.lock().await;
-        // Validate BEFORE evicting the incumbent. Dropping first meant a bad
-        // registration — a stale config on another machine, an unknown tag —
-        // deleted a healthy bench and killed its live leases, then failed, and
-        // the healthy host never re-registered because it was still connected.
-        match state.register_bench(&spec) {
-            Ok(bench) => {
-                // Only now is it safe to displace whatever was there.
-                let stale = drop_bench(&mut state, &bench_id);
-                for msg in stale {
-                    msg.send();
-                }
-                state
-                    .leases
-                    .inventory_mut()
-                    .benches
-                    .insert(bench_id.clone(), bench);
-                state.hosts.insert(
-                    bench_id.clone(),
-                    HostConn {
-                        bench: bench_id.clone(),
-                        conn_id,
-                        out: out.clone(),
-                        last_seen: now(),
-                    },
-                );
-                out.send(&ToHost::Registered);
-                tracing::info!(bench = %bench_id, %peer, "host registered");
-            }
-            Err(reason) => {
-                // A refused registration is terminal: retrying will not help,
-                // and a bench that matches nothing is worse than no bench.
-                tracing::warn!(bench = %bench_id, %reason, "registration refused");
-                out.send(&ToHost::Rejected { reason });
-                return Ok(());
-            }
+        // A refused *first* registration is terminal: retrying will not help,
+        // and a bench that matches nothing is worse than no bench.
+        let Some(outgoing) = register(&mut state, conn_id, &spec, &out, &hangup, peer) else {
+            return Ok(());
+        };
+        drop(state);
+        for msg in outgoing {
+            msg.send();
         }
     }
 
     let outcome: Result<()> = loop {
-        let line = match lines.next().await {
-            Some(Ok(line)) => line,
-            Some(Err(err)) => break Err(err.into()),
-            None => break Ok(()),
+        let line = tokio::select! {
+            // The coordinator has stopped believing this connection serves its
+            // bench. Hanging up is the only way to say so — the protocol has
+            // no message for it — and it is a state the host already recovers
+            // from, by releasing its exports and registering again.
+            _ = hangup.notified() => break Ok(()),
+            line = lines.next() => match line {
+                Some(Ok(line)) => line,
+                Some(Err(err)) => break Err(err.into()),
+                None => break Ok(()),
+            },
         };
         let msg: HostMsg = match serde_json::from_str(&line) {
             Ok(msg) => msg,
@@ -153,18 +135,35 @@ async fn serve_host(
             }
         };
         // Any message proves liveness, not just an explicit heartbeat.
-        shared
-            .state
-            .lock()
-            .await
-            .touch_host(&bench_id, conn_id, now());
+        shared.state.lock().await.touch_host(conn_id, now());
 
         match msg {
-            HostMsg::Heartbeat | HostMsg::Register { .. } => {}
+            HostMsg::Heartbeat => {}
+            HostMsg::Register { bench } => {
+                // Repeating the registration is how a host recovers a bench the
+                // liveness reaper withdrew. Discarding it meant a host that
+                // missed one window — a GC pause, a suspended laptop, a slow
+                // network — lost its bench for good while connected,
+                // heartbeating and still holding the hardware, because the
+                // entry those heartbeats would have touched was gone.
+                let outgoing = {
+                    let mut state = shared.state.lock().await;
+                    register(&mut state, conn_id, &bench, &out, &hangup, peer)
+                };
+                for msg in outgoing.unwrap_or_default() {
+                    msg.send();
+                }
+            }
             HostMsg::Done { request, result } => {
                 let outgoing = {
                     let mut state = shared.state.lock().await;
-                    fail_lease_if_needed(&mut state, request, result, "host", &bench_id)
+                    instruction_done(
+                        &mut state,
+                        request,
+                        result,
+                        Replier::Host(conn_id),
+                        &bench_id,
+                    )
                 };
                 for msg in outgoing {
                     msg.send();
@@ -185,17 +184,10 @@ async fn serve_host(
         }
     };
 
-    tracing::info!(bench = %bench_id, "host disconnected");
+    tracing::info!(bench = %bench_id, conn_id, "host disconnected");
     let outgoing = {
         let mut state = shared.state.lock().await;
-        // Only tear the bench down if this connection still owns it. A late
-        // disconnect from a replaced host must not remove its successor.
-        if state.remove_host(&bench_id, conn_id) {
-            drop_bench(&mut state, &bench_id)
-        } else {
-            tracing::info!(bench = %bench_id, "a replaced host connection closed; leaving the bench alone");
-            Vec::new()
-        }
+        withdraw_host(&mut state, conn_id)
     };
     for msg in outgoing {
         msg.send();
@@ -203,8 +195,114 @@ async fn serve_host(
     outcome
 }
 
+/// Accept or refuse a registration, and answer the host.
+///
+/// Runs for the first `register` on a connection and for every later one:
+/// repeating it is how a host gets back a bench the reaper took away. Returns
+/// the effects of displacing whatever held the bench, or `None` if the
+/// registration was refused.
+fn register(
+    state: &mut State,
+    conn_id: u64,
+    spec: &BenchSpec,
+    out: &Outbox,
+    hangup: &Arc<Notify>,
+    peer: SocketAddr,
+) -> Option<Vec<crate::state::Outgoing>> {
+    // One connection, one bench. A second id on the same connection would
+    // leave the first with a route to a connection that no longer claims it,
+    // and nothing would ever withdraw it.
+    if let Some(held) = state.hosts.get(&conn_id) {
+        if held.bench.id != spec.id {
+            let reason = format!(
+                "this connection is registered for bench {:?}; register {:?} on its own connection",
+                held.bench.id, spec.id
+            );
+            tracing::warn!(bench = %spec.id, %peer, %reason, "registration refused");
+            out.send(&ToHost::Rejected { reason });
+            return None;
+        }
+    }
+
+    // Validate BEFORE evicting the incumbent. Dropping first meant a bad
+    // registration — a stale config on another machine, an unknown tag —
+    // deleted a healthy bench and killed its live leases, then failed, and the
+    // healthy host never re-registered because it was still connected.
+    let bench = match state.register_bench(spec) {
+        Ok(bench) => bench,
+        Err(reason) => {
+            tracing::warn!(bench = %spec.id, %reason, "registration refused");
+            out.send(&ToHost::Rejected { reason });
+            return None;
+        }
+    };
+
+    // Only now is it safe to displace whatever was there — and only if that is
+    // somebody else. A host repeating itself, or registering again to recover a
+    // withdrawn bench, must keep the leases it is already serving.
+    let outgoing = if state
+        .bench_host
+        .get(&bench.id)
+        .is_some_and(|owner| *owner != conn_id)
+    {
+        drop_bench(state, &bench.id)
+    } else {
+        Vec::new()
+    };
+
+    state.register_host(conn_id, bench, out.clone(), Arc::clone(hangup), now());
+    out.send(&ToHost::Registered);
+    tracing::info!(bench = %spec.id, %peer, conn_id, "host registered");
+    Some(outgoing)
+}
+
+/// This connection stops serving its bench: it hung up, or it went silent.
+///
+/// The effects are dispatched *before* the route to the host is forgotten. The
+/// reaper used to forget first, so `Effect::Unexport` found no host and was
+/// silently skipped — harmless for a host that really is dead, but a host
+/// wrongly declared dead is alive on an open socket and was never told, and
+/// kept its device stub-bound and the handed-over socket pumping for a lease
+/// the coordinator had already forgotten. It is the same rule `CloseSession`
+/// follows on the client side.
+///
+/// A bench another live connection is still registered for goes to that
+/// connection instead of disappearing. `register_bench` deliberately lets a
+/// second host claim a bench id, which left the first still connected and
+/// still holding the hardware; taking the bench away with the second was how
+/// it became unclaimable for good.
+pub(crate) fn withdraw_host(state: &mut State, conn_id: u64) -> Vec<crate::state::Outgoing> {
+    let Some(bench_id) = state.hosts.get(&conn_id).map(|h| h.bench.id.clone()) else {
+        return Vec::new();
+    };
+    if state.bench_host.get(&bench_id) != Some(&conn_id) {
+        state.hosts.remove(&conn_id);
+        tracing::info!(bench = %bench_id, conn_id, "a replaced host connection closed; leaving the bench alone");
+        return Vec::new();
+    }
+
+    let outgoing = drop_bench(state, &bench_id);
+    state.hosts.remove(&conn_id);
+    state.bench_host.remove(&bench_id);
+
+    if let Some(standby) = state.standby_host(&bench_id) {
+        tracing::info!(
+            bench = %bench_id, conn_id = standby,
+            "handing the bench back to a host that is still registered for it"
+        );
+        let bench = state.hosts[&standby].bench.clone();
+        state.bench_host.insert(bench_id, standby);
+        state
+            .leases
+            .inventory_mut()
+            .benches
+            .insert(bench.id.clone(), bench);
+    }
+    outgoing
+}
+
 /// Remove a bench and release everything holding it.
-fn drop_bench(state: &mut crate::state::State, bench: &str) -> Vec<crate::state::Outgoing> {
+fn drop_bench(state: &mut State, bench: &str) -> Vec<crate::state::Outgoing> {
     state.leases.inventory_mut().benches.remove(bench);
     let doomed: Vec<_> = state
         .leases
@@ -424,7 +522,7 @@ async fn handle_client(
             Vec::new()
         }
         ClientMsg::Done { request, result } => {
-            fail_lease_if_needed(&mut state, request, result, "client", "")
+            instruction_done(&mut state, request, result, Replier::Client(conn_id), "")
         }
 
         ClientMsg::OpenSession { request, name } => {
@@ -506,15 +604,36 @@ async fn handle_client(
                     state.dispatch(granted.effects)
                 }
                 Err(err) => {
-                    let retryable = match &err {
+                    let mut retryable = match &err {
                         // Contended: wait. Unsatisfiable: never retry as-is.
                         ClaimError::NoMatch(no) => !no.unsatisfiable(),
                         ClaimError::Limit(_) => false,
                         ClaimError::UnknownSession => false,
                     };
+                    let mut error = err.to_string();
+                    // A bench held out of the matcher while its previous holder
+                    // tears down is indistinguishable, to the matcher, from a
+                    // bench that does not exist — and "unsatisfiable" tells the
+                    // agent never to ask again. It is seconds away, so say so.
+                    if matches!(err, ClaimError::NoMatch(_)) && !retryable {
+                        let held: Vec<&str> = state
+                            .draining_benches()
+                            .iter()
+                            .filter(|bench| req.slots.values().any(|want| want.matches(bench)))
+                            .map(|bench| bench.id.as_str())
+                            .collect();
+                        if !held.is_empty() {
+                            error.push_str(&format!(
+                                "\n  {} is still being released by its previous holder; \
+                                 retry in a moment",
+                                held.join(", ")
+                            ));
+                            retryable = true;
+                        }
+                    }
                     out.send(&ToClient::Error {
                         request,
-                        error: err.to_string(),
+                        error,
                         retryable,
                     });
                     Vec::new()
@@ -601,8 +720,25 @@ async fn handle_client(
         ClientMsg::TagList { request } => {
             let t = now();
             let busy = state.leases.busy(t);
+            let draining: Vec<String> = state
+                .draining_benches()
+                .iter()
+                .map(|bench| bench.id.clone())
+                .collect();
             let inventory = state.leases.inventory();
-            let counts = inventory.tag_counts();
+
+            // Counted over the whole inventory rather than the matchable subset
+            // of it, because a bench is briefly unmatchable while its previous
+            // holder tears down and a lab whose only esp32s3 bench vanishes
+            // from `tag_list` for the duration of a release is telling agents
+            // something false. Unmatchable benches are simply not free.
+            let mut counts: std::collections::BTreeMap<benchd_core::tags::Tag, usize> =
+                std::collections::BTreeMap::new();
+            for bench in inventory.benches.values() {
+                for tag in &bench.tags {
+                    *counts.entry(tag.clone()).or_insert(0) += 1;
+                }
+            }
 
             let mut tags: Vec<TagInfo> = Vec::new();
             for (tag, benches) in &counts {
@@ -610,9 +746,13 @@ async fn handle_client(
                     continue;
                 }
                 let free = inventory
-                    .enabled_benches()
-                    .iter()
-                    .filter(|b| b.tags.contains(tag) && !busy.contains_key(&b.id))
+                    .benches
+                    .values()
+                    .filter(|b| {
+                        b.tags.contains(tag)
+                            && !busy.contains_key(&b.id)
+                            && !draining.contains(&b.id)
+                    })
                     .count();
                 tags.push(TagInfo {
                     tag: tag.to_string(),
@@ -638,14 +778,40 @@ async fn handle_client(
 /// `Outcome::Stale` and the coordinator used to log them at debug and continue
 /// — so a claim whose hardware was never exported still looked granted, and a
 /// failed materialisation parked the bench for its full TTL.
-fn fail_lease_if_needed(
-    state: &mut crate::state::State,
+///
+/// Who is answering is checked rather than assumed. Request ids come from one
+/// counter shared between host exports and client materialisations and start at
+/// 1, so a connection that has never opened a session and holds no token could
+/// send `{"msg":"done","request":1,...}` and have a lease dropped under its
+/// holder — the holder told `failed` and `ended`, the host told to unexport —
+/// and a sweep of the first twenty ids cleared the lab. That is not the absent
+/// authentication this deployment accepts: the coordinator knows exactly which
+/// outbox it handed each request to, and only that peer may report on it.
+fn instruction_done(
+    state: &mut State,
     request: RequestId,
     result: Outcome,
-    who: &str,
+    from: Replier,
     bench: &str,
 ) -> Vec<crate::state::Outgoing> {
-    let lease = state.pending.remove(&request);
+    let pending = state.pending.get(&request).copied();
+    if let Some(pending) = pending {
+        if pending.replier != from {
+            tracing::error!(
+                %from, addressed_to = %pending.replier, request = request.0,
+                lease = %pending.lease,
+                "a peer reported on an instruction addressed to someone else; ignoring it"
+            );
+            return Vec::new();
+        }
+        state.pending.remove(&request);
+        // Whatever this instruction held out of the matcher can be allocated
+        // again: its holder has answered. On failure too — a bench waiting for
+        // an acknowledgement that has come back wrong waits for nothing.
+        state.release_hold(request);
+    }
+
+    let who = from.kind();
     let detail = match result {
         Outcome::Ok => return Vec::new(),
         Outcome::Stale { seen } => format!(
@@ -656,10 +822,15 @@ fn fail_lease_if_needed(
         Outcome::Failed { detail } => format!("{who} could not carry it out: {detail}"),
     };
 
-    let Some(lease) = lease else {
-        tracing::warn!(%who, %bench, %detail, "failure for an unknown instruction");
+    // An untracked request id does nothing but land in the log, so it is safe
+    // to reach here without having checked who is speaking. `Unexport` is
+    // deliberately not tracked — the lease it belongs to is already gone — so a
+    // host reporting one that failed arrives this way.
+    let Some(pending) = pending else {
+        tracing::warn!(%from, %bench, %detail, "failure for an unknown instruction");
         return Vec::new();
     };
+    let lease = pending.lease;
 
     tracing::error!(%who, %bench, %lease, %detail, "releasing a lease that could not be set up");
 
