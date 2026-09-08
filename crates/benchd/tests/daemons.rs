@@ -12,7 +12,7 @@
 //! Ignored by default so `cargo test` stays hermetic and fast, and **serial**:
 //!
 //! ```sh
-//! cargo test --test daemons -- --ignored --test-threads=1
+//! cargo test -p benchd --test daemons -- --ignored --test-threads=1
 //! ```
 //!
 //! `--test-threads=1` is not optional. Each test spawns its own coordinator
@@ -80,20 +80,13 @@ description = "ESP32-S3"
 "#;
 
 /// The one binary everything now ships as.
-fn binary() -> std::path::PathBuf {
-    // target/<profile>/deps/<test binary> -> target/<profile>/benchd
-    let mut dir = std::env::current_exe().expect("current_exe");
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    let path = dir.join("benchd");
-    assert!(
-        path.exists(),
-        "{} not built; run `cargo build` first",
-        path.display()
-    );
-    path
+///
+/// This test lives in the `benchd` crate purely so this variable exists: cargo
+/// only guarantees a freshly built binary to tests in the crate that declares
+/// it. Located from anywhere else, the tests silently exercise whatever stale
+/// binary is sitting in the target directory.
+fn binary() -> &'static str {
+    env!("CARGO_BIN_EXE_benchd")
 }
 
 impl Harness {
