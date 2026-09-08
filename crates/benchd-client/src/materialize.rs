@@ -471,6 +471,18 @@ impl Materializer {
                 // cause is the device having just been unplugged, which the
                 // next open reports far better than a failed lease would.
                 tracing::warn!(path = %source.display(), ?err, "could not take the imported device away from the rest of the machine");
+            } else {
+                // Named so that grepping the journal for the /dev path an agent
+                // was refused says who took it and where the usable node is.
+                // The refusal itself happens in the kernel, with nothing of ours
+                // on the stack to report it, so this line is the only account of
+                // it that exists.
+                tracing::info!(
+                    %lease,
+                    device = %source.display(),
+                    node = %dest.display(),
+                    "reserved an imported device for its lease; reachable only at the lease path"
+                );
             }
         }
         Ok(())
