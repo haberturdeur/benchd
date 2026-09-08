@@ -9,7 +9,7 @@ an `ENOENT`, not a silently corrupted test run on someone else's board.
 
 ```
 claim { dut: [soc=esp32s3, psram=octal] }  ttl=15m  reason="wifi reconnect regression"
-  → /run/benchd/agents/agent-3/lz7k2/dut/console   ($LAB_DUT_CONSOLE)
+  → /run/benchd/agent-3/c1-l7/dut/console   ($LAB_DUT_CONSOLE)
 ```
 
 ## Status
@@ -21,25 +21,26 @@ benches forwarded over USB/IP.
 |---|---|
 | Tags, vocabulary, implication closure | done, tested |
 | Inventory + TOML config | done, tested |
-| Matcher (superset match, best-fit, multi-slot, diagnosis) | done — 21 tests + property test |
+| Matcher (superset match, exact per tag, best-fit, multi-slot, diagnosis) | done — 42 tests incl. a property test |
 | Limits (single global set, no roles) | done, tested |
 | Lease lifecycle (claim/renew/release/revoke/expire) | done — 15 tests |
 | Wire protocol (JSON lines) | done, tested |
-| Coordinator daemon | done |
+| Coordinator daemon | done — 19 tests against a live daemon, hostile input included |
 | Host daemon (one per bench) | done |
-| Client daemon + bind-mount materialiser | done |
+| Client daemon + device-node materialiser | done |
 | MCP shim (5 tools) | done |
 | `benchd lease`, the hand-held CLI | done, tested |
-| One binary, six subcommands | done |
+| One binary, a subcommand per component | done |
 | Skill | done |
 | USB/IP remote benches | done — verified across a real network between two machines |
 | Multi-board benches | done, tested |
-| Coordinator (leases, reaper) | specified |
-| Wire messages (serde enums, JSON lines) | specified |
 
-**Read [`docs/design.md`](docs/design.md) first.** It is authoritative: when the code
-and the design doc disagree, the doc wins. It records 26 numbered decisions with the
-alternatives that were rejected and why.
+**Read [`docs/design.md`](docs/design.md) first.** It records 26 numbered decisions with
+the alternatives that were rejected and why, and five rounds of adversarial review with
+what each one found. It is where an argument is settled — but it is not automatically
+right: the most recent review was run *without* it, precisely so the reviewers could
+question the decisions rather than check the code against them, and two decisions changed
+as a result. When the code and the doc disagree, find out which one is wrong.
 
 ## Design in one paragraph
 
@@ -47,19 +48,22 @@ Three components. A **host** owns the hardware of exactly one **bench** (a fixed
 physical grouping — possibly several boards on one carrier — always claimed together).
 The **coordinator** is the single authority for inventory, matching, limits and lease
 state, and the only component that listens. The **client** is a privileged daemon on
-each agent machine that materialises device nodes into agent sandboxes, fronted by a
+each agent machine that materialises a private device node per lease, fronted by a
 thin per-agent MCP shim. Benches carry `key=value` capability tags from a closed
 vocabulary. What a board *is* expands through an implication graph (`soc=esp32s3`
 implies `family=esp32`, `arch=xtensa`, …); how it is *wired* (`console=`, `jtag=`) is
 declared per bench, because no chip identity can know which socket the cable is in.
 Values may name a specific part without the vocabulary enumerating parts:
 `peripheral=accel[mpu6050]` matches a request for either the category or the exact chip.
-A **claim** names one or more **slots**, satisfied
-atomically or not at all, possibly from benches on different hosts; among adequate
-benches the matcher picks the *least capable* one, scored by the scarcity it would
-waste. A granted claim is a **lease** with a mandatory explicit TTL, renewable only by
-explicit call, released the moment its session dies. Executors fence on a per-bench
-epoch, so a stale instruction can never hand out live hardware.
+A **claim** names one or more **slots**, satisfied atomically or not at all, possibly
+from benches on different hosts. A bench qualifies when its tags are a superset of what
+the slot asks for, each tag compared exactly — nothing knows that `8mb` is more than
+`4mb`. Among the benches that qualify the matcher picks the *least capable*, priced by
+the capability it would waste and counted over benches that are actually free, since the
+scarcity of a board nobody can have is not scarcity. A granted claim is a **lease** with
+a mandatory explicit TTL, renewable only by explicit call, released the moment its
+session dies. Executors fence on a per-bench epoch, so a stale instruction can never hand
+out live hardware.
 
 A client may hold links to **several coordinators at once** — the usual arrangement is a
 shared lab server plus one bound to `127.0.0.1` owning the boards on your own desk, which
@@ -82,10 +86,13 @@ crates/benchd-core/               pure: tags, model, matcher, limits, lease, wir
   tests/matcher.rs                behavioural spec + property test vs a brute-force oracle
   tests/lease.rs                  lease lifecycle spec
   tests/failure_paths.rs          what happens when things go wrong
+  tests/privileged_input.rs       what the privileged daemons must refuse
+crates/benchd/tests/daemons.rs    real daemons, real sockets, hostile messages
 crates/benchd-coordinator/        the only listener; matching, limits, lease state
   src/operator.rs                 benches / leases / release
 crates/benchd-host/               one process per bench; owns the hardware
 crates/benchd-client/             privileged: materialises device nodes
+  src/materialize.rs              mknod, ownership, and putting it all back
   src/lease.rs                    hold a bench by hand (unprivileged)
 crates/benchd-mcp/                per-agent stdio shim, five tools
 examples/coordinator.toml         limits + the central vocabulary
@@ -119,10 +126,13 @@ boards are tried first:
 benchd client --coordinator local=127.0.0.1:4711 --coordinator lab=lab.example:4711
 ```
 
-Run agents sandboxed, so a lease is enforced rather than advisory:
+No sandbox is required: a bench's boards are hidden on the host they are plugged into,
+so an agent that reaches for `/dev/ttyUSB0` finds nothing there whether or not it is
+confined. A sandbox buys one further thing — separating agents that share a uid on one
+machine — and `dist/benchd-sandbox` is a worked bubblewrap example if you want it:
 
 ```sh
-benchd-sandbox -- pi        # lab boards are absent from /dev until claimed
+benchd-sandbox -- pi        # this agent sees only its own leases
 ```
 
 Then point an agent at it:
@@ -151,11 +161,19 @@ that fails.
 ## Build
 
 ```sh
-cargo test           # 72 tests, incl. a property test over random inventories
-cargo clippy --all-targets
+cargo test           # 161 tests, incl. a property test over random inventories
+cargo clippy --all-targets --all-features -- -D warnings
+
+# 19 more that spawn real daemons and speak the wire protocol at them,
+# ignored by default so a plain `cargo test` stays hermetic and fast
+cargo test -p benchd --test daemons -- --ignored --test-threads=1
 ```
 
-Requires Rust 1.88+ (MSRV is pinned by `rmcp`, used once the MCP server lands).
+Those live in `crates/benchd` rather than beside the code they exercise, because cargo
+only guarantees a freshly built binary to tests in the crate that declares it. Anywhere
+else they quietly test whatever was last left in `target/`.
+
+Requires Rust 1.88+ (MSRV is pinned by `rmcp`, which the MCP shim uses).
 
 ## Reading order
 

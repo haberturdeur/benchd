@@ -80,10 +80,10 @@ If separating them would be *physically meaningless*, it's one bench.
             │ local socket           │  · reaper                     │
  ┌──────────▼───────────────┐  JSON  │                               │
  │ benchd client (machine)  │───────▶│                               │
- │  · sandbox materialiser  │  lines │                               │
+ │  · node materialiser     │  lines │                               │
  │  · runs as root          │  / TCP │                               │
  └──────────┬───────────────┘        └───────────────▲───────────────┘
-            │ bind mount                             │ JSON lines / TCP
+            │ mknod                                  │ JSON lines / TCP
             ▼                                        │
  /run/benchd/<owner>/<lease>/<slot>/<res>    ┌───────┴──────────┐
                                              │ HOST (one bench) │ ×N
@@ -128,18 +128,51 @@ decides a lock is "probably stale", corrupts someone else's run silently.
 
 ### D2. Real device nodes, at per-lease paths
 
-Bind-mount the real device inode to
-`/run/benchd/<owner>/<lease-id>/<slot>/<resource>`, exposed as `$LAB_DUT_CONSOLE`.
+`mknod` a private node carrying the imported device's type and major/minor at
+`/run/benchd/<owner>/<coordinator>-<lease-id>/<slot>/<resource>`, exposed as
+`$LAB_DUT_CONSOLE`.
 
 *Why real nodes:* Goal 2 rules out everything else. `rfc2217://` and `socket://` are
 pyserial-only — `idf.py monitor`, `minicom` and `openocd` refuse them. A pty bridge
 loses modem-control lines, breaking ESP32 auto-reset intermittently.
 
-*Why bind mounts specifically:* originally because a symlink would dangle inside a
-sandbox that had no `/dev`. Hiding at the host (D22) removed the sandbox and with it
-that constraint, so a symlink would serve today and would let the client daemon drop
-`CAP_SYS_ADMIN`. The bind mount remains for now; it behaves exactly like the device
-because it *is* the device.
+*Why a private node and not a bind mount.* This was a bind mount until the fifth-pass
+review, and the mount was a privilege leak. Bind-mounting a device file shares the
+source inode, so every permission change made to hand the device to its agent lands on
+`/dev/ttyACM0` machine-wide: the node takes the agent's uid — which two agents on one
+machine commonly share, and separating those is the only job the sandbox has left —
+while keeping the group and mode it already had, so `dialout` on a workstation could
+open whatever happened to be leased. A node created with the source's own major and
+minor addresses the same driver and behaves exactly as the device does, while existing
+only inside the lease directory.
+
+*And the node in `/dev` is taken away from everyone but root for the lease's duration,*
+then put back on release. Otherwise the lease directory is merely the *intended* path to
+a leased board rather than the only one. Locking it is safe precisely because it is not
+this machine's hardware: every node the materialiser touches belongs to a device that
+exists here only because this lease imported it over USB/IP.
+
+*The refusal that follows has no voice of its own, so the lock is logged instead.* When
+somebody opens the reserved node anyway they get `EACCES` from the kernel, with nothing
+of ours on the stack to explain it — there is no hook, and the obvious channel is closed
+in any case, since `kernel.dmesg_restrict` keeps an unprivileged agent out of `dmesg`.
+The daemon therefore names both paths when it takes the node, so that grepping the
+journal for the device an agent was refused answers the question: `journalctl -u
+benchd-clientd | grep ttyACM0` reports which lease reserved it and where the usable node
+is. The audience for that is the operator, not the agent; the agent is told by the skill
+never to go there.
+
+*What this costs:* the lease tree must be on a filesystem mounted **without** `nodev`,
+and `/run` is `nosuid,nodev` on any systemd machine. A node can be created on a `nodev`
+mount and then not opened, so the failure without this is every lease reporting success
+and every tool the agent runs failing `EACCES` on a node that looks perfectly correct in
+`ls -l`. The client's systemd unit therefore mounts a tmpfs with `dev` over the lease
+root, and the daemon reads `/proc/self/mountinfo` at startup and logs an error naming the
+fix if it finds the tree on a `nodev` filesystem regardless.
+
+*What it buys:* materialisation no longer needs `CAP_SYS_ADMIN`, only `CAP_MKNOD` and
+`CAP_CHOWN`. The symlink alternative this decision used to hold open is now closed for
+good: a symlink has no ownership of its own to hand anybody.
 
 *Why the lease id is in the path:* if `/dev/lab/dut` meant board A last lease and board
 B this lease, a stale shell writes to the wrong board — the original failure,
@@ -152,7 +185,7 @@ the identity problem tags exist to remove.
 
 *Why:* the piece we need most — a device node materialising in a client-side sandbox —
 fits labgrid's architecture worst. Its model is "resource stays on the exporter, client
-talks over the network through a Driver"; a root-side inode bind-mounter is none of
+talks over the network through a Driver"; a root-side materialiser of device nodes is none of
 Resource/Driver/Exporter. The parts we'd have to modify are its highest-coupling area
 (`remote/`, 6.5k LOC), to inherit 9.6k LOC of drivers we need none of.
 
@@ -244,7 +277,8 @@ hands the fd to the kernel:
                      echo "$port $fd $devid $speed" > .../vhci_hcd.0/attach
 7.  kernel           stub_rx/tx and vhci_rx/tx own the socket; both daemons leave the
                      data path entirely
-8.  client           bind-mount the resulting node into the agent's lease directory
+8.  client           mknod a private node for the imported device in the lease
+                     directory, and lock the imported one in /dev to root
 ```
 
 *What this deletes:* no `usbipd` process, no listening socket on the host, no wildcard
@@ -274,12 +308,18 @@ reachable. It would cut the coordinator out of the data path, but it is a second
 path for a topology we cannot rely on. Revisit if the relay measures badly.
 
 *Used locally too.* A co-located bench takes exactly this path, relay and all. Its
-devices are hidden like any other (D22), so there is no local inode to bind-mount
+devices are hidden like any other (D22), so there is no local node to hand over
 instead. The cost is the coordinator sitting in the data path for a board that is
 physically in the same machine; the benefit is one code path rather than two, and no
 inference about which machine anything is on. A direct host-to-client dial for the
 loopback case stays available as a later optimisation, and would be a transport variant
-of the same handle rather than a return to bind-mounting.
+of the same handle rather than a second materialisation path.
+
+*And it is what makes locking the `/dev` node safe (D2).* Because every leased device
+arrives over USB/IP even on one box, every node the client materialises from belongs to
+an imported device rather than to this machine's own hardware — so taking it away from
+non-root users for the duration removes nothing anybody else could legitimately have
+been using.
 
 ### D6. The coordinator is a SPOF; any restart releases leases
 
@@ -321,6 +361,22 @@ process behind it — a wedged host, a sleeping machine, a half-open connection.
 that has not been heard from for `host_timeout_seconds` has its bench withdrawn from
 matching and its leases ended, whether or not its socket is still open.
 
+*Which means connections are tracked per connection, not per bench, and a bench survives
+a reconnect.* A restarted host may take its bench back while the coordinator still holds
+its half-open predecessor, so briefly two connections claim one bench. Keyed by bench,
+the loser was simply forgotten — and then the *winner's* disconnect took the bench with
+it, leaving the host that was still connected, still heartbeating and still physically
+holding the hardware with no way to get it back. The displaced connection is kept as a
+standby instead, which also means two hosts genuinely configured for the same bench take
+turns rather than destroying it between them.
+
+*A returning host does not get its bench back as immediately matchable if a teardown is
+still outstanding against it.* The previous holder's device nodes do not disappear
+because the host reconnected, so the hold outlives the connection that created it, and
+the bench becomes matchable when the teardown is answered or when the hold expires.
+Nothing waits forever: a client that will never answer — because it died, or because its
+unmaterialisation failed outright — costs its bench that bounded wait and no more.
+
 *Accepted:* coordinator availability is lab availability. Run it on the box that's
 already always on.
 
@@ -350,8 +406,11 @@ They are two subcommands of one binary (D26) and two processes at two privilege
 levels, which is the part that matters.
 
 *Why the daemon is privileged:* the device node must appear on the agent's machine
-(Goal 2). Bind-mounting needs `CAP_SYS_ADMIN`; `usbip attach` needs root. The agent
-stays unprivileged, so something local holds privilege for it.
+(Goal 2). Creating one needs `CAP_MKNOD` and handing it over needs `CAP_CHOWN`; `usbip
+attach` needs root outright, and so does mounting the tree D2 requires. The agent stays
+unprivileged, so something local holds privilege for it. It runs as root today: the
+capability set above is what materialisation actually uses, not a confinement anyone has
+imposed on it.
 
 *Why the split is not optional:* **MCP over stdio is one process per client** — stdio
 is a pipe pair, so the harness spawns the server. A single daemon cannot serve stdio
@@ -451,6 +510,32 @@ is never broadcast: two coordinators satisfying it at once would hold hardware n
 asked for. Failures merge by D14's rule — retryable if *any* coordinator is merely
 contended, unsatisfiable only when they all agree.
 
+**Exactly one answer per request, and never a merged view that hides a gap.** The
+single-lab illusion is built in the client daemon, which is also where it can break, so
+the property is stated as an invariant: no request may be answered twice, none may go
+unanswered, and a request that only some coordinators answered is not an answer. The
+failure that motivates the third clause is the quiet one — a `tag_list` that lost a
+coordinator returning the benches it *could* reach, so an agent sees a lab that has
+silently shrunk and concludes the board it wants no longer exists. It now reports the
+failure instead.
+
+*Everything is completed by an event, so there is one deadline for the case where no
+event comes.* A fanout completes on its last reply, a claim on a grant or on running out
+of coordinators to offer it to; a coordinator that stays connected and simply never
+answers is not an event. After 20 seconds the daemon answers the request itself. That is
+comfortably inside the MCP shim's own 30-second timeout, so the agent is given a reason
+rather than a timeout, and it is the only deadline on the daemon's side — `benchd lease`
+has none at all and waits for its request id indefinitely. A coordinator that is
+connected but has not finished re-registering is waited for separately and briefly, since
+one that accepts a connection and never completes the handshake must not hold up every
+request on the machine.
+
+*A lost link cannot leave a request outstanding.* When a coordinator link drops, anything
+in flight to it — an outstanding claim, a renewal, a release — is resolved rather than
+abandoned, and the link is retired from the fanout tables before the daemon spends
+seconds tearing its leases down, not after. A claim that has not been satisfied moves on
+to the coordinators that remain instead of dying with the one that went away.
+
 **Ids are per-coordinator and must be namespaced.** Each coordinator is an independent
 authority numbering its own `LeaseId`, `SessionId` and epochs from 1, so `l1` is
 ambiguous the moment a second coordinator exists — and silently so, which is how the
@@ -481,6 +566,17 @@ rather than one this project mandates. `dist/benchd-sandbox` remains as a worked
 
 *Cost, accepted:* an unleased board is unusable on its own host without going through
 benchd, and `benchd host` now needs root even for a bench that never leaves the machine.
+
+**One owner for the stub binding, and it is hiding — not exporting.** A lease attaches a
+socket to a device that is *already* bound, and ending one takes that socket away again;
+the binding itself is made once when the host starts and undone once when it exits. So a
+device changes driver exactly twice in a host's life, and both times in the same file.
+This is stated as an invariant because violating it did not look like a bug: when
+exporting owned the binding too, ending a lease unbound the device outright, `cdc_acm`
+claimed it, a `/dev/ttyUSB0` reappeared on the host — and nothing in the system would
+ever hide it again. Every lease after the first silently gave back exactly the guarantee
+this decision exists to provide. The fifth-pass review found it; no test had ever ended a
+lease and then looked at the host.
 
 *Why release must be belt and braces:* a stub binding is kernel state that outlives the
 process which made it, so a host that dies without unbinding leaves boards invisible and
@@ -530,6 +626,17 @@ single-machine operation with no central file to keep in sync.
 closed and rots into `esp32-s3`/`esp32s3`/`s3` per machine — the exact failure D10
 prevents, with an extra dimension to rot along. *What exists* is local; *what things are
 called* is global.
+
+*What a host may declare is checked on registration, and one tag it may never declare is
+its own name.* `name` is an open key — bench ids cannot be enumerated centrally, so it is
+the one tag a declaration cannot be validated against — which means a declared
+`name=esp32s3-a` simply **is** `esp32s3-a` everywhere matching happens. Since anyone who
+can reach the coordinator may register a bench (§9), a host that declares someone else's
+name captures every claim aimed at that board. The real `name` is injected from the bench
+id by whoever knows what that id is, and a declared one is refused. Both places that
+build a bench from declared tags have to apply this — the inventory loader and the
+coordinator's host registration — and until the fifth-pass review the registration path
+did not.
 
 ### D10. Tag vocabulary is closed, `key=value`, with implications
 
@@ -666,8 +773,9 @@ one has no tty: the fallback is the ambiguity.
 *Why nodes are located by vhci port, never by name:* a forwarded device reproduces the
 `by-id` name of the board it came from, so diffing `/dev/serial/by-id` across an import
 can see nothing at all. Storage is worse — the machine running the client very likely
-has a `/dev/sda` of its own, and taking it would be a bind mount of the wrong disk into
-a lease directory.
+has a `/dev/sda` of its own, and taking it would put the wrong disk in a lease directory
+— and, since D2 locks whatever it materialises from, take the machine's own root disk
+away from everything else on it.
 
 *Why `kind = "usb"` is now an error:* it meant "the whole device" and had no way to say
 which node was wanted, so such a bench registered without complaint and then spent ten
@@ -690,10 +798,12 @@ the meaningless request we want to be unable to express.
 boards inside a bench differ in ways agents must select on, they should have been
 separate benches.
 
-### D12. Best fit, weighted by scarcity
+### D12. Best fit, priced by wasted capability
 
-Among adequate benches pick the least capable: cost is `Σ weight(key) / (benches with
-that tag)` over wasted tags.
+Among adequate benches pick the least capable: cost is `Σ weight(key) / (benches carrying
+that exact key=value)` over the tags a claim does not ask for. Matching itself is **exact
+per tag** — there is no ordering between values, and nothing in the matcher knows that
+`8mb` is more than `4mb`.
 
 *Why:* first-fit hands the only JTAG bench to an agent that asked for a blinking LED.
 
@@ -701,6 +811,24 @@ that tag)` over wasted tags.
 only CP2102N board made `console=uart` unique, so the matcher protected the lab's cheapest
 board and handed out the PSRAM one. Identity keys (`soc`, `arch`, `console`) get weight 0;
 contended peripherals keep 1.
+
+*The weight is the only knob, and the vocabulary has to hold up both ends of it.* Because
+matching is exact and the denominator counts benches carrying that exact `key=value`, a
+key whose values are *ordinal* prices the rarity of a value rather than any capability:
+`flash=4mb` on one board costs twice `flash=8mb` on two, which is "least capable wins"
+running backwards. So `flash` is weight 0 along with the identity keys, and any key like
+it belongs there too. Only keys naming a capability a claim can waste — `peripheral`,
+`jtag`, `psram`, `sdmux` — keep weight 1.
+
+*And a value naming the absence of something must not exist.* `psram=none` or `jtag=none`
+is charged exactly like a real capability, so a board that has nothing is priced as
+though it had something rare. A board without the hardware omits the key entirely. This
+is a vocabulary rule the matcher cannot enforce, so the shipped vocabularies say it where
+the temptation is; `psram=none` was in them until the fifth-pass review.
+
+*Why the denominator counts only benches that could actually serve.* It is over benches
+enabled and not busy, not over the whole inventory. Pricing against benches nobody can
+have makes a capability look plentiful precisely when it is scarcest.
 
 ### D13. Atomic multi-slot claims, solved exactly
 
@@ -851,6 +979,16 @@ of different vintages is no longer something that can happen by accident on one 
 kilobytes of clap tables. Against having to reason about which of six things on a given
 box is current, that is not a real price.
 
+*It does not, on its own, cure the disease.* One binary removes the possibility of six
+*versions*, not the possibility of the *wrong* version, and both places that produce or
+consume the artefact had to be fixed separately afterwards. The install scripts assumed
+`./target` and so installed and checksum-verified a file the build had never written
+whenever `CARGO_TARGET_DIR` was set — agreeing with themselves perfectly. The integration
+tests spawned `target/<profile>/benchd` by path from a crate that does not declare it, so
+cargo never rebuilt it and the tests silently graded whatever was lying there. Both now
+ask cargo where the binary is: the scripts through `cargo metadata`, the tests by living
+in `crates/benchd` and using `CARGO_BIN_EXE_benchd`.
+
 *What it does not cost:* the agent boundary (D17). It is tempting to read "the operator
 commands are in the same executable an agent runs" as a weakening, but the executable
 was never the control. An agent could always have run the operator CLI; what stops it
@@ -908,9 +1046,22 @@ lease.
 
 **Client** — `benchd client`, one privileged daemon per agent machine, holding the
 coordinator connection. Materialises and revokes; renews only on explicit agent call;
-removes every materialisation under its root at startup. `benchd mcp` is the thin
-unprivileged stdio shim spawned per agent (D8), which registers a session and forwards
-calls over a local socket.
+its unit mounts a `dev`-permitting tmpfs over the lease tree, since `/run` is `nodev`
+everywhere and D2 needs real nodes. `benchd mcp` is
+the thin unprivileged stdio shim spawned per agent (D8), which registers a session and
+forwards calls over a local socket.
+
+> **Startup cleanup follows a written record, not a sweep.** Removing "every
+> materialisation under the root" is right for the directory tree but wrong for
+> the vhci ports behind it: the port numbers are machine-global, so detaching
+> every busy one takes down whatever a second daemon, or a person with `usbip`,
+> is doing. The daemon records what it attached and detaches only that.
+>
+> **Work on one lease is serialised.** Materialisation and teardown for a lease
+> are ordered against each other, so a teardown cannot overtake the
+> materialisation it is meant to undo and leave a node behind. Different leases
+> still proceed in parallel; the ordering is per lease, not global, because a
+> USB/IP handshake that stalls must not wedge every other lease on the machine.
 
 > **No sandbox is required.** Bench devices are hidden at the host (D22), so there
 > is nothing on the agent's machine for a sandbox to conceal: an agent that ignores
@@ -918,17 +1069,29 @@ calls over a local socket.
 > the board it names has no tty until a lease imports one.
 >
 > `dist/benchd-sandbox` remains as a worked example for operators who want to
-> separate agents that share a uid, which is the one thing hiding does not do. It
-> uses bubblewrap: `--dev /dev` gives a fresh minimal `/dev`, and the agent's
-> `/run/benchd/<identity>` is bind-mounted so that leases appear and disappear
-> inside a running sandbox with no restart and no cooperation from the agent.
-> Nothing in benchd assumes it ran.
+> separate agents that share a uid, which is the one thing hiding does not do —
+> and which matters more since D2, because a lease's device node now lives *in*
+> the lease directory rather than being a mount of something in `/dev`. It uses
+> bubblewrap: `--dev /dev` gives a fresh minimal `/dev`, a `--tmpfs` over the
+> lease root hides every other agent's directory, and only the caller's own is
+> bound back in, so leases appear and disappear inside a running sandbox with no
+> restart and no cooperation from the agent. Nothing in benchd assumes it ran.
+>
+> It must be `--dev-bind` for that directory rather than `--bind`, because
+> bubblewrap adds `MS_NODEV` to a plain bind and a created node is then
+> unopenable — the same `nodev` trap as D2, one layer out. A bind mount would
+> have survived either way, which is part of why the change was worth making
+> deliberately rather than discovering later.
 >
 > The owner directory is named from the agent's declared identity alone, never a
-> session id: a sandbox has to bind-mount it at launch, which is before the
-> coordinator has issued a session. `/run/benchd` is mode 1777 like `/tmp` so an
-> unprivileged sandbox can create its own; the device nodes inside are 0660 owned
-> by the agent's uid, so a listable directory grants nothing.
+> session id: a sandbox has to bind it at launch, which is before the coordinator
+> has issued a session. It is created **by the daemon**, on request, root-owned
+> and not agent-writable — an agent that can write its own lease directory can
+> plant a symlink where root will create the next one, which is exactly how the
+> fourth pass's second escalation worked. The nodes inside are `0600` owned by
+> the agent's uid, and the source node's own group and mode are deliberately not
+> copied: that group is `dialout` or `disk`, and copying it would hand the board
+> to everyone in it precisely as the bind mount used to.
 
 **Matcher** *(implemented)* — `allocate(request, benches, busy, counts, weights)`.
 Invariants pinned by property test: succeeds ⟺ a valid assignment exists; returned cost
@@ -966,6 +1129,7 @@ A contract; the skill must state it.
 | All busy | `Contended` + holders + ETA | wait, retry |
 | Over TTL limit | clamped, with a message | proceed with the shorter lease |
 | Lease expired mid-use | `ENOENT` / `EIO` on the device | **your lease ended** — reclaim; do *not* power-cycle |
+| Opening `/dev/ttyACM*` for a board you hold | `EACCES` | use the lease path; the `/dev` node is reserved on purpose (D2) |
 | Operator forced a release | lease `revoking`, then gone | stop, park the board, re-claim later |
 | A component restarted | lease gone, `lease_released` on next call | re-claim; work since last checkpoint is lost |
 | Bench hardware failed | lease released, bench leaves `tag_list` | re-claim; the matcher routes around it |
@@ -1002,7 +1166,19 @@ If this ever needs a real boundary, the seams are deliberate and in this order:
 
 Hosts and clients run as root but only execute epoch-qualified instructions from the
 coordinator, never agent-supplied strings, and build paths only from validated
-identifiers. That is defence against *bugs*, which remains worthwhile regardless.
+identifiers. Containment checks resolve the path before comparing it rather than
+comparing the string, because the agent owns its own lease directory and a lexical check
+follows a planted symlink. That is defence against *bugs*, which remains worthwhile
+regardless, and it is where every escalation found so far has actually lived.
+
+**Two of the trust assumptions above are narrower than "no malice" suggests, and are
+enforced anyway.** A host may not declare its own `name` (D9), because that tag is
+unvalidatable by construction and forging it redirects other people's claims — the one
+place where the no-malicious-hosts assumption would have cost something a single check
+prevents. And a lease's device node is private to the lease and the `/dev` node it came
+from is locked to root for the duration (D2), so a second agent sharing a uid on the same
+machine does not reach a board it was not granted. Neither makes benchd safe on a hostile
+network; both remove a footgun that a *non*-malicious mistake would otherwise fire.
 
 **We do not run `usbipd`, and that is partly a security decision.** It cannot be
 confined to an interface (verified in `usbipd.c`: `do_getaddrinfo(NULL, family)` with
@@ -1023,7 +1199,6 @@ None blocking.
 | Q10 | Relay latency for JTAG/high-rate transports | **Out of scope.** Serial only for now (~11 KB/s), where the extra RTT is noise. Revisit if a JTAG bench ever exists. |
 | Q12 | Is our USB/IP handshake byte-correct? | **Yes.** Verified against stock `usbipd`/`usbip` and by a live loopback import: DTR/RTS auto-reset works through the relay and the ESP32 ROM banner comes back. |
 | Q11 | Can `usbipd` bind loopback-only? | **Moot — we don't run it.** It binds wildcard with no auth, so instead both ends dial out and hand the kernel the resulting fd (D5). No listening socket to confine. |
-| Q12 | Are the `OP_REQ_IMPORT`/`OP_REP_IMPORT` structs implemented byte-correctly? | open — differential-test against stock `usbip`/`usbipd` in both directions |
 
 **Deferred ideas.** *Idle release* — TTL catches crashes, not an agent that claims a
 board then reads source for 12 minutes; detect via no open fd for N minutes. *Sticky
@@ -1040,17 +1215,24 @@ revisit-with-evidence, not now.
 |---|---|
 | Tags, vocabulary, implications | done, tested |
 | Bench/resource model, TOML config | done, tested (schema splits per D9) |
-| Matcher | done — 21 tests + property test |
+| Matcher | done — 42 tests including a property test |
 | Multi-resource benches | done, tested |
 | Limits (one global set) | done, tested |
 | Lease lifecycle + reaper logic | done — 15 tests |
 | Workspace split | done (`crates/benchd-core`) |
 | Wire messages + JSON line protocol | done, tested |
-| Coordinator daemon | working end-to-end |
-| Host / client daemons | specified |
+| Coordinator daemon | done — hostile-input tests against a live daemon |
+| Host / client daemons | done, deployed, verified across two machines |
 | USB/IP handshake + sysfs fd handoff | done, verified on hardware |
 | One binary, a subcommand per component | done (D26) |
-| Skill | not started |
+| Skill | done — `skill/benchd/SKILL.md` |
+
+161 tests run on every `cargo test`, plus 19 that spawn real daemons and are `#[ignore]`d
+so a plain run stays hermetic. Those 19 live in the `benchd` crate rather than beside the
+code they exercise, which is not tidiness: cargo only guarantees a freshly built binary
+to tests in the crate that declares it, and anywhere else they silently test whatever was
+in the target directory. That was not hypothetical either — it is how the fifth pass's
+fixes came to be reported as failures hours after they were merged.
 
 No persistence layer appears here, and that is the point of D6. No schema language
 either, and that is the point of D5.
@@ -1187,6 +1369,48 @@ where no test ran.
 **The cause was uniform: every test exercised the happy path.** None asked what
 happens when a step fails. `tests/failure_paths.rs` exists to keep that from
 recurring, and immediately found the `tick` bug.
+
+### Fifth pass: six reviewers, and no design document
+
+Six reviewers, one per area, **deliberately not given this document**. The previous four
+passes all reviewed the code against the design, which can only find places where the
+code fails to match — never a place where the design is itself wrong. Three of the
+findings below are of exactly that kind, and D12 and D22 are now different decisions
+because of it.
+
+| Severity | Bug | Root cause |
+|---|---|---|
+| Critical | Ending a lease unbound the device outright, so `cdc_acm` reclaimed it and a `/dev/ttyUSB0` reappeared on the host — permanently. Every lease after a bench's first silently voided D22 | Exporting owned the stub binding as well as the socket, so releasing a lease undid the hiding |
+| Critical | The lease's bind mount shared the source inode, so chowning it to the agent landed on `/dev/ttyACM0` machine-wide, at the agent's uid and its original group | A bind mount of a device file is the same inode; only the path differs |
+| Critical | A host could declare `name=<someone else's bench>` and capture every claim aimed at that board | `name` is an open key and unvalidatable by construction; registration never applied the one rule that covers it |
+| Blocker | A client could answer an instruction addressed to a host, and a failed export was reported to the agent as the client's | Pending requests were keyed by request id alone, with the replier's role hardcoded per handler |
+| Blocker | A host reconnecting destroyed its own bench: the coordinator forgot the displaced connection, then dropped the bench when the survivor disconnected | `HostConn` keyed by bench, so two connections for one bench could not both exist |
+| Blocker | A fanout could answer an agent twice, never, or hand back a partial view as if it were the whole lab | No invariant tied a fanout's completion to the number of coordinators it was sent to |
+| High | The matcher priced the rarity of a tag *value*, so `flash=4mb` on one board cost twice `flash=8mb` on two — "least capable wins", backwards | The denominator counts exact `key=value`, which is meaningless for an ordinal key; `flash` was weight 1 |
+| High | `psram=none` was charged exactly like a real capability, so a board with nothing was priced as though it had something rare | The shipped vocabulary contained absence values, which the matcher cannot detect |
+| High | Scarcity was computed over every bench rather than the allocatable ones, pricing the last free JTAG board at half its worth | `tag_counts` ignored `busy` |
+| Medium | `install.sh` and `deploy.sh` installed and checksum-verified a binary the build had never written | Both assumed `./target`; `CARGO_TARGET_DIR` in the environment sends the artefact elsewhere, and the scripts then agreed with themselves about the wrong file |
+
+**Not reading the design document was the point.** Every earlier pass had asked "does the
+code do what the doc says?", and the answer to that question cannot expose a wrong
+decision. D12's weighting rule had been *validated* against the real inventory in an
+earlier pass (Appendix C) and was still wrong, because the earlier check only asked
+whether rare-versus-valuable had been fixed for the keys it had in mind. A reviewer given
+the tag list and no rationale asked what the denominator meant for a key whose values are
+ordinal, and there was no good answer.
+
+**The two critical device bugs were both invisible to every existing test, in the same
+way.** Nothing had ever ended a lease and then looked at the machine. The host tests
+asserted that materialisation worked; none asked what `/dev` contained afterwards, on
+either side. That is the same lesson as the fourth pass's "every test exercised the happy
+path", one step further along: it is not enough to test that failure paths run, the tests
+have to look at the state the system was supposed to leave behind.
+
+**And the deployment scripts were verifying themselves, not the deployment.** The stale
+binary was found by hand, when a flag that had just been added reported as unknown on a
+freshly deployed daemon whose checksum matched. Both scripts now ask cargo where it built
+rather than assuming. The same class of mistake was still present in the test harness a
+day later, where it made a merged, working fix report as eight failures.
 
 ## Appendix C — corrections made during design
 

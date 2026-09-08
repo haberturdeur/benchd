@@ -19,6 +19,11 @@ present in your `/dev` at all until you hold a lease. If `ls /dev/ttyACM0` says
 it does not exist, that is not a broken board — it is a board you have not
 claimed.
 
+While you *do* hold a lease a `/dev` node may exist for it, and opening it will be
+refused. That is also not a broken board: the node is deliberately reserved so that
+the path `claim` gave you is the only way in. Permission denied on `/dev/ttyACM0`
+means you are holding the board and reaching for it by the wrong name.
+
 ## The loop
 
 ```
