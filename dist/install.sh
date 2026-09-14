@@ -76,7 +76,16 @@ if [ -n "$on_path" ] && [ "$on_path" != /usr/local/bin/benchd ]; then
 fi
 
 sudo mkdir -p /etc/benchd/benches
+# Private keys live here, so this one is not world-readable like the rest of
+# /etc/benchd. ssh refuses to use a key other users can read, so getting this
+# wrong fails at connect time rather than quietly widening the boundary -- but
+# it fails on the machine that can no longer reach the lab, which is a poor
+# place to learn it.
+sudo mkdir -p -m700 /etc/benchd/tunnels
 [ -f /etc/benchd/coordinator.toml ] || sudo install -m644 examples/coordinator.toml /etc/benchd/
+# Not a live config: benchd-tunnel@<name> reads <name>.conf, and no instance
+# name produces this one. It is here to be copied and edited.
+sudo install -m600 examples/tunnel.conf /etc/benchd/tunnels/tunnel.conf.example
 for f in examples/bench-*.toml; do
   name=$(basename "$f" .toml); name=${name#bench-}
   [ -f "/etc/benchd/benches/$name.toml" ] || sudo install -m644 "$f" "/etc/benchd/benches/$name.toml"
@@ -114,9 +123,20 @@ for unit in benchd-host@.service benchd-clientd.service; do
   sudo tee "$conf" >/dev/null <<'EOF'
 # Local override. Nothing in dist/ writes to this file again; edit it freely.
 #
-# Name a shared lab coordinator here rather than in the shipped unit, which a
-# deploy overwrites:
-#   Environment=BENCHD_COORDINATOR=lab.example:4711
+# A shared lab coordinator is reached through an SSH tunnel, so this address
+# stays on loopback: it names the local end of the forward, not the lab. Write
+# /etc/benchd/tunnels/lab.conf (copy tunnel.conf.example) and then
+#   systemctl enable --now benchd-tunnel@lab
+#
+# Naming a remote address here directly still works, but only against a
+# coordinator deliberately bound off loopback with --listen, and then nothing
+# authenticates the link or encrypts what crosses it.
+#
+# A client that names several coordinators has already replaced ExecStart= with
+# literal addresses, and this variable is then never read -- the tunnel address
+# belongs in that override instead. Note also that drop-ins apply in lexical
+# order and the last ExecStart= wins, so a file named to sort *before* the one
+# it means to override is applied and then silently discarded.
 [Service]
 Environment=BENCHD_COORDINATOR=127.0.0.1:4711
 EOF
@@ -132,7 +152,24 @@ for f in /etc/benchd/benches/*.toml; do
   [ -e "$f" ] || continue
   echo "  sudo systemctl enable --now benchd-host@$(basename "$f" .toml)"
 done
+
+# Only worth saying on a machine that has actually configured a tunnel: the
+# unit names /usr/bin/ssh, and a missing client turns into a unit that fails
+# three seconds after every restart with nothing pointing at the cause.
+for f in /etc/benchd/tunnels/*.conf; do
+  [ -e "$f" ] || continue
+  command -v ssh >/dev/null || echo "WARNING: $f exists but ssh is not installed"
+  break
+done
+
 echo
-echo "To point this machine at another coordinator, edit:"
+echo "The coordinator binds 127.0.0.1 only. To reach one on another machine,"
+echo "forward to it rather than naming it directly:"
+echo "  sudo cp /etc/benchd/tunnels/tunnel.conf.example /etc/benchd/tunnels/lab.conf"
+echo "  sudo \$EDITOR /etc/benchd/tunnels/lab.conf        # target, key, known hosts"
+echo "  sudo systemctl enable --now benchd-tunnel@lab"
+echo
+echo "The daemons go on talking to 127.0.0.1:4711, which is the near end of"
+echo "that forward. Their addresses stay yours to edit:"
 echo "  /etc/systemd/system/benchd-host@.service.d/10-coordinator.conf"
 echo "  /etc/systemd/system/benchd-clientd.service.d/10-coordinator.conf"

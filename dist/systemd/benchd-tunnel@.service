@@ -1,0 +1,75 @@
+[Unit]
+Description=benchd SSH tunnel to coordinator %i
+Documentation=https://github.com/tom/benchd
+After=network.target
+# One unit per coordinator, because a client may hold links to several at once
+# (D21) and each needs its own forward. The instance name is the coordinator's
+# local name -- the same name used in `--coordinator name=address` -- so
+# `benchd-tunnel@lab` and the `lab=` entry in the client's argument list refer
+# to the same thing.
+
+[Service]
+# Everything site-specific lives here rather than in the unit, which deploy.sh
+# reinstalls on every deploy:
+#   BENCHD_TUNNEL_TARGET       user@coordinator-host
+#   BENCHD_TUNNEL_LISTEN       local end of the forward, host:port
+#   BENCHD_TUNNEL_REMOTE       what to forward to on the far side, host:port
+#   BENCHD_TUNNEL_KEY          private key for this tunnel
+#   BENCHD_TUNNEL_KNOWN_HOSTS  the coordinator's host key
+EnvironmentFile=/etc/benchd/tunnels/%i.conf
+
+# The options are the point of this unit; ssh's defaults are wrong for an
+# unattended forward in almost every one of them.
+#
+# -N            ask for no command and no shell. The account on the far side
+#               exists to be a tunnel endpoint, nothing else.
+# BatchMode     never prompt. A unit has no terminal to prompt at, and without
+#               this a missing key turns into a process blocked forever on a
+#               passphrase rather than a unit that failed.
+# IdentitiesOnly  offer only the key named below. Otherwise ssh offers every
+#               identity the agent holds and can trip the server's MaxAuthTries
+#               before reaching the right one.
+# StrictHostKeyChecking=yes  refuse an unknown or changed host key. This is the
+#               whole security boundary: accept-new would take whatever answers
+#               on first contact, which is precisely the attack this exists to
+#               stop. It does mean the host key must be seeded in the file below
+#               before the unit will start -- deliberately, and install.sh says
+#               so rather than papering over it.
+# ExitOnForwardFailure=yes  die if the forward cannot be established. Without
+#               it ssh authenticates, fails to bind the local port, and sits
+#               there looking healthy while benchd talks to whatever else owns
+#               that port -- or to nothing at all.
+# ServerAlive*  notice a tunnel that has stopped passing traffic without being
+#               closed. Three probes at fifteen seconds bounds that at about 45
+#               seconds, which is also the coordinator's default host timeout:
+#               a blackholed tunnel and the bench withdrawal it causes are
+#               noticed on the same timescale rather than minutes apart.
+ExecStart=/usr/bin/ssh -N -T \
+  -o BatchMode=yes \
+  -o IdentitiesOnly=yes \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=${BENCHD_TUNNEL_KNOWN_HOSTS} \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=3 \
+  -i ${BENCHD_TUNNEL_KEY} \
+  -L ${BENCHD_TUNNEL_LISTEN}:${BENCHD_TUNNEL_REMOTE} \
+  ${BENCHD_TUNNEL_TARGET}
+
+Restart=always
+RestartSec=3
+# A dropped tunnel needs no coordination with the daemons using it. The host and
+# client reconnect loops already retry every three seconds and the coordinator
+# withdraws a silent host's bench, so a tunnel that comes back is rejoined
+# without anything else being restarted. That is also why the daemons carry no
+# After= on this unit: ordering would be tidier at boot but the reconnect path
+# has to work anyway, and one mechanism that always runs beats two.
+
+# Root because the units that use the tunnel are root and the key sits in
+# /etc/benchd/tunnels alongside their configuration. ssh itself needs no
+# privilege here -- the forward binds a high port -- so a dedicated unprivileged
+# user is a straightforward hardening step if this machine ever has other users.
+User=root
+
+[Install]
+WantedBy=multi-user.target

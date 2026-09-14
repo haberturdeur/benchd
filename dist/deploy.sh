@@ -122,6 +122,12 @@ for shipped in dist/systemd/*.service; do
   fi
 done
 sudo install -m644 dist/systemd/*.service /etc/systemd/system/
+# The tunnel unit names /etc/benchd/tunnels/%i.conf, and this script installs
+# that unit on machines install.sh may never have run on. Created here too, and
+# with the mode rather than without it: ssh refuses a private key that other
+# users can read, so a directory made by hand at the default 0755 fails at
+# connect time on the machine that has just lost its route to the lab.
+sudo mkdir -p -m700 /etc/benchd/tunnels
 sudo systemctl daemon-reload
 
 # Is this unit running *now*? `systemctl restart` on an inactive unit starts
@@ -193,7 +199,16 @@ if running benchd-coordinator.service; then
 fi
 
 for u in $UNITS; do
-  case "$u" in benchd-coordinator.service) continue;; esac
+  case "$u" in
+    benchd-coordinator.service) continue;;
+    # A tunnel runs ssh, not benchd, so a new binary is no reason to drop the
+    # forward -- and dropping it would cut every host and client on this machine
+    # off from the lab in the middle of a deploy, to install code the unit does
+    # not contain. It would also make a tunnel that failed for reasons of its own
+    # -- a lab server rebooting, a network blip -- get reported below as a failed
+    # deploy, which is exactly the wrong place to go looking.
+    benchd-tunnel@*.service) continue;;
+  esac
   running "$u" || continue
   restart "$u"
 done

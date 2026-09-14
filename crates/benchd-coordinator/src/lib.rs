@@ -26,7 +26,17 @@ use crate::state::State;
 #[derive(Parser)]
 pub struct CoordinatorArgs {
     /// Address to listen on.
-    #[arg(long, default_value_t = format!("0.0.0.0:{DEFAULT_PORT}"))]
+    ///
+    /// Loopback by default, because binding the wildcard address publishes an
+    /// unauthenticated lab to the whole network (D5, §9): anything that can
+    /// reach the port can claim hardware, register a bench, or force-release
+    /// somebody else's lease. Remote hosts and clients reach this through an
+    /// SSH tunnel and arrive on loopback like everything else.
+    ///
+    /// Overridable, because the default is a safe posture rather than a
+    /// requirement -- a lab on a network it fully controls may still want to
+    /// bind an interface directly, and it must then say so explicitly.
+    #[arg(long, default_value_t = format!("127.0.0.1:{DEFAULT_PORT}"))]
     listen: String,
 
     /// Vocabulary and limits. Benches are *not* configured here: each host
