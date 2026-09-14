@@ -126,60 +126,82 @@ still owns `/dev/ttyUSB0`.
 Agents have none — one that forgets, or saw `--port /dev/ttyUSB0` in a README, or
 decides a lock is "probably stale", corrupts someone else's run silently.
 
-### D2. Real device nodes, at per-lease paths
+### D2. The imported node itself, at a per-lease path
 
-`mknod` a private node carrying the imported device's type and major/minor at
-`/run/benchd/<owner>/<coordinator>-<lease-id>/<slot>/<resource>`, exposed as
-`$LAB_DUT_CONSOLE`.
+Symlink `/run/benchd/<owner>/<coordinator>-<lease-id>/<slot>/<resource>` to the imported
+device's node in `/dev`, exposed as `$LAB_DUT_CONSOLE`, and give that node to the leasing
+agent's uid at `0600` for as long as the lease lasts.
 
 *Why real nodes:* Goal 2 rules out everything else. `rfc2217://` and `socket://` are
 pyserial-only — `idf.py monitor`, `minicom` and `openocd` refuse them. A pty bridge
 loses modem-control lines, breaking ESP32 auto-reset intermittently.
 
-*Why a private node and not a bind mount.* This was a bind mount until the fifth-pass
-review, and the mount was a privilege leak. Bind-mounting a device file shares the
-source inode, so every permission change made to hand the device to its agent lands on
-`/dev/ttyACM0` machine-wide: the node takes the agent's uid — which two agents on one
-machine commonly share, and separating those is the only job the sandbox has left —
-while keeping the group and mode it already had, so `dialout` on a workstation could
-open whatever happened to be leased. A node created with the source's own major and
-minor addresses the same driver and behaves exactly as the device does, while existing
-only inside the lease directory.
+*Why the node itself, and not a private `mknod` of it.* This was a private node until it
+was measured against the toolchain, and a private node is by construction one that **no
+enumeration lists** — which is most of its appeal and, it turns out, the reason it fails
+Goal 2. A tool that identifies a device by looking around the system rather than by
+opening the path it was handed then misbehaves in ways unrelated to permissions.
+`esptool` resolves a console's USB vendor and product id by matching the path against
+pyserial's port list, which globs `/dev/tty*`; against a private node it finds nothing
+and assumes a USB-UART bridge. On a native-USB part that means both a reset sequence that
+cannot reach the bootloader *and* — because the same VID/PID answer drives
+`uses_usb_jtag_serial()` — skipping the RTC watchdog and SWD autofeed that such a part
+needs disabled **while flashing**. Measured: an unmodified `esptool flash-id` times out
+after 42s against a private node and succeeds in 3s against a symlink to the real one,
+reporting `USB mode: USB-Serial/JTAG` only in the second case. `usbsdmux` fails the same
+way for a different reason (D24). `--before usb-reset` papers over the first half only,
+turning a clean failure into an intermittent one, which is worse.
 
-*And the node in `/dev` is taken away from everyone but root for the lease's duration,*
-then put back on release. Otherwise the lease directory is merely the *intended* path to
-a leased board rather than the only one. Locking it is safe precisely because it is not
-this machine's hardware: every node the materialiser touches belongs to a device that
-exists here only because this lease imported it over USB/IP.
+*Why giving the node away is a smaller concession than it reads.* It is the same fact
+that made locking it safe: this is never the machine's own hardware. Every node the
+materialiser touches belongs to a device that exists here *only because this lease
+imported it* over USB/IP, and that vanishes when the lease detaches its vhci port — its
+lifetime is already exactly the lease's, and there is no other user of it to protect it
+from. `0600` to the leasing uid therefore grants that uid precisely what the private node
+granted it. The real objection to the old bind mount was never sharing the inode as such,
+but *inheriting* the source's group and mode, which handed the board to all of `dialout`
+or `disk`; both are overwritten here rather than kept. Verified on hardware: `tom:root
+0600` for the lease's duration, back to `root:plugdev 0660` on release, and the node gone
+a moment later when the port detaches.
 
-*The refusal that follows has no voice of its own, so the lock is logged instead.* When
-somebody opens the reserved node anyway they get `EACCES` from the kernel, with nothing
-of ours on the stack to explain it — there is no hook, and the obvious channel is closed
-in any case, since `kernel.dmesg_restrict` keeps an unprivileged agent out of `dmesg`.
-The daemon therefore names both paths when it takes the node, so that grepping the
-journal for the device an agent was refused answers the question: `journalctl -u
-benchd-clientd | grep ttyACM0` reports which lease reserved it and where the usable node
-is. The audience for that is the operator, not the agent; the agent is told by the skill
-never to go there.
+*What it costs.* A stale reference gains a second way to be wrong. The lease path still
+fails `ENOENT` once the lease ends, but a tool that resolved it to `/dev/ttyACM0` and
+cached *that* could reach a later lease's board, since kernel names are reused. A
+different agent is stopped by the ownership; the same uid is not. Accepted deliberately:
+agents are handed `$LAB_DUT_*`, and no tool in this toolchain persists a realpath across
+leases. Enforcement is otherwise unchanged — outside a lease the device is not imported
+at all, so "forgot to claim" is still `ENOENT` rather than `EACCES`.
 
-*What this costs:* the lease tree must be on a filesystem mounted **without** `nodev`,
-and `/run` is `nosuid,nodev` on any systemd machine. A node can be created on a `nodev`
-mount and then not opened, so the failure without this is every lease reporting success
-and every tool the agent runs failing `EACCES` on a node that looks perfectly correct in
-`ls -l`. The client's systemd unit therefore mounts a tmpfs with `dev` over the lease
-root, and the daemon reads `/proc/self/mountinfo` at startup and logs an error naming the
-fix if it finds the tree on a `nodev` filesystem regardless.
+*The refusal that follows has no voice of its own, so the handover is logged instead.*
+When somebody opens a reserved node anyway they get `EACCES` from the kernel, with
+nothing of ours on the stack to explain it — there is no hook, and `kernel.dmesg_restrict`
+keeps an unprivileged agent out of `dmesg` in any case. The daemon therefore names the
+device, the lease and the uid when it takes the node, so that `journalctl -u
+benchd-clientd | grep ttyACM0` answers the question. The audience is the operator.
 
-*What it buys:* materialisation no longer needs `CAP_SYS_ADMIN`, only `CAP_MKNOD` and
-`CAP_CHOWN`. The symlink alternative this decision used to hold open is now closed for
-good: a symlink has no ownership of its own to hand anybody.
+*What it buys, beyond the tools working:* two sharp edges disappear with the private
+node. The lease tree no longer has to be on a filesystem mounted without `nodev` — `/run`
+is `nosuid,nodev` on any systemd machine, and a node created there could be created and
+then never opened, which used to make every lease report success and every open fail
+`EACCES` on a node that looked perfectly correct in `ls -l`. And materialisation needs
+only `CAP_CHOWN`, no longer `CAP_MKNOD`.
 
 *Why the lease id is in the path:* if `/dev/lab/dut` meant board A last lease and board
 B this lease, a stale shell writes to the wrong board — the original failure,
 reintroduced. Stale paths must fail `ENOENT`.
 
-*Rejected:* literal `/dev/ttyUSB0`. Kernel indices renumber and collide, reintroducing
-the identity problem tags exist to remove.
+*Rejected:* handing out `/dev/ttyUSB0` directly, with no lease path at all. Kernel
+indices renumber and collide, reintroducing the identity problem tags exist to remove;
+the symlink is what gives the device a stable, lease-scoped name.
+
+*Rejected:* leaving the private node and fixing `esptool` upstream to resolve VID/PID by
+`stat`ting the path and reading `/sys/dev/char/<major>:<minor>`. That fix is real, works
+(measured: it recovers `303a:1001` from a private node, through `vhci_hcd`), and would
+subsume the special cases esptool already carries for udev aliases and Docker
+`/host_dev` bind mounts — but it repairs one tool, on a release schedule we do not
+control, while every other enumerating tool stays broken. Worth sending upstream on its
+own merits; not a substitute for benchd handing over something that behaves like a
+locally connected device.
 
 ### D3. Greenfield, not labgrid
 
@@ -217,7 +239,9 @@ topology detection, and the same bytes on the wire wherever the client happens t
 The coordinator is the sole listener. Hosts and clients dial in and hold the connection
 open; instructions travel back down it. Messages are `serde` enums in a shared crate,
 one JSON object per line, over **plain TCP everywhere** — no unix-socket special case
-for co-located components, no TLS.
+for co-located components, no TLS. The listener binds `127.0.0.1`, so "plain" is a
+statement about benchd's own code rather than about what crosses a network: peers on
+other machines arrive through an SSH forward (§9).
 
 *Why coordinator-only:* hosts live wherever the hardware is — lab VLAN, bench laptop,
 behind NAT. Requiring each to be addressable makes adding a bench an infrastructure
@@ -227,11 +251,18 @@ task instead of a `systemctl start`.
 pushing down an inbound connection is the only delivery mechanism available — not a
 convenience. The same connection carries heartbeats up and `revoking` down.
 
-*Why no TLS:* **benchd does no cryptography.** The PoC assumes a trusted LAN (§9).
-Rolling a PKI is a notorious time sink, and the half that would matter — issuing
-*client* certs so hosts can be identified — is the half nothing automates. If this ever
-needs a boundary it goes underneath as WireGuard, whose peer public keys are already
-mutual authentication, rather than into the application.
+*Why no TLS:* **benchd does no cryptography.** Rolling a PKI is a notorious time sink,
+and the half that would matter — issuing *client* certs so hosts can be identified — is
+the half nothing automates. The boundary goes underneath instead: the coordinator binds
+loopback, and a remote host or client reaches it over an SSH forward (§9). The transport
+is then encrypted and both ends mutually authenticated without a line of it being ours.
+What that does not buy is peer identity — every connection arrives from `127.0.0.1` —
+which §9 states outright rather than leaving to be discovered.
+
+*And the tunnel runs the same direction as the dial,* which is why SSH fits here rather
+than merely being available. The forward is opened *by* the bench machine, outward, so a
+host behind NAT needs no more addressability with a tunnel than without one, and the
+property this decision exists to protect survives it.
 
 *Rejected — a TLS-terminating proxy such as Caddy:* raw TCP would need `caddy-l4`, an
 experimental non-official plugin requiring an `xcaddy` custom build — and worse, **raw
@@ -562,7 +593,12 @@ needs no policy to stay correct.
 from an agent's `/dev`. With nothing to hide it has no job left, and benchd no longer
 requires one to function. Separating two agents that share a uid on one client machine is
 a different problem, and one the operator should solve with whatever sandbox they prefer
-rather than one this project mandates. `dist/benchd-sandbox` remains as a worked example.
+rather than one this project mandates. `dist/benchd-sandbox` remains as a worked example
+— and is at present a *broken* one, because D2 now hands out a symlink into `/dev` and
+that script's whole method is to give the agent a `/dev` without the device in it. The
+repair is a per-agent `/dev` holding that agent's own leased nodes under their kernel
+names, which would serve enumeration and same-uid isolation at once; it is not written.
+Agents with distinct uids are unaffected, being separated by the node's ownership.
 
 *Cost, accepted:* an unleased board is unusable on its own host without going through
 benchd, and `benchd host` now needs root even for a bench that never leaves the machine.
@@ -1142,27 +1178,68 @@ not an error to escalate.
 
 ## 9. Security posture
 
-**There is none, and that is deliberate.** The PoC assumes a trusted LAN with no
-malicious hosts or clients. Anyone who can reach the coordinator's port can register a
-session, claim hardware, and register a bench.
+**The boundary is SSH, and benchd still does no cryptography.** The coordinator binds
+`127.0.0.1` and nothing else. Hosts, clients and operators on other machines reach it
+through an SSH forward and arrive on loopback like everything co-located. What the
+transport gives is exactly what SSH gives: the link is encrypted, and both ends
+authenticated each other before a byte of benchd traffic crossed it.
 
-What this buys: no PKI, no cert distribution or rotation, no auth code in the hot path,
-and no security theatre implying a boundary that isn't there. What it costs: benchd
-**must not** be run on a network you don't control.
+**Inside that boundary there is still nothing, and that is deliberate.** Anything that
+can open the forward can register a session, claim hardware, register a bench, and
+force-release somebody else's lease. The rule is *access to the coordinator machine is
+enough*: authorisation is delegated to that machine's accounts and `authorized_keys` —
+a boundary a lab already knows how to operate — rather than to a second one invented
+here and maintained by us.
+
+What this buys: no PKI, no certificate distribution or rotation, no enrolment state to
+persist and reconcile against D6's statelessness, no auth code in the hot path, and no
+security theatre implying a finer boundary than there is. What it costs is listed
+plainly, because a tunnel invites being mistaken for more than it is.
+
+**What the tunnel does not do.**
+
+- **It does not tell benchd who anyone is.** Every connection arrives from `127.0.0.1`,
+  so the coordinator cannot tell a host from a client from an operator by origin, nor
+  one host from another. A host may still register any bench id, including one meant
+  for somebody else's board. Seam 3 below is unaddressed, not solved.
+- **It is not scoped to a user.** A forward bound to loopback is reachable by *every*
+  local user of the machine holding it. On a single-purpose bench machine that says
+  nothing new; on a shared workstation it means "access to the coordinator machine" is
+  really "access to any machine with a tunnel".
+- **It does not survive being turned off.** `--listen` still takes any address, and a
+  coordinator bound off loopback is exactly as exposed as it was before. The default is
+  the safe posture; the flag is the loaded gun.
 
 There are no roles (D15), so identity grants nothing — the session name is a label for
 diagnostics, not an authorisation input (D19). Limits are global and apply to everyone
 equally; they exist to stop a runaway agent hoarding boards, not to stop an attacker.
 
-If this ever needs a real boundary, the seams are deliberate and in this order:
+If this ever needs a finer boundary than a machine, the seams are deliberate and in
+this order:
 
-1. **WireGuard underneath** — peer public keys are already mutual authentication, and
-   benchd still does no cryptography.
+1. **A different network underneath**, if SSH proves the wrong shape — WireGuard peer
+   public keys are already mutual authentication, and benchd would still do no
+   cryptography. Not chosen now because it is a second network to run, and the identity
+   it offers reaches benchd as a source address: a property of the tunnel's
+   configuration rather than of benchd, so a misconfigured `AllowedIPs` becomes an
+   authorisation bug. SSH needs no address plan and is already on every machine.
 2. **`Register { name, credential }`** — the registration call already has the shape
    (D19); adding a check is one function.
 3. **Host authentication** matters more than client authentication — a lying client
    harms only itself, a lying host can advertise benches that don't exist and mislead
-   an agent about which board it is driving.
+   an agent about which board it is driving. Making `host_id` part of a bench's
+   qualified id would make this structural rather than checked: a host that can only
+   name benches inside its own namespace cannot forge one in anybody else's, and the
+   `name=` tag D9 forbids a host to declare becomes derivable rather than unvalidatable.
+4. **Mutual TLS in the application**, if the boundary must be finer than a machine at
+   all. This is possible despite D5 handing the data socket to the kernel, which is not
+   obvious and was checked rather than assumed: `stub_dev.c` and `vhci_sysfs.c` test
+   only `socket->type != SOCK_STREAM` and never the address family, so a daemon can give
+   the kernel one end of an `AF_UNIX` socketpair and pump the other through a TLS
+   session — keeping the kernel's USB/IP implementation entirely, at one userspace copy
+   per URB. Not done because it is materially more code than the problem justifies
+   today, and because it costs the property that a handed-over socket outlives the
+   daemon that created it.
 
 Hosts and clients run as root but only execute epoch-qualified instructions from the
 coordinator, never agent-supplied strings, and build paths only from validated
@@ -1196,7 +1273,7 @@ None blocking.
 
 | # | Question | State |
 |---|---|---|
-| Q10 | Relay latency for JTAG/high-rate transports | **Out of scope.** Serial only for now (~11 KB/s), where the extra RTT is noise. Revisit if a JTAG bench ever exists. |
+| Q10 | Relay latency for JTAG/high-rate transports | **Measured for flashing; the relay is not the limit.** 256 KB of incompressible data written to a board on the far side of the SSH forward: 637 kbit/s over a board's own USB, and over an FT2232H 88.9 kbit/s at 115200 but 526 kbit/s at 921600. The default baud is the ceiling there, not the RTT. Still genuinely open for JTAG, which no bench exercises. |
 | Q12 | Is our USB/IP handshake byte-correct? | **Yes.** Verified against stock `usbipd`/`usbip` and by a live loopback import: DTR/RTS auto-reset works through the relay and the ESP32 ROM banner comes back. |
 | Q11 | Can `usbipd` bind loopback-only? | **Moot — we don't run it.** It binds wildcard with no auth, so instead both ends dial out and hand the kernel the resulting fd (D5). No listening socket to confine. |
 
@@ -1224,10 +1301,12 @@ revisit-with-evidence, not now.
 | Coordinator daemon | done — hostile-input tests against a live daemon |
 | Host / client daemons | done, deployed, verified across two machines |
 | USB/IP handshake + sysfs fd handoff | done, verified on hardware |
+| SSH-tunnelled transport | done — verified between two machines: an ESP32-S3 on a second host leased over the forward, control plane and USB/IP data channels both, with that coordinator bound to loopback and unreachable directly. `permitopen` refuses any other port (`administratively prohibited`) and the forced command yields no shell. A killed tunnel is restored by systemd in ~4s and leases resume with nothing else restarted |
+| Flashing a remote board | done — verified through the forward with unmodified `esptool`, on both a native-USB ESP32-S3 and an FT2232H-bridged ESP32. 256 KB of random data, which esptool declines to compress and so sends whole, written to an erased region: `Hash of data verified`, read back byte-identical, region restored |
 | One binary, a subcommand per component | done (D26) |
 | Skill | done — `skill/benchd/SKILL.md` |
 
-161 tests run on every `cargo test`, plus 19 that spawn real daemons and are `#[ignore]`d
+160 tests run on every `cargo test`, plus 19 that spawn real daemons and are `#[ignore]`d
 so a plain run stays hermetic. Those 19 live in the `benchd` crate rather than beside the
 code they exercise, which is not tidiness: cargo only guarantees a freshly built binary
 to tests in the crate that declares it, and anywhere else they silently test whatever was

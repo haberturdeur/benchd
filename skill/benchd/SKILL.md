@@ -101,13 +101,19 @@ GPIO4 drives the LED; GPIO5 is wired to the peer's GPIO18.
 up and describe things you cannot discover from the board: pinout, jumpers, what
 is connected to what. They only appear for the bench you were actually granted.
 
-That is a real character device. Everything works as usual:
+That is a real character device. Everything works as usual, with no flags of any
+kind for benchd's benefit:
 
 ```sh
 esptool --port "$LAB_DUT_CONSOLE" write-flash 0x0 firmware.bin
 idf.py -p "$LAB_DUT_CONSOLE" monitor
 minicom -D "$LAB_DUT_CONSOLE"
 ```
+
+The path leads to the same device node the board would have if it were plugged
+into this machine, so tools that work out what they are talking to — esptool
+choosing a reset sequence from the USB vendor and product id, for instance — get
+the right answer on their own.
 
 Not every resource is a console. A bench may also hand you a block device or a
 SCSI node, and the notes say what each one is for — a bench with a switchable SD

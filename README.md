@@ -34,6 +34,8 @@ benches forwarded over USB/IP.
 | Skill | done |
 | USB/IP remote benches | done — verified across a real network between two machines |
 | Multi-board benches | done, tested |
+| SSH-tunnelled transport | done — verified between two machines: a board on a second host leased over the forward, control and USB/IP both, with the coordinator bound to loopback and `permitopen` plus the forced command enforced |
+| Flashing a remote board | done — unmodified `esptool` writes 256 KB of incompressible data through the forward and reads it back byte-identical, over a board's own USB and over an FT2232H bridge alike |
 
 **Read [`docs/design.md`](docs/design.md) first.** It records 26 numbered decisions with
 the alternatives that were rejected and why, and five rounds of adversarial review with
@@ -72,8 +74,12 @@ your local hardware with it. Agents are not told: tag counts are summed, statuse
 and a claim goes to the first coordinator that can satisfy it.
 
 Everything talks newline-delimited JSON over plain TCP, with no schema language and no
-cryptography: benchd assumes a trusted LAN (see §9 of the design doc), and the trust
-boundary belongs to the network, not the application.
+cryptography of its own. The coordinator binds `127.0.0.1` and nothing else; machines
+elsewhere reach it through an SSH forward, which is encrypted and mutually authenticated
+without benchd knowing it is there. The trust boundary therefore belongs to the
+transport rather than to the application, and it is drawn at a whole machine: anything
+that can open the tunnel can drive the lab. See §9 of the design doc, which is equally
+explicit about what that does *not* cover.
 
 ## Layout
 
@@ -97,6 +103,7 @@ crates/benchd-client/             privileged: materialises device nodes
 crates/benchd-mcp/                per-agent stdio shim, five tools
 examples/coordinator.toml         limits + the central vocabulary
 examples/bench-*.toml             one file per bench, lives with the hardware
+examples/tunnel.conf              one per coordinator reached from this machine
 ```
 
 Each component is a library crate; `crates/benchd` is a dispatcher over them and the
@@ -128,12 +135,14 @@ benchd client --coordinator local=127.0.0.1:4711 --coordinator lab=lab.example:4
 
 No sandbox is required: a bench's boards are hidden on the host they are plugged into,
 so an agent that reaches for `/dev/ttyUSB0` finds nothing there whether or not it is
-confined. A sandbox buys one further thing — separating agents that share a uid on one
-machine — and `dist/benchd-sandbox` is a worked bubblewrap example if you want it:
+confined, and a leased device node belongs to the leasing uid alone. A sandbox buys one
+further thing — separating agents that *share* a uid on one machine — and
+`dist/benchd-sandbox` was a worked bubblewrap example of that.
 
-```sh
-benchd-sandbox -- pi        # this agent sees only its own leases
-```
+**That example is currently broken and is not the way to run agents today.** It gives
+each agent a minimal `/dev`, and a lease path is now a symlink into `/dev`, so inside it
+every lease dangles. Repairing it needs a per-agent `/dev` carrying that agent's own
+leased nodes, which is not written yet. The script says so when run.
 
 Then point an agent at it:
 
@@ -161,7 +170,7 @@ that fails.
 ## Build
 
 ```sh
-cargo test           # 161 tests, incl. a property test over random inventories
+cargo test           # 160 tests, incl. a property test over random inventories
 cargo clippy --all-targets --all-features -- -D warnings
 
 # 19 more that spawn real daemons and speak the wire protocol at them,
