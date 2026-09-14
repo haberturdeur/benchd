@@ -86,6 +86,7 @@ explicit about what that does *not* cover.
 ```
 docs/design.md                    the design, 26 decisions, and open questions
 dist/install.sh                   build, install the binary and systemd units
+dist/cross-build.sh               build for a host that has no toolchain of its own
 skill/benchd/SKILL.md             the agent-facing skill
 crates/benchd/                    the one binary: a subcommand per component
 crates/benchd-core/               pure: tags, model, matcher, limits, lease, wire
@@ -183,6 +184,25 @@ only guarantees a freshly built binary to tests in the crate that declares it. A
 else they quietly test whatever was last left in `target/`.
 
 Requires Rust 1.88+ (MSRV is pinned by `rmcp`, which the MCP shim uses).
+
+### For a machine that cannot compile
+
+A bench host is often a Raspberry Pi with no Rust toolchain, so its binary is built
+elsewhere and copied over. `cargo build --target` is not enough on its own: the compile
+succeeds and the *link* fails, because the host's `cc` drives a linker that cannot emit
+the target's architecture.
+
+```sh
+dist/cross-build.sh                          # defaults to aarch64-unknown-linux-musl
+dist/cross-build.sh x86_64-unknown-linux-musl
+```
+
+It uses the `rust-lld` that ships inside the toolchain, so no cross-compiler has to be
+installed, and it prints the commands to install the result. A `*-linux-musl` target is
+what makes that sufficient — the binary is static, so there is no target libc to supply.
+
+Check the printed `sha256` against the installed file afterwards. Every build reports
+version `0.1.0`, so the checksum is the only thing that distinguishes one from another.
 
 ## Reading order
 
