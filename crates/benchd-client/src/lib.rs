@@ -264,10 +264,6 @@ pub async fn run(args: ClientArgs) -> Result<()> {
     }
 
     let mut materializer = Materializer::new(root.clone(), coordinators.clone());
-    // Said once, at startup, rather than discovered per lease: a lease tree
-    // that cannot carry device nodes materialises everything successfully and
-    // then fails every open the agent attempts.
-    materializer.check_root().await;
     // Nothing we materialised survives us in any meaningful sense: every
     // coordinator holds its own lease state and all of them have forgotten
     // everything (D6).

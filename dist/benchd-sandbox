@@ -21,6 +21,25 @@
 #     materialise under /run/benchd/<identity> and DAC alone cannot keep
 #     same-uid agents out of each other's.
 #
+# *** THIS SCRIPT IS CURRENTLY BROKEN, AND KNOWINGLY SO. ***
+#
+# D2 changed: a lease is no longer a private device node inside the lease
+# directory, it is a symlink to the imported device's own node in /dev, which is
+# made over to the leasing agent's uid. That is what lets tools identify the
+# device -- esptool picks its reset sequence by looking the path up in pyserial's
+# port list, which globs /dev, and a private node is in no such list.
+#
+# A symlink to /dev/ttyACM0 is resolved against whatever /dev the process can
+# see, and the whole point of the minimal /dev below is that it has no ttyACM0
+# in it. So inside this sandbox every lease path dangles and every open fails.
+#
+# The fix is a per-agent /dev -- one holding that agent's own leased nodes under
+# their kernel names, which would satisfy enumeration and same-uid isolation at
+# once -- and it is not written yet. Until it is, run agents without this script;
+# ownership on the imported node (0600 to the leasing uid) still separates
+# agents that have distinct uids, which is the common case. It is same-uid
+# agents that this script was the only answer for.
+#
 # Use whatever sandbox you prefer -- this one is bubblewrap. Adapt it, replace
 # it, or drop it.
 #
@@ -49,6 +68,21 @@ while [ $# -gt 0 ]; do
 done
 
 [ $# -gt 0 ] || { echo "nothing to run; use: benchd-sandbox [opts] -- command" >&2; exit 2; }
+
+# Said here and not only in the header, because the symptom inside is a lease
+# path that exists, looks right in `ls -l`, and fails to open -- which reads as
+# a benchd bug rather than as this script being out of date with D2.
+cat >&2 <<'WARNING'
+benchd-sandbox: WARNING -- leases do not work inside this sandbox.
+
+  A lease path is now a symlink to the imported device's node in /dev, and the
+  minimal /dev this script creates does not contain it, so the link dangles and
+  every open fails. Fixing it needs a per-agent /dev, which is not written yet.
+
+  Run agents without this script for now. Node ownership still keeps agents with
+  distinct uids out of each other's boards; only same-uid agents lose anything.
+
+WARNING
 
 # A stable name per agent. Harnesses expose a session id, but it is usually a
 # full UUID and makes contention messages unreadable, so take a short prefix.

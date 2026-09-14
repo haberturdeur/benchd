@@ -17,33 +17,48 @@
 //! reintroduced through the back door. With the lease id in the path, a stale
 //! reference fails with `ENOENT`.
 //!
-//! **A private node per lease, not a bind mount of the one in `/dev`.** A bind
-//! mount of a file shares the source inode, so every permission change made to
-//! hand the device to an agent lands on `/dev/ttyACM0` machine-wide: the node
-//! becomes the agent's uid — which two agents commonly share, and separating
-//! those is the only thing the sandbox is still for — while keeping the group
-//! and mode it had, so `dialout` (a human's own account, on a workstation) can
-//! open whatever is currently leased. `mknod` with the source's type and
-//! major/minor addresses the same driver and behaves exactly as the device
-//! does, while being reachable only through the lease directory.
+//! **A symlink to the imported node, with the access control on the node
+//! itself.** The lease path is a symlink to `/dev/ttyACM0`; the imported node
+//! is given to the agent's uid at `0600` for as long as the lease lasts, and
+//! put back on release.
 //!
-//! The imported node in `/dev` is then locked to root for as long as the lease
-//! lasts and put back on release, so the lease directory really is the only way
-//! to a leased board rather than merely the intended one. Locking it is safe
-//! precisely because it is not this machine's hardware: every node this module
-//! touches belongs to a device that exists here only because this lease
-//! imported it (see [`benchd_core::sysfs::wait_for_vhci_node`]).
+//! This was a private `mknod` until it was measured against real tools, and
+//! that is what it cost: a node reachable only through the lease directory is
+//! also a node that *no enumeration lists*. Tools that identify a device by
+//! looking around the system rather than by opening the path they were handed
+//! then misbehave in ways that have nothing to do with permissions. `esptool`
+//! resolves a console's USB vendor and product id by matching the path against
+//! pyserial's port list, which globs `/dev/tty*`; against a private node it
+//! finds nothing, silently assumes a USB-UART bridge, and both picks a reset
+//! sequence that cannot reach the bootloader of a native-USB part and skips
+//! disabling the RTC watchdog that such a part needs disabled *while flashing*.
+//! `usbsdmux` has the same shape for a different reason (D24). Goal 2 is that
+//! normal tools work, so the private node was failing the goal it existed for.
 //!
-//! That needs the tree to be on a filesystem mounted **without** `nodev`, which
-//! `/run` is not by default — a node can be created on a `nodev` mount but not
-//! opened. [`Materializer::check_root`] says so loudly at startup rather than
-//! leaving an agent with a node and an `EACCES` it cannot explain.
+//! Giving away the imported node instead is much less of a concession than it
+//! reads, and the reason is the same fact that made locking it safe: this is
+//! never the machine's own hardware. Every node here belongs to a device that
+//! exists on this machine *only because this lease imported it* (see
+//! [`benchd_core::sysfs::wait_for_vhci_node`]) and that vanishes when the lease
+//! detaches its vhci port. Its lifetime is already exactly the lease's, and
+//! there is no other user of it to protect it from — so `0600` to the leasing
+//! uid gives that uid exactly what the private node gave it, at a path the rest
+//! of the system can also see and describe. The old objection to sharing the
+//! inode was really an objection to *inheriting* the source's group and mode,
+//! which handed the board to all of `dialout` or `disk`; those are overwritten
+//! here rather than kept.
 //!
-//! `mknod` is spawned rather than called: this crate forbids `unsafe`, and
-//! `mknod(2)` has no safe binding in std. It does mean the daemon no longer
-//! needs `CAP_SYS_ADMIN` for materialisation, only `CAP_MKNOD` and
-//! `CAP_CHOWN` — the symlink swap that would have dropped the last of them is
-//! no longer possible at all, because a symlink cannot have its own ownership.
+//! What is given up is that a stale reference now has a second way to be wrong.
+//! The lease path still fails `ENOENT` once the lease ends, but a tool that
+//! resolved it to `/dev/ttyACM0` and cached *that* could reach a later lease's
+//! board, since kernel names are reused. A different agent is stopped by the
+//! ownership; the same uid is not. Judged acceptable: agents are handed
+//! `$LAB_DUT_*` and no tool in this toolchain persists a realpath across leases.
+//!
+//! Two requirements disappear with the private node, both of them sharp edges:
+//! the lease tree no longer has to be on a filesystem mounted without `nodev`
+//! (`/run` is not, by default, and a node created there could never be opened),
+//! and materialisation no longer needs `CAP_MKNOD` — only `CAP_CHOWN`.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -94,9 +109,9 @@ pub struct Materializer {
     active: BTreeMap<LeaseKey, PathBuf>,
     /// vhci ports this lease imported, needing an explicit detach.
     imported: BTreeMap<LeaseKey, Vec<u32>>,
-    /// Imported `/dev` nodes locked to root for the duration of a lease, and
-    /// what to put back on release. Locking them is what makes the lease path
-    /// the only way to a leased board; this is what stops that being permanent.
+    /// Imported `/dev` nodes made over to an agent for the duration of a lease,
+    /// and the ownership to put back on release. Taking them over is what makes
+    /// a lease exclusive; this is what stops that being permanent.
     restore: BTreeMap<LeaseKey, Vec<BorrowedNode>>,
     /// The same two things, on disk, so a restarted daemon can undo its own
     /// work and only its own.
@@ -114,34 +129,6 @@ impl Materializer {
             active: BTreeMap::new(),
             restore: BTreeMap::new(),
             imported: BTreeMap::new(),
-        }
-    }
-
-    /// Complain at startup if the lease tree cannot carry device nodes.
-    ///
-    /// `mknod` succeeds on a `nodev` mount and the node is then unopenable, so
-    /// the symptom without this is every lease reporting success and every tool
-    /// the agent runs failing with `EACCES` on a node that looks perfectly
-    /// correct in `ls -l`. `/run` is `nosuid,nodev` on any systemd machine, so
-    /// this is the expected state of a deployment that has not been told.
-    pub async fn check_root(&self) {
-        let Ok(mountinfo) = tokio::fs::read_to_string("/proc/self/mountinfo").await else {
-            return;
-        };
-        let root = tokio::fs::canonicalize(&self.root)
-            .await
-            .unwrap_or_else(|_| self.root.clone());
-        let Some(options) = mount_options_for(&mountinfo, &root) else {
-            return;
-        };
-        if !honours_device_nodes(options) {
-            tracing::error!(
-                root = %self.root.display(), options,
-                "the lease tree is on a nodev filesystem: device nodes can be created \
-                 there but never opened, so every lease will hand the agent a node it \
-                 cannot use. Give the root its own tmpfs mounted `dev`, and bind it \
-                 into agent sandboxes in a way that keeps devices (`bwrap --dev-bind`)"
-            );
         }
     }
 
@@ -351,7 +338,7 @@ impl Materializer {
         let mut imported: BTreeMap<&benchd_core::wire::ChannelKey, (u32, u32)> = BTreeMap::new();
         for (slot, resources) in slots {
             for (name, handle) in resources {
-                // This process is root and about to create a device node at a
+                // This process is root and about to create a symlink at a
                 // path built from these names. They arrive from the
                 // coordinator, which validates them — but a privileged daemon
                 // that trusts its input has no business being privileged, so
@@ -433,11 +420,10 @@ impl Materializer {
 
     /// Give one imported device to the agent that leased it.
     ///
-    /// Two halves, and both are needed: a node under the lease directory that
-    /// only the agent's uid can open, and the imported node in `/dev` taken
-    /// away from everyone but root until the lease ends. The first without the
-    /// second would leave the board openable by anyone in the group udev gave
-    /// it, which is the whole population of `dialout` or `disk`.
+    /// Two halves: the imported node in `/dev` becomes the agent's alone, and
+    /// the lease path points at it. The ownership is the half that enforces
+    /// anything — the symlink is a stable, lease-scoped name for a node whose
+    /// kernel name is neither.
     async fn take_over(
         &mut self,
         lease: LeaseKey,
@@ -448,7 +434,7 @@ impl Materializer {
         let facts = node_facts(source)
             .await
             .ok_or_else(|| format!("{} is not a device node", source.display()))?;
-        make_node(&self.root, &facts, dest, uid).await?;
+        link_node(&self.root, source, dest).await?;
 
         let borrowed = self.restore.entry(lease).or_default();
         if needs_locking(borrowed, source) {
@@ -460,29 +446,39 @@ impl Materializer {
             };
             // Recorded before the change is made, not after: a crash in between
             // must leave a record that restores the original, never one that
-            // has forgotten a node it locked.
+            // has forgotten a node it took.
             self.restore
                 .entry(lease)
                 .or_default()
                 .push(borrowed.clone());
             self.ledger.record_node(lease, &borrowed).await;
-            if let Err(err) = lock_source(source).await {
-                // Not fatal: the agent has its node either way, and the usual
-                // cause is the device having just been unplugged, which the
-                // next open reports far better than a failed lease would.
-                tracing::warn!(path = %source.display(), ?err, "could not take the imported device away from the rest of the machine");
-            } else {
-                // Named so that grepping the journal for the /dev path an agent
-                // was refused says who took it and where the usable node is.
-                // The refusal itself happens in the kernel, with nothing of ours
-                // on the stack to report it, so this line is the only account of
-                // it that exists.
-                tracing::info!(
-                    %lease,
+            // Fatal, unlike the root-locking this replaced. Then the agent had
+            // its own node whatever happened here and the usual cause was a
+            // board unplugged a moment ago; now this *is* the agent's access,
+            // and a lease that reports success over a node its owner cannot
+            // open is the failure mode hardest to diagnose from the agent's
+            // side.
+            reserve_source(source, uid)
+                .await
+                .map_err(|e| format!("giving {} to its lease: {e}", source.display()))?;
+            match uid {
+                // Named so that grepping the journal for a /dev path says which
+                // lease holds it and where the agent's own name for it is. The
+                // refusal of anyone else happens in the kernel, with nothing of
+                // ours on the stack to report it, so this line is the only
+                // account of it that exists.
+                Some(uid) => tracing::info!(
+                    %lease, uid,
                     device = %source.display(),
                     node = %dest.display(),
-                    "reserved an imported device for its lease; reachable only at the lease path"
-                );
+                    "reserved an imported device for its lease"
+                ),
+                None => tracing::warn!(
+                    %lease,
+                    device = %source.display(),
+                    "no uid known for the session holding this lease: the device \
+                     stays root-only and the agent will not be able to open it"
+                ),
             }
         }
         Ok(())
@@ -576,77 +572,38 @@ fn needs_locking(borrowed: &[BorrowedNode], source: &Path) -> bool {
     !borrowed.iter().any(|node| node.path == source)
 }
 
-/// Create the agent's own device node for an imported device.
-async fn make_node(
-    root: &Path,
-    facts: &NodeFacts,
-    dest: &Path,
-    uid: Option<u32>,
-) -> Result<(), String> {
+/// Point the lease path at the imported device.
+///
+/// A symlink rather than a copy of the device address, so that everything
+/// resolving this path — the kernel, `udev`, pyserial's port list — arrives at
+/// the same `/dev` node the device would have if it were plugged in here. That
+/// is the whole point; see the module docs.
+async fn link_node(root: &Path, source: &Path, dest: &Path) -> Result<(), String> {
     let dest = resolved_dest(root, dest).await?;
-    // A lease directory can outlive the daemon that made it, and `mknod`
+    // A lease directory can outlive the daemon that made it, and `symlink`
     // refuses a path that exists.
     if let Err(err) = tokio::fs::remove_file(&dest).await {
         if err.kind() != std::io::ErrorKind::NotFound {
             return Err(format!("clearing {}: {err}", dest.display()));
         }
     }
-
-    let (major, minor) = major_minor(facts.rdev);
-    let output = tokio::process::Command::new("mknod")
-        .arg("--mode=0600")
-        .arg(&dest)
-        .arg(facts.kind)
-        .arg(major.to_string())
-        .arg(minor.to_string())
-        .output()
+    tokio::fs::symlink(source, &dest)
         .await
-        .map_err(|e| format!("failed to run mknod: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "mknod {} {} {major} {minor}: {}",
-            dest.display(),
-            facts.kind,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    // Pinned rather than trusted: `mknod`'s mode is a request, and the source
-    // node's own group and mode are deliberately *not* copied — that group is
-    // `dialout` or `disk`, and copying it would hand the board to everyone in
-    // it exactly as the bind mount used to.
-    set_mode(&dest, 0o600)
-        .await
-        .map_err(|e| format!("chmod {}: {e}", dest.display()))?;
-
-    // Without this the node is root's and the unprivileged agent cannot open
-    // the hardware it just leased — which fails the one promise the whole
-    // system makes.
-    match uid {
-        Some(uid) => chown(&dest, uid, 0)
-            .await
-            .map_err(|e| format!("giving {} to uid {uid}: {e}", dest.display()))?,
-        // Fails closed. The alternative — copying the source's group and mode
-        // so that group access happens to work — is the defect this is fixing.
-        None => tracing::warn!(
-            path = %dest.display(),
-            "no uid known for the session holding this lease: the node stays \
-             root-only and the agent will not be able to open it"
-        ),
-    }
-    Ok(())
+        .map_err(|e| format!("linking {} to {}: {e}", dest.display(), source.display()))
 }
 
-/// Where a resource's node really goes, with the whole path resolved.
+/// Where a resource's lease path really goes, with the whole path resolved.
 ///
 /// `Path::starts_with` compares unresolved components, so a symlink planted at
-/// any component of the destination passes it while root creates a device node
-/// somewhere else entirely. Every component is therefore created here, refused
-/// if it is anything but a real directory, and the result checked again after
-/// resolution — cheap, and the only version of this check that means anything.
+/// any component of the destination passes it while root creates the lease path
+/// somewhere else entirely — and root creating a symlink at an attacker-chosen
+/// path is a way to be pointed at a file the next `chown` then hands away.
+/// Every component is therefore created here, refused if it is anything but a
+/// real directory, and the result checked again after resolution.
 async fn resolved_dest(root: &Path, dest: &Path) -> Result<PathBuf, String> {
     let outside = || {
         format!(
-            "refusing to create a device node outside {}: {}",
+            "refusing to create a lease path outside {}: {}",
             root.display(),
             dest.display()
         )
@@ -668,7 +625,7 @@ async fn resolved_dest(root: &Path, dest: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("resolving {}: {e}", parent.display()))?;
     if !real_parent.starts_with(&real_root) {
         return Err(format!(
-            "refusing to create a device node outside {}: {} resolves to {}",
+            "refusing to create a lease path outside {}: {} resolves to {}",
             root.display(),
             dest.display(),
             real_parent.join(name).display()
@@ -722,18 +679,24 @@ async fn create_tree(root: &Path, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Take a leased device node away from everyone but root.
+/// Reserve an imported device node for the agent that leased it.
 ///
 /// The lease is exclusive over the bench, so for as long as it lasts nothing
-/// else on this machine has any business opening the imported node directly.
-/// The agent reaches it through the lease directory, and a second agent sharing
-/// the same uid does not reach it at all.
-async fn lock_source(source: &Path) -> std::io::Result<()> {
-    // Mode first: it closes group access while the node is still root's, so
-    // there is no instant at which it is both group-readable and owned by
-    // somebody new.
+/// else on this machine has any business opening this node — and the one thing
+/// that does have business with it is the agent, which is why the node becomes
+/// the agent's rather than root's.
+///
+/// Without a uid it is locked to root instead. That leaves the agent unable to
+/// open its own lease, which the caller reports; the alternative is leaving the
+/// source's `dialout` or `disk` group in place so that access happens to work,
+/// and handing a board to everyone in that group is the defect being fixed.
+async fn reserve_source(source: &Path, uid: Option<u32>) -> std::io::Result<()> {
+    // Mode first, and it is not merely tidiness: it closes group access while
+    // the node is still root's, so there is no instant at which the node is
+    // both group-readable and owned by somebody new. The source's own group is
+    // `dialout` or `disk`, so that instant would be the whole group's.
     set_mode(source, 0o600).await?;
-    chown(source, 0, 0).await
+    chown(source, uid.unwrap_or(0), 0).await
 }
 
 /// Put a borrowed device node back the way it was found.
@@ -767,12 +730,10 @@ async fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     tokio::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode)).await
 }
 
-/// What a device node is and where it points, as the kernel has it.
+/// The ownership a device node had before a lease took it, which is all that
+/// has to be remembered in order to give it back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NodeFacts {
-    /// `c` or `b`, the letter `mknod` takes.
-    kind: &'static str,
-    rdev: u64,
     uid: u32,
     gid: u32,
     mode: u32,
@@ -780,75 +741,25 @@ struct NodeFacts {
 
 async fn node_facts(path: &Path) -> Option<NodeFacts> {
     use std::os::unix::fs::MetadataExt;
-    // Not `metadata`: a source that is a symlink is not a device node worth
-    // copying, and following one would copy whatever it happens to point at.
+    // Not `metadata`: a source that is a symlink is not a device node, and
+    // following one would describe — and later hand out — whatever it happens
+    // to point at.
     let meta = tokio::fs::symlink_metadata(path).await.ok()?;
+    if !is_device_node(&meta) {
+        return None;
+    }
     Some(NodeFacts {
-        kind: node_kind(&meta)?,
-        rdev: meta.rdev(),
         uid: meta.uid(),
         gid: meta.gid(),
         mode: meta.mode() & 0o7777,
     })
 }
 
-/// The `mknod` type letter for a device node, and nothing for anything else.
-fn node_kind(meta: &std::fs::Metadata) -> Option<&'static str> {
+/// Whether the kernel would call this a device rather than a file.
+fn is_device_node(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::FileTypeExt;
     let kind = meta.file_type();
-    if kind.is_char_device() {
-        Some("c")
-    } else if kind.is_block_device() {
-        Some("b")
-    } else {
-        None
-    }
-}
-
-/// Split a `dev_t` into the major/minor pair `mknod` takes.
-///
-/// Linux packs them unevenly and not contiguously — 12 bits of major, 20 of
-/// minor, in four pieces — so this is glibc's `major`/`minor` rather than a
-/// shift by eight. It matters on exactly the machines this daemon runs on: a
-/// block device with a minor above 255 would otherwise produce a node
-/// addressing a different driver, silently.
-fn major_minor(rdev: u64) -> (u32, u32) {
-    let major = ((rdev >> 8) as u32 & 0xfff) | ((rdev >> 32) as u32 & !0xfff);
-    let minor = (rdev as u32 & 0xff) | ((rdev >> 12) as u32 & !0xff);
-    (major, minor)
-}
-
-/// The mount options of the filesystem a path is on, from `mountinfo` text.
-///
-/// Longest mount point wins, and the last line wins among equals: a dedicated
-/// tmpfs at `/run/benchd` overrides the `/run` line above it, and an
-/// over-mounted point overrides the one it hides.
-fn mount_options_for<'a>(mountinfo: &'a str, path: &Path) -> Option<&'a str> {
-    let mut best: Option<(usize, &'a str)> = None;
-    for line in mountinfo.lines() {
-        // `id parent major:minor root mount-point options ...`
-        let mut fields = line.split(' ').skip(4);
-        let (Some(point), Some(options)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        // Mount points with whitespace are octal-escaped in mountinfo, which
-        // this does not decode: a lease root with a space in it would simply
-        // find no line and go unchecked.
-        let point = Path::new(point);
-        if !path.starts_with(point) {
-            continue;
-        }
-        let depth = point.components().count();
-        if best.is_none_or(|(deepest, _)| depth >= deepest) {
-            best = Some((depth, options));
-        }
-    }
-    best.map(|(_, options)| options)
-}
-
-/// Whether a filesystem will let anything open a device node created on it.
-fn honours_device_nodes(options: &str) -> bool {
-    !options.split(',').any(|option| option == "nodev")
+    kind.is_char_device() || kind.is_block_device()
 }
 
 /// Remove a lease directory and everything in it.
@@ -1202,38 +1113,49 @@ mod tests {
         assert!(!benchd_core::model::valid_component(LEDGER_DIR));
     }
 
-    /// glibc's `makedev`, to build the values the kernel would report.
-    fn makedev(major: u64, minor: u64) -> u64 {
-        ((major & 0xfff) << 8) | (minor & 0xff) | ((major & !0xfff) << 32) | ((minor & !0xff) << 12)
-    }
-
     #[test]
-    fn a_device_number_splits_the_way_the_kernel_packed_it() {
-        // The ones this actually sees: a CDC-ACM tty, a usb-serial bridge, the
-        // SD-mux's block and SCSI generic nodes.
-        assert_eq!(major_minor(makedev(166, 0)), (166, 0));
-        assert_eq!(major_minor(makedev(188, 3)), (188, 3));
-        assert_eq!(major_minor(makedev(8, 0)), (8, 0));
-        assert_eq!(major_minor(makedev(21, 0)), (21, 0));
-
-        // And the ones that catch a naive `>> 8`: a minor above 255 spills into
-        // a second field, and a node built from the wrong halves addresses a
-        // different driver rather than failing.
-        assert_eq!(major_minor(makedev(8, 300)), (8, 300));
-        assert_eq!(major_minor(makedev(259, 1)), (259, 1));
-        assert_eq!(major_minor(makedev(0xfff, 0xfffff)), (0xfff, 0xfffff));
-    }
-
-    #[test]
-    fn a_regular_file_is_not_a_device_and_is_not_copied() {
+    fn a_regular_file_is_not_a_device_and_is_not_handed_over() {
         // The source always comes from `wait_for_vhci_node`, so this should be
-        // unreachable — but the thing being copied is a *device address*, and
-        // `mknod`ing one from something that is not a device would produce a
-        // node pointing at whatever driver happened to be at rdev 0.
+        // unreachable — but what follows a successful check here is `chown` to
+        // the agent, and doing that to something that is not a device is how a
+        // path traversal ends with an agent owning a file it named.
         let tree = TempTree::new("notadevice");
         let file = tree.path().join("console");
         std::fs::write(&file, b"").unwrap();
-        assert_eq!(node_kind(&std::fs::symlink_metadata(&file).unwrap()), None);
+        assert!(!is_device_node(&std::fs::symlink_metadata(&file).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn the_lease_path_resolves_to_the_imported_node_itself() {
+        // The property the whole scheme exists for. A tool that identifies a
+        // device by looking around the system — pyserial's port list, and so
+        // esptool's choice of reset sequence — only finds it if what the agent
+        // was handed leads back to the node udev knows about. A copy of the
+        // device address would open the same driver and still be invisible to
+        // every one of them.
+        let tree = TempTree::new("linked");
+        let root = tree.path().join("run");
+        let source = tree.path().join("ttyACM0");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&source, b"").unwrap();
+
+        let dest = root
+            .join("pi-4f2a")
+            .join("c0-l7")
+            .join("dut")
+            .join("console");
+        link_node(&root, &source, &dest).await.unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&dest).unwrap().is_symlink(),
+            "the lease path must be a link, not a node of its own"
+        );
+        assert_eq!(std::fs::read_link(&dest).unwrap(), source);
+
+        // Materialising twice must not trip over what the first one left, which
+        // happens for real whenever a lease outlives the daemon that made it.
+        link_node(&root, &source, &dest).await.unwrap();
+        assert_eq!(std::fs::read_link(&dest).unwrap(), source);
     }
 
     #[tokio::test]
@@ -1436,36 +1358,6 @@ mod tests {
         assert_eq!(found.ports, vec![3]);
         assert_eq!(found.nodes.len(), 1);
         assert_eq!(found.nodes[0].gid, 986);
-    }
-
-    /// A real `/proc/self/mountinfo`, trimmed.
-    const MOUNTINFO: &str = "\
-24 31 0:22 / /proc rw,nosuid,nodev,noexec,relatime shared:5 - proc proc rw
-29 31 0:26 / /run rw,nosuid,nodev,relatime shared:12 - tmpfs run rw,mode=755
-31 1 0:31 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw
-33 24 0:24 / /dev rw,nosuid,relatime shared:2 - devtmpfs dev rw,mode=755";
-
-    #[test]
-    fn a_lease_root_that_cannot_carry_device_nodes_is_recognised() {
-        // /run is nosuid,nodev on every systemd machine, and a device node on a
-        // nodev mount can be created and then never opened. Without noticing,
-        // the daemon reports every lease as materialised and the agent gets
-        // EACCES from a node that looks perfectly correct.
-        let run = mount_options_for(MOUNTINFO, Path::new("/run/benchd/pi-4f2a")).unwrap();
-        assert!(!honours_device_nodes(run), "{run}");
-        // The fix is a tmpfs of its own, mounted `dev`, and the deepest mount
-        // point has to win for that to be visible here.
-        let with_own_mount = format!(
-            "{MOUNTINFO}\n99 29 0:44 / /run/benchd rw,nosuid,relatime shared:99 - tmpfs benchd rw,mode=755"
-        );
-        let benchd = mount_options_for(&with_own_mount, Path::new("/run/benchd/pi-4f2a")).unwrap();
-        assert!(honours_device_nodes(benchd), "{benchd}");
-
-        // A root somewhere else entirely is judged by its own filesystem, not
-        // by a mount point that merely shares a prefix as a string.
-        let home = mount_options_for(MOUNTINFO, Path::new("/runners/benchd")).unwrap();
-        assert!(honours_device_nodes(home), "{home}");
-        assert!(mount_options_for("", Path::new("/run/benchd")).is_none());
     }
 
     #[tokio::test]
