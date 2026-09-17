@@ -1,62 +1,72 @@
 #!/usr/bin/env bash
-# Run a command with one agent's lease directory visible and no other's.
+# Run an agent in one filesystem/device sandbox.
 #
-# **This is an example, not a requirement.** benchd does not need it and does not
-# assume it ran. A bench's own boards are hidden by the host that owns them
-# (design decision D22): they are bound to the usbip stub and have no tty, so an
-# agent that ignores the skill and reaches for /dev/ttyUSB0 gets ENOENT there
-# whether or not it is sandboxed.
+# **This is an example, not a requirement.** benchd does not assume it ran. It
+# is useful when agents share a uid: each invocation gets only its identity's
+# leased devices, a read-only host filesystem, and a writable workspace.
 #
-# That is a fact about the *host*, though, and this script runs on the client.
-# A lease imports its device over USB/IP onto this machine, and the import
-# enumerates a real, fresh device node here — which the client daemon then makes
-# reachable by the agent holding the lease. Nothing the host does keeps a
-# *second* agent on this machine away from that node under its own /dev name,
-# and two agents sharing a uid is exactly the case this script exists to
-# separate. So it does two things:
+# A leased node cannot be reached from a *second* Linux sandbox. Codex, Cursor
+# and Copilot each build one, and its synthetic /dev either omits the node or
+# binds it nodev -- locked, because the mount is made in a user namespace. No
+# permission setting on either side changes that.
 #
-#   - a minimal /dev, so that a leased board is reachable only through the lease
-#     that granted it, by the agent it was granted to;
-#   - a bind of only the caller's own lease directory, because leases
-#     materialise under /run/benchd/<identity> and DAC alone cannot keep
-#     same-uid agents out of each other's.
+# What a harness can do is leave its sandbox for one command. Codex asks before
+# it does, and the benchd plugin answers: `benchd hook codex` approves a single
+# command naming a device this identity holds, and says nothing about anything
+# else. Its sandbox therefore stays on. Copilot deliberately admits no such
+# answer -- leaving its sandbox is always a question for a person -- so the
+# adapter below turns it off rather than prompting on every flash.
 #
-# *** THIS SCRIPT IS CURRENTLY BROKEN, AND KNOWINGLY SO. ***
+# An agent that left its own sandbox is still in this one: the host is
+# read-only and the workspace is the only thing it can write.
 #
-# D2 changed: a lease is no longer a private device node inside the lease
-# directory, it is a symlink to the imported device's own node in /dev, which is
-# made over to the leasing agent's uid. That is what lets tools identify the
-# device -- esptool picks its reset sequence by looking the path up in pyserial's
-# port list, which globs /dev, and a private node is in no such list.
+# The selected agent's state directory is writable so it can save sessions.
+# Commands the agent runs can consequently modify that directory too. The rest
+# of the host, including the rest of $HOME, is read-only. Use a separate Unix
+# account as well if agent credentials/configuration must be isolated.
 #
-# A symlink to /dev/ttyACM0 is resolved against whatever /dev the process can
-# see, and the whole point of the minimal /dev below is that it has no ttyACM0
-# in it. So inside this sandbox every lease path dangles and every open fails.
-#
-# The fix is a per-agent /dev -- one holding that agent's own leased nodes under
-# their kernel names, which would satisfy enumeration and same-uid isolation at
-# once -- and it is not written yet. Until it is, run agents without this script;
-# ownership on the imported node (0600 to the leasing uid) still separates
-# agents that have distinct uids, which is the common case. It is same-uid
-# agents that this script was the only answer for.
-#
-# Use whatever sandbox you prefer -- this one is bubblewrap. Adapt it, replace
-# it, or drop it.
+# The agent's benchd MCP configuration must inherit BENCHD_IDENTITY from this
+# launcher. Overriding it names a different device view outside the sandbox.
 #
 # Usage:
-#   benchd-sandbox [--identity NAME] [--root DIR] [--dev-allow PATH]... -- command [args...]
+#   benchd-sandbox [options] -- command [args...]
 #
-# Example:
-#   benchd-sandbox --identity pi-4f2a -- pi
+# Options:
+#   --identity NAME       Stable identity used by benchd (default: agent-PID)
+#   --workspace DIR       Writable workspace and initial directory (default: $PWD)
+#   --agent TYPE          auto, codex, cursor, copilot, or none (default: auto)
+#   --write PATH          Additional writable path (repeatable)
+#   --dev-allow PATH      Additional host device node (repeatable)
+#   --root DIR            Client runtime root (default: /run/benchd)
+#
+# Examples:
+#   benchd-sandbox --identity codex-1 -- codex
+#   benchd-sandbox --identity cursor-1 -- cursor-agent
+#   benchd-sandbox --identity copilot-1 -- copilot
 set -euo pipefail
+
+command -v bwrap >/dev/null || {
+  echo "benchd-sandbox: bubblewrap (bwrap) is not installed" >&2
+  exit 1
+}
+command -v socat >/dev/null || {
+  echo "benchd-sandbox: socat is not installed" >&2
+  exit 1
+}
 
 ROOT=/run/benchd
 IDENTITY=${BENCHD_IDENTITY:-}
+WORKSPACE=$PWD
+AGENT=auto
 DEV_ALLOW=()
+WRITABLE=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --identity)  IDENTITY=$2; shift 2 ;;
+    --workspace) WORKSPACE=$2; shift 2 ;;
+    --agent)     AGENT=$2; shift 2 ;;
+    --write)     WRITABLE+=("$2"); shift 2 ;;
     --root)      ROOT=$2; shift 2 ;;
     --dev-allow) DEV_ALLOW+=("$2"); shift 2 ;;
     --)          shift; break ;;
@@ -69,23 +79,7 @@ done
 
 [ $# -gt 0 ] || { echo "nothing to run; use: benchd-sandbox [opts] -- command" >&2; exit 2; }
 
-# Said here and not only in the header, because the symptom inside is a lease
-# path that exists, looks right in `ls -l`, and fails to open -- which reads as
-# a benchd bug rather than as this script being out of date with D2.
-cat >&2 <<'WARNING'
-benchd-sandbox: WARNING -- leases do not work inside this sandbox.
-
-  A lease path is now a symlink to the imported device's node in /dev, and the
-  minimal /dev this script creates does not contain it, so the link dangles and
-  every open fails. Fixing it needs a per-agent /dev, which is not written yet.
-
-  Run agents without this script for now. Node ownership still keeps agents with
-  distinct uids out of each other's boards; only same-uid agents lose anything.
-
-WARNING
-
-# A stable name per agent. Harnesses expose a session id, but it is usually a
-# full UUID and makes contention messages unreadable, so take a short prefix.
+# A stable name per agent. Harnesses can provide one through BENCHD_IDENTITY.
 if [ -z "$IDENTITY" ]; then
   if [ -n "${PI_SESSION_ID:-}" ]; then
     IDENTITY="pi-$(echo "$PI_SESSION_ID" | tr -cd '[:alnum:]' | cut -c1-8)"
@@ -93,9 +87,110 @@ if [ -z "$IDENTITY" ]; then
     IDENTITY="agent-$$"
   fi
 fi
-# Must match benchd's own sanitising, or the daemon will materialise somewhere
-# this sandbox cannot see.
-IDENTITY=$(echo "$IDENTITY" | tr -cd '[:alnum:]._-' | cut -c1-48)
+if [ ${#IDENTITY} -gt 64 ] || [ "$IDENTITY" = "." ] || [ "$IDENTITY" = ".." ] \
+  || [[ ! "$IDENTITY" =~ ^[[:alnum:]_.-]+$ ]]; then
+  echo "invalid identity: use 1-64 ASCII letters, digits, '.', '_' or '-'" >&2
+  exit 2
+fi
+
+WORKSPACE=$(realpath -e -- "$WORKSPACE") \
+  || { echo "--workspace does not exist: $WORKSPACE" >&2; exit 2; }
+[ -d "$WORKSPACE" ] || { echo "--workspace must be a directory: $WORKSPACE" >&2; exit 2; }
+
+case "$AGENT" in
+  auto)
+    case "$(basename -- "$1")" in
+      codex)        AGENT=codex ;;
+      cursor-agent) AGENT=cursor ;;
+      copilot)      AGENT=copilot ;;
+      *)            AGENT=none ;;
+    esac
+    ;;
+  codex|cursor|copilot|none) ;;
+  *) echo "unknown agent type: $AGENT" >&2; exit 2 ;;
+esac
+
+# A later, contradictory sandbox flag could recreate a synthetic /dev. Refuse
+# it instead of depending on each CLI's "first wins" / "last wins" behavior.
+case "$AGENT" in
+  codex)
+    # Nothing is taken away here. Escalating a single command out of Codex's
+    # sandbox is only offered under `on-request`, so ask for that policy when
+    # the caller has not chosen one -- with any other policy a command that
+    # needs the board fails and stays failed. Without the plugin installed the
+    # same escalation arrives as a prompt, which is a slow day rather than a
+    # broken one.
+    approval=
+    chose_sandbox=
+    for arg in "${@:2}"; do
+      case "$arg" in
+        -a|--ask-for-approval|--ask-for-approval=*|--approve-for-me|--full-auto \
+          |--yolo|--dangerously-bypass-approvals-and-sandbox)
+          approval=given
+          ;;
+        -s|--sandbox|--sandbox=*)
+          chose_sandbox=yes
+          ;;
+      esac
+    done
+    case "${2:-}" in
+      # A non-interactive run has nobody to ask, so Codex fixes the policy at
+      # "never" and there is no escalation to answer -- `--approve-for-me` is
+      # what puts the question back, and the hook then answers it before the
+      # reviewer it names ever runs. It refuses to sit beside an explicit
+      # sandbox choice, so a caller who made one has made this one too.
+      exec|e)
+        COMMAND=("$1" "$2")
+        [ -n "$approval" ] || [ -n "$chose_sandbox" ] || COMMAND+=(--approve-for-me)
+        COMMAND+=("${@:3}")
+        ;;
+      *)
+        COMMAND=("$1")
+        [ -n "$approval" ] || COMMAND+=(--ask-for-approval on-request)
+        COMMAND+=("${@:2}")
+        ;;
+    esac
+    STATE_DIR="${CODEX_HOME:-$HOME/.codex}"
+    ;;
+  cursor)
+    # No hook of Cursor's can hand a command the board: its shell hooks answer
+    # allow/deny/ask and nothing more, and its sandbox remaps the process to
+    # uid 0 in a user namespace, which a node owned by the agent's real uid at
+    # mode 0600 does not survive being visible to.
+    for arg in "${@:2}"; do
+      case "$arg" in
+        --sandbox|--sandbox=*)
+          echo "benchd-sandbox controls Cursor's --sandbox setting" >&2
+          exit 2
+          ;;
+      esac
+    done
+    COMMAND=("$1" --sandbox disabled "${@:2}")
+    STATE_DIR="$HOME/.cursor"
+    ;;
+  copilot)
+    # Copilot's sandbox has a per-command escape, but a hook cannot open it:
+    # for a request carrying `requestSandboxBypass`, only a `deny` propagates
+    # and an `allow` still falls through to the person at the keyboard. That is
+    # a deliberate choice on their side, and it leaves two options -- confirm
+    # every flash by hand, or run without the inner sandbox. Headless use
+    # decides it: `copilot -p` has nobody to ask.
+    for arg in "${@:2}"; do
+      case "$arg" in
+        --sandbox|--sandbox=*|--no-sandbox)
+          echo "benchd-sandbox controls Copilot's sandbox setting" >&2
+          exit 2
+          ;;
+      esac
+    done
+    COMMAND=("$1" --no-sandbox "${@:2}")
+    STATE_DIR="${COPILOT_HOME:-$HOME/.copilot}"
+    ;;
+  none)
+    COMMAND=("$@")
+    STATE_DIR=
+    ;;
+esac
 
 [ -d "$ROOT" ] || { echo "$ROOT does not exist; is the benchd client daemon running?" >&2; exit 1; }
 
@@ -105,16 +200,21 @@ IDENTITY=$(echo "$IDENTITY" | tr -cd '[:alnum:]._-' | cut -c1-48)
 # create the next lease, and root follows it.
 SOCK="$ROOT/agent.sock"
 [ -S "$SOCK" ] || { echo "$SOCK missing; is the benchd client daemon running?" >&2; exit 1; }
-OWNER=$(printf '{"msg":"prepare_owner","request":1,"name":"%s"}\n' "$IDENTITY" \
-  | timeout 5 socat - "UNIX-CONNECT:$SOCK" 2>/dev/null \
-  | sed -n 's/.*"path":"\([^"]*\)".*/\1/p' | head -1)
+READY=$(printf '{"msg":"prepare_owner","request":1,"name":"%s"}\n' "$IDENTITY" \
+  | timeout 5 socat - "UNIX-CONNECT:$SOCK" 2>/dev/null | head -1)
+OWNER=$(printf '%s\n' "$READY" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
+DEV=$(printf '%s\n' "$READY" | sed -n 's/.*"device_path":"\([^"]*\)".*/\1/p')
 if [ -z "$OWNER" ]; then
   echo "the benchd client daemon did not prepare a lease directory for $IDENTITY" >&2
   exit 1
 fi
+if [ -z "$DEV" ]; then
+  echo "the benchd client daemon is too old for sandbox device isolation; deploy this checkout first" >&2
+  exit 1
+fi
 
 if [ "${BENCHD_SANDBOX_VERBOSE:-}" = "1" ]; then
-  echo "benchd-sandbox: identity=$IDENTITY leases=$OWNER" >&2
+  echo "benchd-sandbox: identity=$IDENTITY leases=$OWNER devices=$DEV" >&2
 fi
 
 # Anything the site genuinely needs from the real /dev, named one device at a
@@ -127,18 +227,25 @@ for d in "${DEV_ALLOW[@]}"; do
   DEV_ARGS+=(--dev-bind "$d" "$d")
 done
 
-# --dev /dev: a fresh, minimal devtmpfs, not a bind of the host's.
+WRITE_ARGS=(--bind "$WORKSPACE" "$WORKSPACE")
+if [ -n "$STATE_DIR" ] && [ -d "$STATE_DIR" ]; then
+  WRITE_ARGS+=(--bind "$STATE_DIR" "$STATE_DIR")
+fi
+for path in "${WRITABLE[@]}"; do
+  resolved=$(realpath -e -- "$path") \
+    || { echo "--write does not exist: $path" >&2; exit 2; }
+  WRITE_ARGS+=(--bind "$resolved" "$resolved")
+done
+
+# --dev-bind DEV /dev: only this identity's basic and leased device nodes.
 #
-# Two properties matter and only the fresh mount has both. Nothing this machine
-# has now is visible — including /dev/bus/usb, which reaches an imported device
-# just as directly as its tty does. And nothing this machine gains *later*
-# becomes visible either: a lease granted to another agent while this sandbox is
-# running imports a device and enumerates a node for it, and through a bind of
-# /dev that node would appear in here too, under a name this agent can open.
-# There is nothing to re-check and no window to get right; the node simply is
-# not in this mount namespace.
+# The directory is on devtmpfs rather than /run (which is nodev), and the client
+# creates duplicate device nodes with the imported node's device number. Since
+# this is a directory bind, later nodes appear without restarting the sandbox.
 #
-# The devices this agent is entitled to arrive by the lease directory instead.
+# /dev/pts is the host devpts mount. Same-uid processes could already access one
+# another's PTYs; benchd-sandbox isolates bench hardware, not process terminals.
+# A private devpts mount would require a privileged helper inside the sandbox.
 #
 # --dev-bind for that directory, not --bind: bubblewrap adds MS_NODEV to a
 # plain --bind, and a device node that is an ordinary inode *in* the directory
@@ -166,7 +273,10 @@ done
 # hand back what the bind above just withheld.
 exec bwrap \
   --ro-bind / / \
-  --dev /dev \
+  "${WRITE_ARGS[@]}" \
+  --dev-bind "$DEV" /dev \
+  --dev-bind /dev/pts /dev/pts \
+  --tmpfs /dev/shm \
   "${DEV_ARGS[@]}" \
   --tmpfs "$ROOT" \
   --dev-bind "$OWNER" "$OWNER" \
@@ -174,8 +284,9 @@ exec bwrap \
   --unshare-pid \
   --proc /proc \
   --tmpfs /tmp \
-  --bind "${HOME}" "${HOME}" \
+  --chdir "$WORKSPACE" \
   --setenv BENCHD_IDENTITY "$IDENTITY" \
   --setenv BENCHD_LEASES "$OWNER" \
+  --setenv BENCHD_SANDBOX outer \
   --die-with-parent \
-  -- "$@"
+  -- "${COMMAND[@]}"

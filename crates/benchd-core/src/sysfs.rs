@@ -419,6 +419,52 @@ fn rhport_of(port: u32, status: &str) -> u32 {
     port % ports_per_hub(status)
 }
 
+/// The vhci `local_busid` for a port that is actually attached, e.g. `9-1`.
+///
+/// Used to read `urbnum` so the client can tell a lease whose device is
+/// transferring from one that is merely imported. A free port reports `0-0`
+/// and `VDEV_ST_NULL` (4); only `VDEV_ST_USED` (6) names a real device.
+pub fn vhci_local_busid(port: u32, status: &str) -> Option<&str> {
+    for line in status.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let (_hub, p, state, _spd, _dev, _sock, busid) = (
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+        );
+        if parse_padded(p) != Some(port) {
+            continue;
+        }
+        if parse_padded(state) != Some(6) || busid == "0-0" {
+            return None;
+        }
+        return Some(busid);
+    }
+    None
+}
+
+/// How many URBs the kernel has completed on this vhci port.
+///
+/// Increases when something is actually talking to the imported device, not
+/// merely because the port is attached. That is the client's signal that a
+/// lease is in use (D15).
+pub async fn vhci_urbnum(port: u32) -> Option<u64> {
+    let status = tokio::fs::read_to_string(format!("{VHCI}/status"))
+        .await
+        .ok()?;
+    let busid = vhci_local_busid(port, &status)?;
+    tokio::fs::read_to_string(format!("/sys/bus/usb/devices/{busid}/urbnum"))
+        .await
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Parse a zero-padded sysfs field such as `0008` or `004`.
 fn parse_padded(field: &str) -> Option<u32> {
     let trimmed = field.trim_start_matches('0');
@@ -498,7 +544,6 @@ pub async fn wait_for_vhci_node(
     want: WantedNode,
     timeout: std::time::Duration,
 ) -> Option<PathBuf> {
-    let super_speed = on_super_speed_hub(speed);
     let status = tokio::fs::read_to_string(format!("{VHCI}/status"))
         .await
         .unwrap_or_default();
@@ -506,10 +551,7 @@ pub async fn wait_for_vhci_node(
     let deadline = tokio::time::Instant::now() + timeout;
 
     while tokio::time::Instant::now() < deadline {
-        if let Some(bus) = vhci_bus(super_speed).await {
-            let device = PathBuf::from(VHCI)
-                .join(format!("usb{bus}"))
-                .join(format!("{bus}-{}", rhport + 1));
+        if let Some(device) = vhci_device_path(speed, rhport).await {
             if let Some(name) = node_under(&device, want).await {
                 // sysfs gains the node before udev creates it under /dev, so a
                 // name with nothing behind it yet just means "not ready"; the
@@ -525,6 +567,52 @@ pub async fn wait_for_vhci_node(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     None
+}
+
+/// Wait for the usbfs node of a freshly imported device.
+///
+/// Serial and storage resources have a named node of their own, but libusb
+/// tools such as OpenOCD open `/dev/bus/usb/BBB/DDD` instead. A sandbox must
+/// receive that node as well or a lease advertising JTAG loses JTAG the moment
+/// it is confined.
+pub async fn wait_for_vhci_usb_node(
+    port: u32,
+    speed: u32,
+    timeout: std::time::Duration,
+) -> Option<PathBuf> {
+    let status = tokio::fs::read_to_string(format!("{VHCI}/status"))
+        .await
+        .unwrap_or_default();
+    let rhport = rhport_of(port, &status);
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    while tokio::time::Instant::now() < deadline {
+        if let Some(device) = vhci_device_path(speed, rhport).await {
+            let (Ok(bus), Ok(dev)) = (
+                read_num(&device.join("busnum")).await,
+                read_num(&device.join("devnum")).await,
+            ) else {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            };
+            let path = PathBuf::from(format!("/dev/bus/usb/{bus:03}/{dev:03}"));
+            if tokio::fs::metadata(&path).await.is_ok() {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                return Some(path);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    None
+}
+
+async fn vhci_device_path(speed: u32, rhport: u32) -> Option<PathBuf> {
+    let bus = vhci_bus(on_super_speed_hub(speed)).await?;
+    Some(
+        PathBuf::from(VHCI)
+            .join(format!("usb{bus}"))
+            .join(format!("{bus}-{}", rhport + 1)),
+    )
 }
 
 /// The USB bus number of one of vhci's root hubs.
@@ -677,6 +765,7 @@ async fn class_node_under(device: &std::path::Path, class: &str) -> Option<std::
 mod tests {
     use super::{
         is_forwarded, node_under, on_super_speed_hub, parse_padded, ports_per_hub, rhport_of,
+        vhci_local_busid,
     };
     use crate::wire::WantedNode;
     use std::path::Path;
@@ -862,6 +951,18 @@ ss  0003 004 000 00000000 000000 0-0";
         assert!(on_super_speed_hub(5));
         assert!(on_super_speed_hub(6));
         assert!(!on_super_speed_hub(3));
+    }
+
+    #[test]
+    fn a_used_vhci_port_names_its_imported_device() {
+        assert_eq!(vhci_local_busid(0, STATUS), Some("9-1"));
+        assert_eq!(vhci_local_busid(1, STATUS), Some("9-2"));
+        assert_eq!(
+            vhci_local_busid(2, STATUS),
+            None,
+            "free ports are not in use"
+        );
+        assert_eq!(vhci_local_busid(8, STATUS), None);
     }
 
     #[test]

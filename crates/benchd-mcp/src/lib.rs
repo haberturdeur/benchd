@@ -9,7 +9,8 @@
 //!
 //! Unprivileged. One process per agent, because MCP over stdio is a pipe pair
 //! and the harness spawns the server (D8). All privilege lives in the client
-//! daemon on the other end of the unix socket.
+//! daemon on the other end of the unix socket. The socket is redialled when
+//! that daemon restarts; the stdio session is not.
 //!
 //! **stdout belongs to the transport.** Anything written there that is not
 //! JSON-RPC corrupts the session, which is why the dispatcher logs to stderr.

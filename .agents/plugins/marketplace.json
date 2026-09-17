@@ -1,0 +1,20 @@
+{
+  "name": "benchd",
+  "interface": {
+    "displayName": "benchd"
+  },
+  "plugins": [
+    {
+      "name": "benchd",
+      "source": {
+        "source": "local",
+        "path": "./plugins/benchd"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -18,7 +18,9 @@
 //! split is forced rather than chosen: MCP over stdio is one process per
 //! client, so a single daemon could not serve several agents.
 
+mod activity;
 mod agent;
+pub mod hook;
 mod ids;
 pub mod lease;
 mod materialize;
@@ -54,10 +56,13 @@ pub struct ClientArgs {
     )]
     coordinators: Vec<String>,
 
-    /// Where device nodes are materialised. Bind-mount `<root>/<owner>` into an
-    /// agent's sandbox and its leases appear and disappear live.
+    /// Where lease-scoped resource links are materialised.
     #[arg(long, default_value = "/run/benchd")]
     root: String,
+
+    /// Devtmpfs-backed root for per-agent device views used by benchd-sandbox.
+    #[arg(long, default_value = "/dev/benchd")]
+    device_root: String,
 
     /// Unix socket the per-agent MCP shims connect to.
     #[arg(long, default_value = "/run/benchd/agent.sock")]
@@ -263,7 +268,7 @@ pub async fn run(args: ClientArgs) -> Result<()> {
         tracing::info!(name = %c.name, address = %c.address, id = %c.id, "coordinator");
     }
 
-    let mut materializer = Materializer::new(root.clone(), coordinators.clone());
+    let mut materializer = Materializer::new(root.clone(), &args.device_root, coordinators.clone());
     // Nothing we materialised survives us in any meaningful sense: every
     // coordinator holds its own lease state and all of them have forgotten
     // everything (D6).
@@ -287,6 +292,11 @@ pub async fn run(args: ClientArgs) -> Result<()> {
                 tracing::error!(?err, "agent socket failed");
             }
         });
+    }
+
+    {
+        let shared = Arc::clone(&shared);
+        tokio::spawn(async move { activity::watch(shared).await });
     }
 
     // One reconnect loop per coordinator. They are independent authorities, so

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "benchd",
+  "version": "0.1.0",
+  "description": "Claim physical hardware before flashing, monitoring or testing on it. Bundles the benchd skill, the MCP server that hands out leases, and the hook that lets a command reach a leased board from inside a sandboxed harness.",
+  "keywords": ["hardware", "embedded", "esp32", "serial", "lab"],
+  "extensions": {
+    "com.openai": {
+      "hooks": "./hooks/codex.json"
+    }
+  }
+}

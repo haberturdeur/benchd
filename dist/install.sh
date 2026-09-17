@@ -58,6 +58,7 @@ if ! has_subcommands "$BIN"; then
 fi
 
 sudo install -m755 "$BIN" /usr/local/bin/
+sudo install -m755 dist/benchd-sandbox /usr/local/bin/
 
 # The check deploy.sh has always had, and this script never did. Four separate
 # debugging dead ends in this project were a stale binary in /usr/local/bin,
@@ -148,10 +149,7 @@ sudo systemctl daemon-reload
 echo
 echo "Installed. Now:"
 echo "  sudo systemctl enable --now benchd-coordinator benchd-clientd"
-for f in /etc/benchd/benches/*.toml; do
-  [ -e "$f" ] || continue
-  echo "  sudo systemctl enable --now benchd-host@$(basename "$f" .toml)"
-done
+echo "  sudo benchd update-benches"
 
 # Only worth saying on a machine that has actually configured a tunnel: the
 # unit names /usr/bin/ssh, and a missing client turns into a unit that fails

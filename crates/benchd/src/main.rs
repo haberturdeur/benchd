@@ -1,7 +1,7 @@
 //! `benchd` — every component, behind one command.
 //!
 //! The coordinator, the host, the client daemon, the MCP shim, the hand-held
-//! lease and the operator commands are one executable with six entry points.
+//! lease, bench-unit reconciliation and the operator commands are one executable.
 //! They were six binaries; a lab is several machines running different subsets
 //! of them, and keeping six versions in step across those machines is the part
 //! that goes wrong. One artefact cannot be half-upgraded.
@@ -16,7 +16,6 @@
 
 use std::process::ExitCode;
 
-use benchd_core::wire::DEFAULT_PORT;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -28,14 +27,13 @@ use clap::{Parser, Subcommand};
     arg_required_else_help = true
 )]
 struct Args {
-    /// Which coordinator the operator commands should ask.
+    /// Restrict an operator command to one coordinator.
     ///
-    /// Only `benches`, `leases` and `release` read this. The daemons take their
-    /// own `--coordinator`, after the subcommand, because a host dialling one
-    /// and an operator inspecting one are different questions that happen to
-    /// share a word.
-    #[arg(long, default_value_t = format!("127.0.0.1:{DEFAULT_PORT}"), env = "BENCHD_COORDINATOR")]
-    coordinator: String,
+    /// Without this, `benches` asks the local client daemon and shows all of its
+    /// connected coordinators. `leases` and `release` default to the local
+    /// coordinator. Daemons take their own `--coordinator` after the subcommand.
+    #[arg(long, env = "BENCHD_COORDINATOR")]
+    coordinator: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -57,6 +55,12 @@ enum Command {
 
     /// Hold a bench by hand.
     Lease(benchd_client::lease::LeaseArgs),
+
+    /// Enable hosts for configured hardware that is connected; disable the rest.
+    UpdateBenches(benchd_host::update::UpdateArgs),
+
+    /// Answer an agent harness's lifecycle hook. Installed by the benchd plugin.
+    Hook(benchd_client::hook::HookArgs),
 
     /// `benches`, `leases`, `release` — flattened in, so they read as the
     /// top-level commands they have always been.
@@ -97,7 +101,12 @@ async fn main() -> ExitCode {
         Command::Host(_) => logging("benchd_host=info,benchd_core=info"),
         Command::Client(_) => logging("benchd_client=info,benchd_core=info"),
         Command::Mcp(_) => logging("benchd_mcp=info"),
-        Command::Lease(_) | Command::Operator(_) => {}
+        Command::Lease(_)
+        | Command::UpdateBenches(_)
+        | Command::Operator(_)
+        // A hook's stdout is a decision the harness parses, and its stderr is
+        // shown to whoever is watching. Neither is a place for log lines.
+        | Command::Hook(_) => {}
     }
 
     let result = match args.command {
@@ -105,8 +114,10 @@ async fn main() -> ExitCode {
         Command::Host(args) => benchd_host::run(args).await,
         Command::Client(args) => benchd_client::run(args).await,
         Command::Mcp(args) => benchd_mcp::run(args).await,
+        Command::UpdateBenches(args) => benchd_host::update::run(args).await,
+        Command::Hook(args) => benchd_client::hook::run(args).await,
         Command::Operator(command) => {
-            benchd_coordinator::operator::run(&args.coordinator, command).await
+            benchd_coordinator::operator::run(args.coordinator.as_deref(), command).await
         }
 
         // The only subcommand with an exit status of its own: it reports

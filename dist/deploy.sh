@@ -77,6 +77,7 @@ BIN="${TARGET_DIR:-${CARGO_TARGET_DIR:-target}}/release/benchd"
 [ -x "$BIN" ] || { echo "cargo built no $BIN" >&2; exit 1; }
 
 sudo install -m755 "$BIN" /usr/local/bin/
+sudo install -m755 dist/benchd-sandbox /usr/local/bin/
 
 a=$(sha256sum "$BIN" | cut -d' ' -f1)
 c=$(sha256sum /usr/local/bin/benchd  | cut -d' ' -f1)

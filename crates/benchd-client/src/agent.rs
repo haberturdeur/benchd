@@ -20,8 +20,10 @@ use std::time::Duration;
 use crate::ids::{CoordinatorId, LeaseKey, SessionKey};
 use anyhow::Result;
 use benchd_core::lease::SessionId;
-use benchd_core::wire::{ClientMsg, RequestId, SessionToken, ToClient};
-use futures::{SinkExt, StreamExt};
+use benchd_core::wire::{
+    ClientMsg, CoordinatorInventory, OperatorMsg, RequestId, SessionToken, ToClient, ToOperator,
+};
+use futures::{future::join_all, SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
@@ -214,11 +216,12 @@ impl Fanout {
 /// Who a request was issued for.
 ///
 /// The daemon asks things on its own account — re-registration after a
-/// reconnect, and the `CloseSession` that follows a disconnect — and those
-/// replies are not an agent's to see. `RequestId(0)` used to stand in for
-/// "mine", but zero is a perfectly legal id for an agent to pick, so an agent
-/// with a request outstanding under it swallowed the daemon's re-registration
-/// reply. A variant cannot be collided with.
+/// reconnect, the `CloseSession` that follows a disconnect, and a `Renew`
+/// triggered by device traffic — and those replies are not an agent's to
+/// swallow. `RequestId(0)` used to stand in for "mine", but zero is a perfectly
+/// legal id for an agent to pick, so an agent with a request outstanding under
+/// it swallowed the daemon's re-registration reply. A variant cannot be
+/// collided with.
 #[derive(Clone, Copy, PartialEq)]
 enum Origin {
     Agent(RequestId),
@@ -233,6 +236,9 @@ struct Pending {
     /// Set for `OpenSession`. A request that needs a session waits for one of
     /// these instead of writing the coordinator off as absent.
     opening_session: bool,
+    /// Set when this is a traffic-triggered `Renew`, so the reply can update
+    /// the hold without being forwarded as an agent's answer.
+    auto_lease: Option<LeaseKey>,
 }
 
 #[derive(Default)]
@@ -253,12 +259,42 @@ struct Inner {
     claims: BTreeMap<(u64, u64), ClaimAttempt>,
     /// Which agent holds a lease, so events reach the right one.
     lease_owner: BTreeMap<LeaseKey, u64>,
+    /// When each lease expires and how it has been sliding, for activity renew.
+    holds: BTreeMap<LeaseKey, Hold>,
     /// Session -> directory component, for materialisation paths.
     owners: BTreeMap<SessionKey, String>,
     /// Session -> the uid that should own its device nodes.
     uids: BTreeMap<SessionKey, u32>,
     next_agent: u64,
     next_request: u64,
+}
+
+/// Enough to decide whether device traffic should slide a lease forward.
+struct Hold {
+    expires_at: u64,
+    extra: u64,
+    last_urbs: Option<u64>,
+    in_flight: bool,
+}
+
+fn note_expiry(inner: &mut Inner, lease: LeaseKey, expires_at: u64) {
+    let extra = expires_at
+        .saturating_sub(crate::activity::unix_now())
+        .max(1);
+    inner
+        .holds
+        .entry(lease)
+        .and_modify(|hold| {
+            hold.expires_at = expires_at;
+            hold.extra = extra;
+            hold.in_flight = false;
+        })
+        .or_insert(Hold {
+            expires_at,
+            extra,
+            last_urbs: None,
+            in_flight: false,
+        });
 }
 
 impl Agents {
@@ -390,9 +426,76 @@ impl Agents {
                 origin,
                 to,
                 opening_session,
+                auto_lease: None,
             },
         );
         ours
+    }
+
+    pub(crate) async fn track_auto_renew(&self, agent: u64, lease: LeaseKey) -> RequestId {
+        let ours = self
+            .track(agent, Origin::Daemon, lease.coordinator, false)
+            .await;
+        let mut inner = self.inner.lock().await;
+        if let Some(pending) = inner.pending.get_mut(&ours.0) {
+            pending.auto_lease = Some(lease);
+        }
+        ours
+    }
+
+    async fn attach_lease(&self, request: RequestId, lease: LeaseKey) {
+        let mut inner = self.inner.lock().await;
+        if let Some(pending) = inner.pending.get_mut(&request.0) {
+            pending.auto_lease = Some(lease);
+        }
+    }
+
+    pub(crate) async fn holder_of(&self, lease: LeaseKey) -> Option<u64> {
+        self.inner.lock().await.lease_owner.get(&lease).copied()
+    }
+
+    pub(crate) async fn due_extensions(
+        &self,
+        urbs: &BTreeMap<LeaseKey, u64>,
+        now: u64,
+    ) -> Vec<(LeaseKey, SessionToken, u64)> {
+        let mut inner = self.inner.lock().await;
+        let mut due = Vec::new();
+        let mut candidates = Vec::new();
+        for (lease, hold) in inner.holds.iter_mut() {
+            let Some(&count) = urbs.get(lease) else {
+                continue;
+            };
+            let grew = hold.last_urbs.is_some_and(|prev| count > prev);
+            hold.last_urbs = Some(count);
+            if crate::activity::should_extend(
+                now,
+                hold.expires_at,
+                hold.extra,
+                grew,
+                hold.in_flight,
+            ) {
+                candidates.push((*lease, hold.extra));
+            }
+        }
+        for (lease, extra) in candidates {
+            let Some(agent_id) = inner.lease_owner.get(&lease) else {
+                continue;
+            };
+            let Some(session) = inner
+                .agents
+                .get(agent_id)
+                .and_then(|agent| agent.sessions.get(&lease.coordinator))
+                .cloned()
+            else {
+                continue;
+            };
+            if let Some(hold) = inner.holds.get_mut(&lease) {
+                hold.in_flight = true;
+            }
+            due.push((lease, session, extra));
+        }
+        due
     }
 
     /// Drop an agent and everything keyed by it, returning the sessions that
@@ -420,7 +523,16 @@ impl Agents {
         inner.fanout.retain(|(a, _), _| *a != agent_id);
         inner.claims.retain(|(a, _), _| *a != agent_id);
         inner.pending.retain(|_, p| p.agent != agent_id);
-        inner.lease_owner.retain(|_, a| *a != agent_id);
+        let gone: Vec<_> = inner
+            .lease_owner
+            .iter()
+            .filter(|(_, a)| **a == agent_id)
+            .map(|(k, _)| *k)
+            .collect();
+        for lease in gone {
+            inner.holds.remove(&lease);
+            inner.lease_owner.remove(&lease);
+        }
         agent.sessions
     }
 
@@ -475,7 +587,8 @@ impl Agents {
             | ToClient::Granted { request, .. }
             | ToClient::Renewed { request, .. }
             | ToClient::Status { request, .. }
-            | ToClient::Tags { request, .. } => request.0,
+            | ToClient::Tags { request, .. }
+            | ToClient::Inventory { request, .. } => request.0,
             _ => return None,
         };
 
@@ -504,6 +617,32 @@ impl Agents {
                                        there was re-registered."
                         }),
                     );
+                }
+                if let (Some(lease), ToClient::Renewed { expires_at, .. }) =
+                    (pending.auto_lease, &msg)
+                {
+                    note_expiry(&mut inner, lease, *expires_at);
+                    send_event(
+                        &inner,
+                        agent_id,
+                        serde_json::json!({
+                            "msg": "renewed",
+                            "lease": lease.to_public(),
+                            "expires_at": expires_at,
+                            "reason": "device in use",
+                        }),
+                    );
+                }
+                if let (Some(lease), ToClient::Error { error, .. }) = (pending.auto_lease, &msg) {
+                    if let Some(hold) = inner.holds.get_mut(&lease) {
+                        hold.in_flight = false;
+                        if error.contains("maximum total hold")
+                            || error.contains("revoked by an operator")
+                        {
+                            hold.extra = 0;
+                        }
+                    }
+                    tracing::warn!(%lease, error, "activity renew refused");
                 }
                 self.registered.notify_waiters();
                 return None;
@@ -540,10 +679,18 @@ impl Agents {
                 record_session(&mut inner, agent_id, from, session, *id);
                 self.registered.notify_waiters();
             }
-            ToClient::Granted { lease, .. } => {
+            ToClient::Granted {
+                lease, expires_at, ..
+            } => {
                 inner
                     .lease_owner
                     .insert(LeaseKey::new(from, *lease), agent_id);
+                note_expiry(&mut inner, LeaseKey::new(from, *lease), *expires_at);
+            }
+            ToClient::Renewed { expires_at, .. } => {
+                if let Some(lease) = pending.auto_lease {
+                    note_expiry(&mut inner, lease, *expires_at);
+                }
             }
             _ => {}
         }
@@ -682,7 +829,9 @@ impl Agents {
             }),
         )
         .await;
-        self.inner.lock().await.lease_owner.remove(&lease);
+        let mut inner = self.inner.lock().await;
+        inner.lease_owner.remove(&lease);
+        inner.holds.remove(&lease);
     }
 
     async fn notify(&self, lease: LeaseKey, msg: serde_json::Value) {
@@ -767,6 +916,7 @@ impl Agents {
         inner
             .lease_owner
             .retain(|k, _| k.coordinator != coordinator);
+        inner.holds.retain(|k, _| k.coordinator != coordinator);
         inner.owners.retain(|k, _| k.coordinator != coordinator);
         inner.uids.retain(|k, _| k.coordinator != coordinator);
         for agent in inner.agents.values_mut() {
@@ -964,6 +1114,7 @@ fn next_claim_target(inner: &mut Inner, agent_id: u64, theirs: RequestId) -> Opt
                 origin: Origin::Agent(theirs),
                 to: next,
                 opening_session: false,
+                auto_lease: None,
             },
         );
         return Some(ClaimRetry {
@@ -1034,6 +1185,10 @@ fn with_request(msg: ToClient, request: RequestId) -> ToClient {
         },
         Status { leases, .. } => Status { request, leases },
         Tags { tags, .. } => Tags { request, tags },
+        Inventory { coordinators, .. } => Inventory {
+            request,
+            coordinators,
+        },
         other => other,
     }
 }
@@ -1121,25 +1276,123 @@ async fn serve_agent(shared: Arc<Shared>, socket: tokio::net::UnixStream) -> Res
     Ok(())
 }
 
+/// Ask every coordinator whose executor link is live for its operator view.
+///
+/// A fresh connection is intentional. The long-lived connection identifies as
+/// a client on its first message and cannot then switch protocol roles to send
+/// an [`OperatorMsg`]. Keeping the result grouped also matters: two independent
+/// authorities may both have a bench or lease numbered the same.
+async fn inspect_connected(shared: &Shared) -> Result<Vec<CoordinatorInventory>, String> {
+    let live = shared.live_links().await;
+    if live.is_empty() {
+        return Err("no coordinator is reachable".into());
+    }
+
+    let coordinators: Vec<_> = shared
+        .coordinators
+        .iter()
+        .filter(|coordinator| live.contains(&coordinator.id))
+        .collect();
+    join_all(coordinators.into_iter().map(inspect_coordinator))
+        .await
+        .into_iter()
+        .collect()
+}
+
+async fn inspect_coordinator(
+    coordinator: &crate::Coordinator,
+) -> Result<CoordinatorInventory, String> {
+    let socket = tokio::net::TcpStream::connect(&coordinator.address)
+        .await
+        .map_err(|err| {
+            format!(
+                "could not inspect coordinator {} at {}: {err}",
+                coordinator.name, coordinator.address
+            )
+        })?;
+    socket.set_nodelay(true).ok();
+    let (read, write) = socket.into_split();
+    let mut lines = FramedRead::new(read, LinesCodec::new());
+    let mut sink = FramedWrite::new(write, LinesCodec::new());
+    sink.send(
+        serde_json::to_string(&OperatorMsg::Inspect)
+            .map_err(|err| format!("could not encode inspection request: {err}"))?,
+    )
+    .await
+    .map_err(|err| format!("could not ask coordinator {}: {err}", coordinator.name))?;
+
+    let line = tokio::time::timeout(Duration::from_secs(10), lines.next())
+        .await
+        .map_err(|_| format!("coordinator {} did not reply within 10s", coordinator.name))?
+        .ok_or_else(|| format!("coordinator {} closed the connection", coordinator.name))?
+        .map_err(|err| format!("could not read coordinator {}: {err}", coordinator.name))?;
+    let reply: ToOperator = serde_json::from_str(&line).map_err(|err| {
+        format!(
+            "could not understand coordinator {}'s reply: {err}",
+            coordinator.name
+        )
+    })?;
+    match reply {
+        ToOperator::State { benches, leases } => Ok(CoordinatorInventory {
+            name: coordinator.name.clone(),
+            local: coordinator.name == "local",
+            benches,
+            leases,
+        }),
+        ToOperator::Error { error } => Err(format!("coordinator {}: {error}", coordinator.name)),
+        other => Err(format!(
+            "coordinator {} sent an unexpected reply: {other:?}",
+            coordinator.name
+        )),
+    }
+}
+
 async fn forward(shared: &Arc<Shared>, agent_id: u64, msg: ClientMsg) {
     // Handled locally: no coordinator knows where this machine puts device
     // nodes, and the caller is a sandbox launcher rather than an agent.
     if let ClientMsg::PrepareOwner { request, name } = &msg {
-        let dir = shared.root.join(owner_dir(SessionId(0), name));
-        let reply = match std::fs::create_dir_all(&dir).and_then(|_| {
-            // Root-owned and not writable by the agent: the whole point is that
-            // the agent cannot plant symlinks where root will later create
-            // lease directories.
-            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        }) {
-            Ok(()) => ToClient::OwnerReady {
+        // PrepareOwner runs before the caller has a coordinator session id.
+        // Reject a name that owner_dir would have to rewrite: materialisation
+        // later uses the real session id as its fallback, and the two paths
+        // would otherwise differ (for example s0 here versus s7 later).
+        let prepared = if benchd_core::model::valid_component(name) {
+            shared
+                .materializer
+                .lock()
+                .await
+                .prepare_owner(&owner_dir(SessionId(0), name))
+                .await
+        } else {
+            Err("invalid sandbox identity".to_owned())
+        };
+        let reply = match prepared {
+            Ok((dir, devices)) => ToClient::OwnerReady {
                 request: *request,
                 path: dir.display().to_string(),
+                device_path: devices.display().to_string(),
             },
-            Err(err) => ToClient::Error {
+            Err(error) => ToClient::Error {
                 request: *request,
-                error: format!("could not prepare {}: {err}", dir.display()),
+                error,
                 retryable: false,
+            },
+        };
+        send_to_agent(shared, agent_id, &reply).await;
+        return;
+    }
+
+    // Operator discovery is also local. The daemon is the only process that
+    // knows every configured coordinator and which links are currently alive.
+    if let ClientMsg::Inspect { request } = &msg {
+        let reply = match inspect_connected(shared).await {
+            Ok(coordinators) => ToClient::Inventory {
+                request: *request,
+                coordinators,
+            },
+            Err(error) => ToClient::Error {
+                request: *request,
+                error,
+                retryable: true,
             },
         };
         send_to_agent(shared, agent_id, &reply).await;
@@ -1381,6 +1634,7 @@ async fn route_by_lease(
         .agents
         .track(agent_id, Origin::Agent(theirs), key.coordinator, false)
         .await;
+    shared.agents.attach_lease(ours, key).await;
     shared
         .send(key.coordinator, &build(ours, session, key.lease))
         .await;
@@ -1490,6 +1744,7 @@ fn request_of(msg: &ClientMsg) -> RequestId {
         | ClientMsg::Release { request, .. }
         | ClientMsg::Status { request, .. }
         | ClientMsg::TagList { request }
+        | ClientMsg::Inspect { request }
         | ClientMsg::PrepareOwner { request, .. }
         | ClientMsg::Done { request, .. } => *request,
         ClientMsg::Heartbeat => RequestId(0),
@@ -2090,6 +2345,7 @@ mod tests {
         assert!(inner.fanout.is_empty(), "fanout");
         assert!(inner.pending.is_empty(), "pending");
         assert!(inner.lease_owner.is_empty(), "lease_owner");
+        assert!(inner.holds.is_empty(), "holds");
     }
 
     #[tokio::test(flavor = "multi_thread")]

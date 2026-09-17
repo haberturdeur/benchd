@@ -286,6 +286,66 @@ fn registration(id: &str) -> String {
     )
 }
 
+#[test]
+#[ignore = "spawns daemons"]
+fn benches_combines_the_clients_coordinators_and_marks_only_local_benches() {
+    let local = Harness::start("benches-local");
+    let lab = Harness::start("benches-lab");
+
+    let mut local_host = Peer::connect(&local);
+    local_host.send(&registration("on-this-machine"));
+    assert!(local_host.recv().contains("\"msg\":\"registered\""));
+
+    let mut lab_host = Peer::connect(&lab);
+    lab_host.send(&registration("across-the-tunnel"));
+    assert!(lab_host.recv().contains("\"msg\":\"registered\""));
+
+    let dir = tempdir::TempDir::new("benches-client").expect("temp dir");
+    let socket = dir.path().join("agent.sock");
+    let root = dir.path().join("leases");
+    let mut client = Command::new(binary())
+        .arg("client")
+        .arg("--coordinator")
+        .arg(format!("local=127.0.0.1:{}", local.port))
+        .arg("--coordinator")
+        .arg(format!("lab=127.0.0.1:{}", lab.port))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--root")
+        .arg(&root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn client");
+
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(socket.exists(), "client never opened its socket");
+
+    let output = Command::new(binary())
+        .arg("benches")
+        .arg("--socket")
+        .arg(&socket)
+        .output()
+        .expect("run benches");
+    let _ = client.kill();
+    let _ = client.wait();
+
+    assert!(
+        output.status.success(),
+        "benchd benches failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 output");
+    assert!(stdout.contains("on-this-machine [local]"), "{stdout}");
+    assert!(stdout.contains("across-the-tunnel"), "{stdout}");
+    assert!(!stdout.contains("across-the-tunnel [local]"), "{stdout}");
+}
+
 /// The `request` an instruction carries, so a reply can be correlated the way
 /// a real executor correlates it.
 fn request_of(line: &str) -> u64 {

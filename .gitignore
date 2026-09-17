@@ -5,6 +5,13 @@ target/
 .vscode/
 .idea/
 
+# ...with one exception, which is project state: the marketplace entry that
+# points Codex at plugins/benchd. A personal ~/.gitignore ignoring .agents/ is
+# common enough that leaving this to chance means shipping the plugin with no
+# way to install it.
+!.agents/
+!.agents/**
+
 # Python prototype leftovers (the prototype lives in git history only)
 __pycache__/
 *.py[cod]

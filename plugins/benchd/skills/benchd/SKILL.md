@@ -69,7 +69,10 @@ needs those waits. Only list a capability if your test would fail without it.
 
 **`ttl_seconds` is required, and you should mean it.** Estimate the work and add
 a little. Too short is cheap to fix (`renew`); too long idles hardware someone
-else is waiting for. Long soaks are fine — just renew as you go.
+else is waiting for. Long soaks are fine — just renew as you go. If you are
+actually talking to the board (flash, monitor output, JTAG), the client extends
+the lease on that traffic, still capped by the lab's total-hold budget. Idle
+thinking does not extend it.
 
 **`reason` is read by humans and other agents** when they are waiting for your
 board. One short line: what you are testing.
@@ -167,14 +170,42 @@ Wait roughly that long, then try again. Do not spin.
 
 ## When a device stops working
 
-If a device path gives **`ENOENT` or `EIO` mid-use, your lease ended.** The board
-is fine. Do not power-cycle it, do not re-plug anything, do not investigate the
-hardware. Claim again — and if the work needs longer, ask for a bigger `ttl_seconds`
-this time.
+If a path that **was working** gives `ENOENT` or `EIO` mid-use, your lease ended.
+The board is fine. Do not power-cycle it, do not re-plug anything, do not
+investigate the hardware. Claim again — and if the work needs longer, ask for a
+bigger `ttl_seconds` this time.
+
+If it never worked in the first place, read the next section instead. A path that
+is missing or refused on the *first* touch is a different problem with an opposite
+fix, and the errno does not tell them apart.
 
 You may also get a **revoking** notice before that happens: the grace window has
 started and the device is about to go away. Either finish and `release`, or call
 `renew` if you still need it.
+
+## The path was never reachable, from the first command
+
+`No such file or directory` or `Permission denied` on the path `claim` just gave
+you, before anything had worked: the lease is fine and so is the board. Your own
+harness ran that command inside a sandbox it built, and a leased device cannot be
+reached from in there — it is hidden or it arrives on a mount that forbids
+devices, and nothing you can set from inside changes either.
+
+**Do not go looking for the board somewhere else.** Not in `/dev`, not under
+another lease id, not by resolving the path. There is nothing wrong to find, and
+the node you would find that way is not yours.
+
+Run the same command again, escalated out of your sandbox, saying which board it
+is for. Where this is set up, a command naming a device you currently hold is
+approved on sight, so it costs one retry and no one is interrupted. Where it is
+not, a person is asked once and the answer is the same.
+
+Escalating that way leaves your harness's sandbox, not the machine's: the host
+filesystem stays read-only and your workspace is still the only thing you can
+write. So escalate the one command that talks to the board rather than the
+session — a single command naming the leased path is the shape that is
+recognised. Chain something else onto it with `;` or `&&` and it stops being
+recognised, because the rest of the line is not about the board.
 
 ## Rules
 

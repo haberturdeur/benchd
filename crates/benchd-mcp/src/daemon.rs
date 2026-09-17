@@ -1,22 +1,37 @@
 //! Talking to the local client daemon.
 //!
-//! One connection per agent, request/response with unsolicited events mixed in.
-//! The daemon holds the session token and substitutes it, so this process never
-//! handles one — which means a shim cannot present another agent's.
+//! One logical connection per agent, request/response with unsolicited events
+//! mixed in. The daemon holds the session token and substitutes it, so this
+//! process never handles one — which means a shim cannot present another
+//! agent's.
+//!
+//! The unix socket is a link, not the agent's lifetime. Stdio is. When the
+//! client daemon restarts the socket vanishes and comes back; this redials,
+//! opens a fresh session under the same name, and retries in-flight calls.
+//! Leases still die with the daemon (D6). Tools do not.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use benchd_core::wire::{ClaimSpec, ClientMsg, RequestId};
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
+const FIRST_WAIT: Duration = Duration::from_secs(30);
+const CALL_WAIT: Duration = Duration::from_secs(30);
+const RETRY_MIN: Duration = Duration::from_millis(50);
+const RETRY_MAX: Duration = Duration::from_secs(2);
+
 pub struct Daemon {
-    tx: mpsc::UnboundedSender<String>,
+    socket: String,
+    name: String,
+    tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
+    up: Notify,
     pending: Arc<Mutex<BTreeMap<u64, oneshot::Sender<Value>>>>,
     /// Paths arrive *after* a grant, once the device nodes actually exist, so a
     /// claim waits for a second message keyed by lease id.
@@ -26,16 +41,70 @@ pub struct Daemon {
 
 impl Daemon {
     pub async fn connect(socket: &str, name: &str) -> Result<Arc<Self>> {
-        let stream = tokio::net::UnixStream::connect(socket)
-            .await
-            .with_context(|| {
-                format!("failed to connect to the benchd client daemon at {socket}")
-            })?;
+        let daemon = Arc::new(Daemon {
+            socket: socket.to_string(),
+            name: name.to_string(),
+            tx: Mutex::new(None),
+            up: Notify::new(),
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            paths: Arc::new(Mutex::new(BTreeMap::new())),
+            next: AtomicU64::new(1),
+        });
+        {
+            let daemon = Arc::clone(&daemon);
+            tokio::spawn(async move { daemon.pump().await });
+        }
+        daemon.wait_until_up(FIRST_WAIT).await.with_context(|| {
+            format!("failed to connect to the benchd client daemon at {socket}")
+        })?;
+        Ok(daemon)
+    }
+
+    async fn wait_until_up(&self, budget: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if self.tx.lock().await.is_some() {
+                return Ok(());
+            }
+            if tokio::time::timeout_at(deadline, self.up.notified())
+                .await
+                .is_err()
+            {
+                return Err(anyhow!("the benchd client daemon did not come up in time"));
+            }
+        }
+    }
+
+    async fn pump(&self) {
+        let mut delay = RETRY_MIN;
+        loop {
+            match self.try_link().await {
+                Ok(()) => {
+                    delay = RETRY_MIN;
+                    tokio::time::sleep(RETRY_MIN).await;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        socket = %self.socket,
+                        error = format!("{err:#}"),
+                        "client daemon unreachable; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(RETRY_MAX);
+                }
+            }
+        }
+    }
+
+    /// Drive one socket until it dies. `Ok` means it was up and then closed;
+    /// `Err` means it never registered.
+    async fn try_link(&self) -> Result<()> {
+        let stream = tokio::net::UnixStream::connect(&self.socket).await?;
         let (read, write) = stream.into_split();
+        let mut sink = FramedWrite::new(write, LinesCodec::new());
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
         tokio::spawn(async move {
-            let mut sink = FramedWrite::new(write, LinesCodec::new());
             while let Some(line) = rx.recv().await {
                 if sink.send(line).await.is_err() {
                     break;
@@ -43,147 +112,203 @@ impl Daemon {
             }
         });
 
-        let daemon = Arc::new(Daemon {
-            tx,
-            pending: Arc::new(Mutex::new(BTreeMap::new())),
-            paths: Arc::new(Mutex::new(BTreeMap::new())),
-            next: AtomicU64::new(1),
-        });
-
+        let (dead_tx, dead_rx) = oneshot::channel();
         {
-            let daemon = Arc::clone(&daemon);
+            let mut lines = FramedRead::new(read, LinesCodec::new());
+            let pending = Arc::clone(&self.pending);
+            let paths = Arc::clone(&self.paths);
             tokio::spawn(async move {
-                let mut lines = FramedRead::new(read, LinesCodec::new());
                 while let Some(Ok(line)) = lines.next().await {
                     let Ok(value) = serde_json::from_str::<Value>(&line) else {
                         continue;
                     };
-                    daemon.dispatch(value).await;
+                    dispatch(&pending, &paths, value).await;
                 }
-                tracing::warn!("client daemon closed the connection");
+                let _ = dead_tx.send(());
             });
         }
 
-        // Registration is a request for a token and always succeeds; there is
-        // no authentication (D19).
-        daemon
-            .request(ClientMsg::OpenSession {
+        self.call_on(
+            &tx,
+            ClientMsg::OpenSession {
                 request: RequestId(0),
-                name: name.into(),
-            })
-            .await?;
-        Ok(daemon)
+                name: self.name.clone(),
+            },
+        )
+        .await?;
+        *self.tx.lock().await = Some(tx);
+        self.up.notify_waiters();
+        tracing::info!(socket = %self.socket, "connected to the client daemon");
+
+        let _ = dead_rx.await;
+        *self.tx.lock().await = None;
+        self.fail_inflight().await;
+        tracing::warn!("client daemon closed the connection; reconnecting");
+        Ok(())
     }
 
-    async fn dispatch(&self, value: Value) {
-        let kind = value.get("msg").and_then(Value::as_str).unwrap_or("");
-
-        // `paths` completes a claim; `failed` aborts one. Both resolve the same
-        // waiter, so a claim that cannot be set up returns a reason immediately
-        // instead of stalling until the timeout.
-        if kind == "paths" || kind == "failed" {
-            if let Some(lease) = value.get("lease").and_then(Value::as_u64) {
-                if let Some(tx) = self.paths.lock().await.remove(&lease) {
-                    let _ = tx.send(value);
-                }
-            }
-            return;
-        }
-
-        if let Some(id) = value.get("request").and_then(Value::as_u64) {
-            if let Some(tx) = self.pending.lock().await.remove(&id) {
-                let _ = tx.send(value);
-                return;
-            }
-        }
-
-        // Unsolicited: revoking, ended, disconnected, or a session_opened from
-        // the daemon re-registering us after a coordinator restart. Nothing to
-        // correlate; log it so an agent whose device vanished can find out why
-        // from the shim's stderr.
-        tracing::info!(%value, "event");
+    async fn fail_inflight(&self) {
+        self.pending.lock().await.clear();
+        self.paths.lock().await.clear();
     }
 
-    async fn request(&self, mut msg: ClientMsg) -> Result<Value> {
+    async fn call_on(
+        &self,
+        tx: &mpsc::UnboundedSender<String>,
+        mut msg: ClientMsg,
+    ) -> Result<Value> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         set_request(&mut msg, RequestId(id));
 
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
-        self.tx
-            .send(serde_json::to_string(&msg)?)
+        let (otx, orx) = oneshot::channel();
+        self.pending.lock().await.insert(id, otx);
+        tx.send(serde_json::to_string(&msg)?)
             .map_err(|_| anyhow!("the benchd client daemon is not reachable"))?;
 
-        let value = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+        let value = tokio::time::timeout(CALL_WAIT, orx)
             .await
             .map_err(|_| anyhow!("the coordinator did not answer in time"))?
             .map_err(|_| anyhow!("the benchd client daemon closed the connection"))?;
+        decode_reply(value)
+    }
 
-        if value.get("msg").and_then(Value::as_str) == Some("error") {
-            let detail = value
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            // The retryable flag is the machine-readable form of
-            // unsatisfiable-versus-contended; surface it in the text so the
-            // agent sees it too (D14).
-            let retryable = value
-                .get("retryable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            return Err(anyhow!(
-                "{detail}{}",
-                if retryable {
-                    "\n\n(the hardware exists but is busy — waiting and retrying will work)"
-                } else {
-                    "\n\n(this request cannot succeed as written — change it rather than retrying)"
+    async fn request(&self, msg: ClientMsg) -> Result<Value> {
+        let deadline = tokio::time::Instant::now() + CALL_WAIT;
+        loop {
+            let tx = loop {
+                if let Some(tx) = self.tx.lock().await.clone() {
+                    break tx;
                 }
-            ));
+                if tokio::time::timeout_at(deadline, self.up.notified())
+                    .await
+                    .is_err()
+                {
+                    return Err(anyhow!("the benchd client daemon is not reachable"));
+                }
+            };
+            match self.call_on(&tx, msg.clone()).await {
+                Ok(value) => return Ok(value),
+                Err(err) if is_link_error(&err) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(err);
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
         }
-        Ok(value)
     }
 
     pub async fn claim(&self, claim: ClaimSpec) -> Result<Value> {
-        let granted = self
-            .request(ClientMsg::Claim {
-                request: RequestId(0),
-                session: benchd_core::wire::SessionToken(String::new()),
-                claim,
-            })
-            .await?;
+        let deadline = tokio::time::Instant::now() + CALL_WAIT + CALL_WAIT;
+        loop {
+            let granted = self
+                .request(ClientMsg::Claim {
+                    request: RequestId(0),
+                    session: benchd_core::wire::SessionToken(String::new()),
+                    claim: claim.clone(),
+                })
+                .await?;
 
-        let lease = granted.get("lease").and_then(Value::as_u64).unwrap_or(0);
-        let (tx, rx) = oneshot::channel();
-        self.paths.lock().await.insert(lease, tx);
+            let lease = granted.get("lease").and_then(Value::as_u64).unwrap_or(0);
+            let (tx, rx) = oneshot::channel();
+            self.paths.lock().await.insert(lease, tx);
 
-        // A grant is not useful until the device nodes exist; waiting here means
-        // the agent's first sight of the lease already includes usable paths.
-        let paths = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
-            .await
-            .map_err(|_| anyhow!("the devices were granted but never appeared"))?
-            .map_err(|_| anyhow!("the benchd client daemon closed the connection"))?;
-
-        if paths.get("msg").and_then(Value::as_str) == Some("failed") {
-            let detail = paths
-                .get("detail")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            return Err(anyhow!(
-                "the claim could not be set up and has been released: {detail}\n\n\
-                 (nothing is held; the bench is free for another attempt)"
-            ));
+            // A grant is not useful until the device nodes exist; waiting here
+            // means the agent's first sight of the lease already includes
+            // usable paths.
+            match tokio::time::timeout_at(deadline, rx).await {
+                Ok(Ok(paths)) => {
+                    if paths.get("msg").and_then(Value::as_str) == Some("failed") {
+                        let detail = paths
+                            .get("detail")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        return Err(anyhow!(
+                            "the claim could not be set up and has been released: {detail}\n\n\
+                             (nothing is held; the bench is free for another attempt)"
+                        ));
+                    }
+                    let mut out = granted;
+                    if let Some(slots) = paths.get("slots") {
+                        out["slots"] = slots.clone();
+                    }
+                    return Ok(out);
+                }
+                Ok(Err(_)) if tokio::time::Instant::now() < deadline => continue,
+                Ok(Err(_)) | Err(_) => {
+                    return Err(anyhow!("the devices were granted but never appeared"));
+                }
+            }
         }
-
-        let mut out = granted;
-        if let Some(slots) = paths.get("slots") {
-            out["slots"] = slots.clone();
-        }
-        Ok(out)
     }
 
     pub async fn simple(&self, msg: ClientMsg) -> Result<Value> {
         self.request(msg).await
     }
+}
+
+async fn dispatch(
+    pending: &Mutex<BTreeMap<u64, oneshot::Sender<Value>>>,
+    paths: &Mutex<BTreeMap<u64, oneshot::Sender<Value>>>,
+    value: Value,
+) {
+    let kind = value.get("msg").and_then(Value::as_str).unwrap_or("");
+
+    // `paths` completes a claim; `failed` aborts one. Both resolve the same
+    // waiter, so a claim that cannot be set up returns a reason immediately
+    // instead of stalling until the timeout.
+    if kind == "paths" || kind == "failed" {
+        if let Some(lease) = value.get("lease").and_then(Value::as_u64) {
+            if let Some(tx) = paths.lock().await.remove(&lease) {
+                let _ = tx.send(value);
+            }
+        }
+        return;
+    }
+
+    if let Some(id) = value.get("request").and_then(Value::as_u64) {
+        if let Some(tx) = pending.lock().await.remove(&id) {
+            let _ = tx.send(value);
+            return;
+        }
+    }
+
+    // Unsolicited: revoking, ended, disconnected, or a session_opened from
+    // the daemon re-registering us after a coordinator restart. Nothing to
+    // correlate; log it so an agent whose device vanished can find out why
+    // from the shim's stderr.
+    tracing::info!(%value, "event");
+}
+
+fn is_link_error(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    text.contains("not reachable") || text.contains("closed the connection")
+}
+
+fn decode_reply(value: Value) -> Result<Value> {
+    if value.get("msg").and_then(Value::as_str) == Some("error") {
+        let detail = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        // The retryable flag is the machine-readable form of
+        // unsatisfiable-versus-contended; surface it in the text so the
+        // agent sees it too (D14).
+        let retryable = value
+            .get("retryable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return Err(anyhow!(
+            "{detail}{}",
+            if retryable {
+                "\n\n(the hardware exists but is busy — waiting and retrying will work)"
+            } else {
+                "\n\n(this request cannot succeed as written — change it rather than retrying)"
+            }
+        ));
+    }
+    Ok(value)
 }
 
 fn set_request(msg: &mut ClientMsg, id: RequestId) {
@@ -196,8 +321,125 @@ fn set_request(msg: &mut ClientMsg, id: RequestId) {
         | Release { request, .. }
         | Status { request, .. }
         | TagList { request }
+        | Inspect { request }
         | PrepareOwner { request, .. }
         | Done { request, .. } => *request = id,
         Heartbeat => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use benchd_core::lease::SessionId;
+    use benchd_core::wire::{SessionToken, TagInfo, ToClient};
+    use tokio::net::UnixListener;
+
+    fn socket_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "benchd-mcp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    async fn speak(stream: tokio::net::UnixStream) {
+        let (read, write) = stream.into_split();
+        let mut lines = FramedRead::new(read, LinesCodec::new());
+        let mut sink = FramedWrite::new(write, LinesCodec::new());
+        while let Some(Ok(line)) = lines.next().await {
+            let Ok(msg) = serde_json::from_str::<ClientMsg>(&line) else {
+                continue;
+            };
+            let reply = match msg {
+                ClientMsg::OpenSession { request, .. } => ToClient::SessionOpened {
+                    request,
+                    session: SessionToken("s".into()),
+                    id: SessionId(1),
+                },
+                ClientMsg::TagList { request } => ToClient::Tags {
+                    request,
+                    tags: vec![TagInfo {
+                        tag: "soc=esp32s3".into(),
+                        benches: 1,
+                        free: 1,
+                        description: String::new(),
+                    }],
+                },
+                other => ToClient::Ok {
+                    request: match other {
+                        ClientMsg::Heartbeat => RequestId(0),
+                        ClientMsg::OpenSession { request, .. }
+                        | ClientMsg::CloseSession { request, .. }
+                        | ClientMsg::Claim { request, .. }
+                        | ClientMsg::Renew { request, .. }
+                        | ClientMsg::Release { request, .. }
+                        | ClientMsg::Status { request, .. }
+                        | ClientMsg::TagList { request }
+                        | ClientMsg::Inspect { request }
+                        | ClientMsg::PrepareOwner { request, .. }
+                        | ClientMsg::Done { request, .. } => request,
+                    },
+                },
+            };
+            let Ok(line) = serde_json::to_string(&reply) else {
+                continue;
+            };
+            if sink.send(line).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    async fn listen(path: &std::path::Path) -> UnixListener {
+        let _ = std::fs::remove_file(path);
+        UnixListener::bind(path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_shim_redials_after_the_client_daemon_restarts() {
+        let path = socket_path();
+        let listener = listen(&path).await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            speak(stream).await;
+        });
+
+        let daemon = Daemon::connect(path.to_str().unwrap(), "cursor")
+            .await
+            .unwrap();
+        let first = daemon
+            .simple(ClientMsg::TagList {
+                request: RequestId(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(first["tags"][0]["tag"], "soc=esp32s3");
+
+        server.abort();
+        let _ = server.await;
+
+        let listener = listen(&path).await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            speak(stream).await;
+        });
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(3),
+            daemon.simple(ClientMsg::TagList {
+                request: RequestId(0),
+            }),
+        )
+        .await
+        .expect("the shim should have redialled")
+        .unwrap();
+        assert_eq!(second["tags"][0]["tag"], "soc=esp32s3");
+
+        server.abort();
+        let _ = std::fs::remove_file(&path);
     }
 }

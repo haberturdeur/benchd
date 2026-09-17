@@ -512,11 +512,11 @@ async fn handle_client(
 
     match msg {
         ClientMsg::Heartbeat => Vec::new(),
-        // Handled by the client daemon; it must never reach here.
-        ClientMsg::PrepareOwner { request, .. } => {
+        // Handled by the client daemon; they must never reach here.
+        ClientMsg::PrepareOwner { request, .. } | ClientMsg::Inspect { request } => {
             out.send(&ToClient::Error {
                 request,
-                error: "PrepareOwner is a client-daemon request".into(),
+                error: "this is a client-daemon request".into(),
                 retryable: false,
             });
             Vec::new()

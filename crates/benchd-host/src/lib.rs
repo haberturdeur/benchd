@@ -15,6 +15,7 @@
 
 mod export;
 mod hide;
+pub mod update;
 
 use std::collections::BTreeMap;
 use std::path::Path;

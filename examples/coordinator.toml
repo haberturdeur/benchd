@@ -44,6 +44,10 @@ implies = ["family=esp32", "arch=xtensa", "net=wifi", "net=bt"]
 [tags.soc.values.esp32c3]
 description = "ESP32-C3, RISC-V single core"
 implies = ["family=esp32", "arch=riscv", "net=wifi", "net=bt"]
+[tags.soc.values.esp32p4]
+description = "ESP32-P4, RISC-V high-performance"
+# No radios on the P4 itself; kits that add an ESP32-C5/C6 declare net= on the bench.
+implies = ["family=esp32", "arch=riscv"]
 
 [tags.family]
 description = "SoC family (implied by soc=, rarely set directly)"
@@ -79,6 +83,8 @@ description = "External PSRAM fitted"
 description = "Quad-SPI PSRAM"
 [tags.psram.values.octal]
 description = "Octal-SPI PSRAM"
+[tags.psram.values.hex]
+description = "Hex (16-line) PSRAM, as on ESP32-P4"
 
 [tags.flash]
 description = "Flash size"

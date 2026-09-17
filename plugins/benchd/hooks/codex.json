@@ -1,0 +1,18 @@
+{
+  "description": "Answers the approval Codex raises when a command it sandboxed was denied. `benchd hook codex` approves exactly one case -- a single command naming a device this agent currently holds -- and stays silent on everything else, which leaves the normal prompt in place. Approving drops Codex's own sandbox for that command only; it still runs inside benchd-sandbox, so it gains the board rather than the machine.",
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/benchd hook codex",
+            "timeout": 5,
+            "statusMessage": "Checking for leased hardware"
+          }
+        ]
+      }
+    ]
+  }
+}

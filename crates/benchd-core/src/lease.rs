@@ -459,9 +459,10 @@ impl LeaseManager {
         })
     }
 
-    /// Extend a lease. Explicit by design: an automatic keepalive would
-    /// recreate the never-expiring hold this system exists to remove, whereas
-    /// an explicit call proves the agent is alive *and* still working (D15).
+    /// Extend a lease. A heartbeat keepalive would recreate the never-expiring
+    /// hold this system exists to remove. Traffic on the leased device is a
+    /// different proof — the holder is still working — and the client may send
+    /// this same call when it sees that (D15).
     ///
     /// Renewing a lease already `Revoking` because it **expired** cancels the
     /// revocation, which lets an agent that notices the warning rescue its

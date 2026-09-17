@@ -453,6 +453,12 @@ privilege lives in the daemon.
 (`rmcp` supports it) but pushes per-agent identity into a header the harness must set,
 which is more fragile than a process boundary that already exists.
 
+*The shim outlives the daemon.* Stdio is the agent's lifetime; the unix socket is a
+link. When `benchd client` restarts the socket is gone for a few seconds, then a new
+daemon binds it. The shim redials, opens a fresh session under the same name, and
+retries the call that was in flight. Leases still die with the old daemon (D6) — there
+is nothing to restore — but the agent does not have to be restarted to claim again.
+
 ### D20. A bench names a position, and records what should be in it
 
 A serial resource is named by its `/dev/serial/by-path` entry, and optionally
@@ -541,6 +547,14 @@ is never broadcast: two coordinators satisfying it at once would hold hardware n
 asked for. Failures merge by D14's rule — retryable if *any* coordinator is merely
 contended, unsatisfiable only when they all agree.
 
+**Operators see the same whole.** `benchd benches` asks the local client daemon, because
+that is the one process which knows every configured coordinator and which links are
+currently alive. It combines their inventories and marks benches from the coordinator
+explicitly named `local` as `[local]`; remote benches need no mark. `--coordinator`
+remains an escape hatch for inspecting one authority directly. The old default spoke
+straight to `127.0.0.1:4711`, so a healthy client connected to the desk and the lab still
+printed only the desk — a partial picture presented as the whole one.
+
 **Exactly one answer per request, and never a merged view that hides a gap.** The
 single-lab illusion is built in the client daemon, which is also where it can break, so
 the property is stated as an invariant: no request may be answered twice, none may go
@@ -593,12 +607,58 @@ needs no policy to stay correct.
 from an agent's `/dev`. With nothing to hide it has no job left, and benchd no longer
 requires one to function. Separating two agents that share a uid on one client machine is
 a different problem, and one the operator should solve with whatever sandbox they prefer
-rather than one this project mandates. `dist/benchd-sandbox` remains as a worked example
-— and is at present a *broken* one, because D2 now hands out a symlink into `/dev` and
-that script's whole method is to give the agent a `/dev` without the device in it. The
-repair is a per-agent `/dev` holding that agent's own leased nodes under their kernel
-names, which would serve enumeration and same-uid isolation at once; it is not written.
-Agents with distinct uids are unaffected, being separated by the node's ownership.
+rather than one this project mandates. `dist/benchd-sandbox` is a worked example: the
+client maintains a devtmpfs-backed `/dev` per identity and reproduces only that owner's
+leased nodes under their kernel names. Mounting that directory as the sandbox's `/dev`
+serves enumeration and same-uid isolation at once. It is also the filesystem sandbox:
+the host is read-only, with write access restored for the workspace and selected
+agent's state. Agents with distinct uids are unaffected, being separated by the source
+node's ownership.
+
+*One mount namespace, not nested sandboxes:* Codex, Cursor and Copilot can each create
+an inner Linux sandbox. Bubblewrap supplies that child with a synthetic `/dev`; adding
+the outer private `/dev` as a normal writable path either omits its device nodes or
+binds them with `MS_NODEV`, at which point `open(2)` fails with `EACCES`. Mount flags
+locked by a user namespace cannot be relaxed by a child. So a leased node is reachable
+only from a command that is *not* inside a second sandbox — which is a question of
+which commands run there, not of permissions granted to any of them.
+
+*The inner sandbox is left on where the harness can be asked to step out of it.* A
+plugin cannot change the above: every harness builds its mount namespace before
+plugin code loads, and none exposes the construction. What two of them do expose is a
+per-command escape, and that is the seam benchd uses. Codex retries a command denied
+by its sandbox with no sandbox at all, after an approval its `PermissionRequest` hook
+may answer; `benchd hook codex` answers it for a single command naming a device the
+identity currently holds, and abstains on everything else, which leaves every other
+approval exactly where it was. Copilot's equivalent escape is reserved to a human by
+design — for a request carrying `requestSandboxBypass` a hook's `deny` propagates and
+its `allow` does not — so the launcher disables that inner sandbox instead, since
+`copilot -p` has nobody to prompt.
+
+Escalation is bounded by the outer sandbox rather than by the hook: a command that
+leaves Codex's sandbox is still on a read-only host with one writable workspace. That
+bound is what makes answering automatically defensible; without `benchd-sandbox`
+around it the hook is approving an ordinary unsandboxed command, and an operator who
+wants that should say so in their approval policy rather than install this.
+
+Cursor offers no such seam at all. Its `beforeShellExecution` hook is handed a
+`sandbox` boolean alongside the command — so it can see which side a command will run
+on — but its only reply is `allow`, `deny` or `ask`, none of which moves the command
+across that line, and `sandbox.json` grants filesystem paths rather than device nodes.
+Its sandbox also remaps the process to uid 0 in a user namespace, so a leased node
+chowned to the agent's real uid at mode 0600 would be unopenable there even if it were
+visible. Two independent reasons, and its adapter disables the inner sandbox as before.
+
+This is an adapter boundary, not an agent-specific benchd protocol. An unknown CLI
+must either run with `--agent none` and no inner mount sandbox, or supply an
+equivalent adapter.
+
+*What the harness must be started with.* Escalation exists only under an approval
+policy that admits it: `on-request` interactively, and `--approve-for-me` for
+`codex exec`, which otherwise fixes the policy at `never` and leaves a blocked
+command blocked. The launcher supplies whichever applies unless the caller chose a
+policy themselves. A harness started without one still runs — the board is simply
+out of reach, which is a legible failure rather than a silent one.
 
 *Cost, accepted:* an unleased board is unusable on its own host without going through
 benchd, and `benchd host` now needs root even for a bench that never leaves the machine.
@@ -657,6 +717,16 @@ refused.
 
 *Why host-declared:* config belongs next to the hardware. Adding a board is a
 single-machine operation with no central file to keep in sync.
+
+**Config is not activation.** `/etc/benchd/benches` may describe hardware that is
+normally unplugged. `sudo benchd update-benches` reconciles host units to the intersection
+of those files and boards that actually registered with the local coordinator. It starts
+unrepresented configs briefly so connected hardware can prove itself, enables those that
+register, and stops/disables both absent hardware and units whose config disappeared.
+Registration is the liveness oracle because a running host deliberately hides its own USB
+device: rechecking `/dev/serial/by-path` would classify every healthy managed bench as
+absent. Existing registered hosts are never restarted, so reconciling does not disturb
+their leases.
 
 *Why central vocabulary:* if hosts also defined tags, the closed vocabulary stops being
 closed and rots into `esp32-s3`/`esp32s3`/`s3` per machine — the exact failure D10
@@ -902,8 +972,15 @@ max_benches    = 2        # concurrent benches per session
 *Why explicit TTL:* naming a duration forces the agent to scope the work, and gives
 requested-vs-used telemetry to tune the limits from data rather than guesswork.
 
-*Why not auto-keepalive:* it recreates the never-expiring hold we're eliminating. An
-explicit renew is a liveness proof — alive *and* still working.
+*Why not auto-keepalive from heartbeats:* it recreates the never-expiring hold we're
+eliminating. A client daemon that is still connected says nothing about whether the
+agent is still working.
+
+*Device traffic is a different proof.* USB transfers on an imported lease mean
+something is actually talking to the board. The client daemon then sends the same
+`Renew` the agent would, so `max_total_hold` and operator revoke still apply. A claim
+that never opens the device still expires at its TTL. Continuous use slides the window
+forward once less than half the last grant remains.
 
 *Why no classes:* an earlier draft had agent/human/ci tiers with different ceilings and
 rights. That is a permission system, and a permission system needs identity to mean
@@ -948,12 +1025,13 @@ harness gives it, and it was never the set of programs on the machine.
 agent has. It is a *presentation* of the agent surface — a terminal instead of MCP — and
 so is bound by D17 rather than an exception to it.
 
-*What it is not is an operator command that happens to be spelled differently.* They
-talk to different things: `benchd benches` speaks to a coordinator over TCP and answers
-"what exists, who has it, take it back", whereas claiming goes through the local client
-daemon, because the point of a claim is device nodes appearing on *this* machine. D26
-put them behind one command anyway, and the distinction survives it intact, because it
-was always about what each one can ask for and never about how it is invoked.
+*What it is not is an operator command that happens to be spelled differently.* Operator
+commands answer "what exists, who has it, take it back"; claiming asks for capabilities
+and cannot name a bench. `benchd benches` now goes through the local client daemon too,
+because only it can combine several connected coordinators, while `leases` and `release`
+still address one authority directly. D26 put them behind one command anyway, and the
+distinction survives it intact, because it was always about what each one can ask for and
+never about how it is invoked.
 
 *Why the process is the lease:* the socket connection is the session, so quitting,
 crashing, or closing the terminal returns the hardware immediately. It is the same
@@ -962,8 +1040,9 @@ failure — walking away — cost nothing.
 
 *The TTL stays mandatory (D15) but the CLI supplies a default*, because a person at a
 terminal is not the runaway that limit is for; here it is the backstop for a death that
-takes the socket with it silently. Auto-renew is still refused: a holder who wants
-longer says so.
+takes the socket with it silently. Sitting idle at a prompt still does not auto-renew.
+USB traffic on the leased device does, the same way an agent's flash does (D15): the
+client sends an ordinary `Renew`, capped by `max_total_hold`.
 
 ### D18. Rust, TOML, workspace
 
@@ -993,16 +1072,16 @@ benchd              the dispatcher; the only crate that produces a binary
 
 With no `.proto` (D5) the wire messages are just `serde` types and live in core, which
 already depends on serde for config. Core stays free of tokio so its property test stays
-millisecond-scale. The two hand-operated surfaces live in the crate whose daemon they
-talk to — the operator commands with the coordinator, `lease` with the client — because
-each is a thin front end over that daemon's protocol and shares its types.
+millisecond-scale. Hand-operated subcommands live with the component whose state they
+act on — operator inspection with the coordinator, `lease` with the client, and
+`update-benches` with the host.
 
 ### D26. One binary, a subcommand per component
 
 Every component ships as `benchd <subcommand>`: `coordinator`, `host`, `client`, `mcp`,
-`lease`, and the operator commands `benches` / `leases` / `release`. Each is still its
-own crate, and `crates/benchd` is a dispatcher that owns exactly two things they must
-not each decide: the tokio runtime, and that logs go to stderr.
+`lease`, `update-benches`, and the operator commands `benches` / `leases` / `release`.
+Each is still its own crate, and `crates/benchd` is a dispatcher that owns exactly two
+things they must not each decide: the tokio runtime, and that logs go to stderr.
 
 *Why:* a lab is several machines running different subsets of the components, and six
 binaries meant six versions to keep in step across them. Every stale-binary dead end
@@ -1081,9 +1160,8 @@ lease.
 > nothing able to resolve it.
 
 **Client** — `benchd client`, one privileged daemon per agent machine, holding the
-coordinator connection. Materialises and revokes; renews only on explicit agent call;
-its unit mounts a `dev`-permitting tmpfs over the lease tree, since `/run` is `nodev`
-everywhere and D2 needs real nodes. `benchd mcp` is
+coordinator connection. Materialises and revokes; extends a lease when the imported
+device is transferring, otherwise only on an explicit `renew`. `benchd mcp` is
 the thin unprivileged stdio shim spawned per agent (D8), which registers a session and
 forwards calls over a local socket.
 
@@ -1106,18 +1184,25 @@ forwards calls over a local socket.
 >
 > `dist/benchd-sandbox` remains as a worked example for operators who want to
 > separate agents that share a uid, which is the one thing hiding does not do —
-> and which matters more since D2, because a lease's device node now lives *in*
-> the lease directory rather than being a mount of something in `/dev`. It uses
-> bubblewrap: `--dev /dev` gives a fresh minimal `/dev`, a `--tmpfs` over the
-> lease root hides every other agent's directory, and only the caller's own is
-> bound back in, so leases appear and disappear inside a running sandbox with no
+> and which matters more since D2, because a lease path is a symlink to a node
+> in `/dev`. The client maintains a devtmpfs-backed device tree per identity,
+> reproducing its imported resource nodes under their normal names and the
+> imported device's usbfs node for libusb/OpenOCD. Bubblewrap mounts that tree
+> as `/dev`, puts a `tmpfs` over the lease root, and binds only the caller's own
+> lease directory back in. Both views update while the sandbox runs, with no
 > restart and no cooperation from the agent. Nothing in benchd assumes it ran.
+> The same outer sandbox mounts the host read-only and restores writes only for
+> the selected workspace, explicit `--write` paths, and the selected agent's
+> state directory. The latter is deliberately writable so the CLI can persist
+> sessions; commands it runs can modify it too, so Unix users remain the
+> credential/configuration isolation boundary.
 >
-> It must be `--dev-bind` for that directory rather than `--bind`, because
-> bubblewrap adds `MS_NODEV` to a plain bind and a created node is then
-> unopenable — the same `nodev` trap as D2, one layer out. A bind mount would
-> have survived either way, which is part of why the change was worth making
-> deliberately rather than discovering later.
+> The device tree lives below `/dev/benchd`, not beside the lease tree under
+> `/run`: `/run` is mounted `nodev`, so a duplicate node there is unopenable.
+> It must also be `--dev-bind` rather than `--bind`, because bubblewrap adds
+> `MS_NODEV` to a plain bind. The source node itself remains mode `0600` and
+> owned by the leasing uid, so running without the sandbox has the same access
+> control as before.
 >
 > The owner directory is named from the agent's declared identity alone, never a
 > session id: a sandbox has to bind it at launch, which is before the coordinator
@@ -1304,10 +1389,11 @@ revisit-with-evidence, not now.
 | SSH-tunnelled transport | done — verified between two machines: an ESP32-S3 on a second host leased over the forward, control plane and USB/IP data channels both, with that coordinator bound to loopback and unreachable directly. `permitopen` refuses any other port (`administratively prohibited`) and the forced command yields no shell. A killed tunnel is restored by systemd in ~4s and leases resume with nothing else restarted |
 | Flashing a remote board | done — verified through the forward with unmodified `esptool`, on both a native-USB ESP32-S3 and an FT2232H-bridged ESP32. 256 KB of random data, which esptool declines to compress and so sends whole, written to an erased region: `Hash of data verified`, read back byte-identical, region restored |
 | One binary, a subcommand per component | done (D26) |
-| Skill | done — `skill/benchd/SKILL.md` |
+| Skill, MCP server and escalation hook, as one plugin | done — `plugins/benchd/` |
+| Reaching a leased board from inside an agent's own sandbox | done — verified against an ESP32-C3 under `codex exec`, headless: `stty` on the lease path failed inside Codex's sandbox (`ENOENT` — the path is not merely refused there, it is absent), the model asked to escalate, `benchd hook codex` approved it with no human involved, and the retry read the console at 9600 baud. Cursor is not covered: its hooks can only allow, deny or ask, never move a command out of its sandbox, so its inner sandbox is still disabled rather than answered |
 
-160 tests run on every `cargo test`, plus 19 that spawn real daemons and are `#[ignore]`d
-so a plain run stays hermetic. Those 19 live in the `benchd` crate rather than beside the
+177 tests run on every `cargo test`, plus 20 that spawn real daemons and are `#[ignore]`d
+so a plain run stays hermetic. Those 20 live in the `benchd` crate rather than beside the
 code they exercise, which is not tidiness: cargo only guarantees a freshly built binary
 to tests in the crate that declares it, and anywhere else they silently test whatever was
 in the target directory. That was not hypothetical either — it is how the fifth pass's

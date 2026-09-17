@@ -154,6 +154,13 @@ pub enum ClientMsg {
     TagList {
         request: RequestId,
     },
+    /// Ask the local client daemon for every bench on every coordinator it is
+    /// currently connected to. This never crosses a coordinator link: only the
+    /// client knows that several independent authorities make up this machine's
+    /// view, or which one was configured as `local`.
+    Inspect {
+        request: RequestId,
+    },
 
     Heartbeat,
     /// Reply to [`ToClient::Materialize`] / [`ToClient::Unmaterialize`].
@@ -210,8 +217,12 @@ pub enum ToClient {
     },
     /// Reply to a request that succeeded but returns nothing.
     Ok { request: RequestId },
-    /// Reply to `PrepareOwner`: the directory to bind-mount.
-    OwnerReady { request: RequestId, path: String },
+    /// Reply to `PrepareOwner`: the lease tree and private `/dev` to bind.
+    OwnerReady {
+        request: RequestId,
+        path: String,
+        device_path: String,
+    },
     /// Reply to any request that failed. `retryable` is the machine-readable
     /// form of the unsatisfiable-versus-contended distinction (D14): an agent
     /// must never retry-spin on a request that can never succeed.
@@ -255,6 +266,12 @@ pub enum ToClient {
     Tags {
         request: RequestId,
         tags: Vec<TagInfo>,
+    },
+    /// Reply to [`ClientMsg::Inspect`], grouped by authority so equal lease and
+    /// bench ids from different coordinators are never accidentally conflated.
+    Inventory {
+        request: RequestId,
+        coordinators: Vec<CoordinatorInventory>,
     },
 
     /// Make a granted lease's devices appear for `session`.
@@ -433,6 +450,17 @@ pub struct LeaseView {
     pub expires_at: Secs,
     pub state: String,
     pub reason: String,
+}
+
+/// One coordinator's contribution to the local client's operator view.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CoordinatorInventory {
+    /// The name from `benchd client --coordinator name=address`.
+    pub name: String,
+    /// True only for the coordinator explicitly named `local`.
+    pub local: bool,
+    pub benches: Vec<BenchView>,
+    pub leases: Vec<LeaseView>,
 }
 
 // ---------------------------------------------------------------------------

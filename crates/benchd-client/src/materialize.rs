@@ -91,6 +91,12 @@ struct BorrowedNode {
 
 pub struct Materializer {
     root: PathBuf,
+    /// A devtmpfs-backed tree which each sandbox mounts as its `/dev`.
+    ///
+    /// `/run` is `nodev`, so duplicate nodes cannot live beside the lease
+    /// links. Keeping them under the real `/dev` also means a file created
+    /// after the sandbox starts appears there immediately.
+    device_root: PathBuf,
     /// Needed to dial a relay data channel, which goes to the coordinator that
     /// granted the lease rather than to any particular one.
     coordinators: Vec<crate::Coordinator>,
@@ -113,23 +119,45 @@ pub struct Materializer {
     /// and the ownership to put back on release. Taking them over is what makes
     /// a lease exclusive; this is what stops that being permanent.
     restore: BTreeMap<LeaseKey, Vec<BorrowedNode>>,
+    /// Per-owner copies of those nodes, under [`Self::device_root`].
+    ///
+    /// They carry the same device number, so they open the same driver, but
+    /// only the owning sandbox has their directory mounted as `/dev`.
+    mirrors: BTreeMap<LeaseKey, Vec<PathBuf>>,
     /// The same two things, on disk, so a restarted daemon can undo its own
     /// work and only its own.
     ledger: Ledger,
 }
 
 impl Materializer {
-    pub fn new(root: impl Into<PathBuf>, coordinators: Vec<crate::Coordinator>) -> Self {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        device_root: impl Into<PathBuf>,
+        coordinators: Vec<crate::Coordinator>,
+    ) -> Self {
         let root = root.into();
         Materializer {
             ledger: Ledger::new(&root),
             root,
+            device_root: device_root.into(),
             coordinators,
             seen: BTreeMap::new(),
             active: BTreeMap::new(),
             restore: BTreeMap::new(),
+            mirrors: BTreeMap::new(),
             imported: BTreeMap::new(),
         }
+    }
+
+    /// Prepare the two live views a sandbox needs before it starts.
+    pub async fn prepare_owner(&self, owner: &str) -> Result<(PathBuf, PathBuf), String> {
+        let leases = self.root.join(owner);
+        create_tree(&self.root, &leases).await?;
+
+        let devices = self.device_root.join(owner);
+        create_device_tree(&self.device_root, &devices).await?;
+        prepare_standard_devices(&devices).await?;
+        Ok((leases, devices))
     }
 
     /// Import a remote device and return the vhci port it landed on, with the
@@ -249,6 +277,29 @@ impl Materializer {
         self.active.clear();
         self.imported.clear();
         self.restore.clear();
+        self.mirrors.clear();
+
+        // Mirrors are only names for nodes tracked by the ledger. They are
+        // never useful across a daemon restart, and leaving an old ttyACM0 in
+        // an owner's private /dev could point at a later import reusing that
+        // device number.
+        if let Err(err) = tokio::fs::remove_dir_all(&self.device_root).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %self.device_root.display(),
+                    ?err,
+                    "could not clear stale sandbox device tree"
+                );
+            }
+        }
+        if let Err(err) = tokio::fs::create_dir_all(&self.device_root).await {
+            tracing::error!(
+                path = %self.device_root.display(),
+                ?err,
+                "could not create sandbox device root"
+            );
+        }
+        let _ = set_mode(&self.device_root, DIR_MODE).await;
 
         // What a previous incarnation did to this machine. Not the same
         // question as what the machine currently has attached: an engineer's
@@ -405,9 +456,38 @@ impl Materializer {
             }
         }
 
+        // A resource path is enough for serial/storage tools. libusb tools
+        // open the imported device's usbfs node instead, so reserve and mirror
+        // one of those per imported USB device too.
+        let mut usb_nodes = Vec::new();
+        for &(port, speed) in imported.values() {
+            match sysfs::wait_for_vhci_usb_node(port, speed, std::time::Duration::from_secs(10))
+                .await
+            {
+                Some(source) => usb_nodes.push(source),
+                None => {
+                    // A serial/block resource remains completely usable without
+                    // usbfs. Treat this as optional compatibility for libusb
+                    // tools rather than failing an otherwise healthy lease.
+                    tracing::warn!(
+                        %lease,
+                        port,
+                        "imported device has no /dev/bus/usb node; libusb tools \
+                         will not work in the sandbox"
+                    );
+                }
+            }
+        }
+
         for (source, dest) in &plan {
-            if let Err(detail) = self.take_over(lease, source, dest, uid).await {
+            if let Err(detail) = self.take_over(lease, owner, source, dest, uid).await {
                 // Roll back, so a failure never leaves a partial lease behind.
+                self.roll_back(lease, owner).await;
+                return Outcome::Failed { detail };
+            }
+        }
+        for source in &usb_nodes {
+            if let Err(detail) = self.take_over_device(lease, owner, source, uid).await {
                 self.roll_back(lease, owner).await;
                 return Outcome::Failed { detail };
             }
@@ -427,15 +507,28 @@ impl Materializer {
     async fn take_over(
         &mut self,
         lease: LeaseKey,
+        owner: &str,
         source: &Path,
         dest: &Path,
+        uid: Option<u32>,
+    ) -> Result<(), String> {
+        link_node(&self.root, source, dest).await?;
+        self.take_over_device(lease, owner, source, uid).await
+    }
+
+    /// Reserve one imported node and reproduce its kernel name in the owner's
+    /// sandbox-only `/dev`.
+    async fn take_over_device(
+        &mut self,
+        lease: LeaseKey,
+        owner: &str,
+        source: &Path,
         uid: Option<u32>,
     ) -> Result<(), String> {
         let facts = node_facts(source)
             .await
             .ok_or_else(|| format!("{} is not a device node", source.display()))?;
-        link_node(&self.root, source, dest).await?;
-
+        let mirror = mirror_path(&self.device_root, owner, source)?;
         let borrowed = self.restore.entry(lease).or_default();
         if needs_locking(borrowed, source) {
             let borrowed = BorrowedNode {
@@ -470,7 +563,7 @@ impl Materializer {
                 Some(uid) => tracing::info!(
                     %lease, uid,
                     device = %source.display(),
-                    node = %dest.display(),
+                    sandbox_node = %mirror.display(),
                     "reserved an imported device for its lease"
                 ),
                 None => tracing::warn!(
@@ -481,11 +574,28 @@ impl Materializer {
                 ),
             }
         }
+
+        // Expose the private name only after the source is reserved. A sandbox
+        // may already be watching its /dev while a claim is materialised;
+        // creating this first would briefly hand it a usable, unreserved node.
+        mirror_node(&self.device_root, source, &mirror, uid)
+            .await
+            .map_err(|e| format!("mirroring {} into the sandbox: {e}", source.display()))?;
+        if !self.mirrors.entry(lease).or_default().contains(&mirror) {
+            self.mirrors.entry(lease).or_default().push(mirror.clone());
+        }
         Ok(())
     }
 
     /// Undo everything done for one lease, whether or not it ever completed.
     async fn roll_back(&mut self, lease: LeaseKey, owner: &str) {
+        for mirror in self.mirrors.remove(&lease).unwrap_or_default() {
+            if let Err(err) = tokio::fs::remove_file(&mirror).await {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %mirror.display(), ?err, "could not remove sandbox device");
+                }
+            }
+        }
         // Give the devices back first: after the detach below the nodes are
         // gone and there is nothing left to give back to.
         for node in self.restore.remove(&lease).unwrap_or_default() {
@@ -506,6 +616,19 @@ impl Materializer {
             sysfs::vhci_detach(port).await;
         }
         self.ledger.forget(lease).await;
+    }
+
+    /// URB completion counts for every imported lease, summed across its ports.
+    pub async fn urb_totals(&self) -> BTreeMap<LeaseKey, u64> {
+        let mut totals = BTreeMap::new();
+        for (lease, ports) in &self.imported {
+            let mut n = 0u64;
+            for port in ports {
+                n = n.saturating_add(sysfs::vhci_urbnum(*port).await.unwrap_or(0));
+            }
+            totals.insert(*lease, n);
+        }
+        totals
     }
 
     pub async fn unmaterialize(
@@ -679,6 +802,146 @@ async fn create_tree(root: &Path, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Create a root-owned directory tree for a sandbox's private `/dev`.
+async fn create_device_tree(root: &Path, dir: &Path) -> Result<(), String> {
+    match tokio::fs::DirBuilder::new()
+        .mode(DIR_MODE)
+        .recursive(true)
+        .create(root)
+        .await
+    {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(format!("mkdir {}: {err}", root.display())),
+    }
+    let meta = tokio::fs::symlink_metadata(root)
+        .await
+        .map_err(|e| format!("stat {}: {e}", root.display()))?;
+    if !meta.is_dir() {
+        return Err(format!("{} is not a directory", root.display()));
+    }
+    set_mode(root, DIR_MODE)
+        .await
+        .map_err(|e| format!("chmod {}: {e}", root.display()))?;
+    create_tree(root, dir).await
+}
+
+/// Basic `/dev` entries needed by shells and agent runtimes.
+///
+/// The owner's directory is mounted over `/dev`, so these cannot come from
+/// bubblewrap's usual `--dev /dev`. PTYs are supplied by a separate bind of
+/// `/dev/pts`; the stable devices are cheap and safe to reproduce here.
+async fn prepare_standard_devices(dev: &Path) -> Result<(), String> {
+    create_device_tree(dev, &dev.join("pts")).await?;
+    create_device_tree(dev, &dev.join("shm")).await?;
+
+    for name in ["null", "zero", "full", "random", "urandom", "tty"] {
+        let source = PathBuf::from("/dev").join(name);
+        let facts = node_facts(&source)
+            .await
+            .ok_or_else(|| format!("{} is not a device node", source.display()))?;
+        make_node(&dev.join(name), &facts, Some(0), facts.mode).await?;
+    }
+
+    for (name, target) in [
+        ("fd", "/proc/self/fd"),
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+        ("ptmx", "pts/ptmx"),
+    ] {
+        let path = dev.join(name);
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if tokio::fs::read_link(&path).await.ok().as_deref() == Some(Path::new(target)) {
+                    continue;
+                }
+                tokio::fs::remove_file(&path)
+                    .await
+                    .map_err(|e| format!("clearing {}: {e}", path.display()))?;
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "refusing to replace non-symlink standard device {}",
+                    path.display()
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("stat {}: {err}", path.display())),
+        }
+        tokio::fs::symlink(target, &path)
+            .await
+            .map_err(|e| format!("linking {} to {target}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn mirror_path(device_root: &Path, owner: &str, source: &Path) -> Result<PathBuf, String> {
+    let relative = source
+        .strip_prefix("/dev")
+        .map_err(|_| format!("{} is not under /dev", source.display()))?;
+    if relative
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(format!(
+            "{} is not a plain path below /dev",
+            source.display()
+        ));
+    }
+    Ok(device_root.join(owner).join(relative))
+}
+
+async fn mirror_node(
+    device_root: &Path,
+    source: &Path,
+    dest: &Path,
+    uid: Option<u32>,
+) -> Result<(), String> {
+    let facts = node_facts(source)
+        .await
+        .ok_or_else(|| format!("{} is not a device node", source.display()))?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", dest.display()))?;
+    create_device_tree(device_root, parent).await?;
+    make_node(dest, &facts, uid, 0o600).await
+}
+
+async fn make_node(
+    dest: &Path,
+    facts: &NodeFacts,
+    uid: Option<u32>,
+    mode: u32,
+) -> Result<(), String> {
+    if let Err(err) = tokio::fs::remove_file(dest).await {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("clearing {}: {err}", dest.display()));
+        }
+    }
+    let path = dest.to_path_buf();
+    let kind = facts.kind;
+    let rdev = facts.rdev;
+    tokio::task::spawn_blocking(move || {
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &path,
+            kind,
+            rustix::fs::Mode::from_bits_retain(mode),
+            rdev,
+        )
+    })
+    .await
+    .map_err(|e| format!("creating {}: {e}", dest.display()))?
+    .map_err(|e| format!("creating {}: {e}", dest.display()))?;
+    chown(dest, uid.unwrap_or(0), 0)
+        .await
+        .map_err(|e| format!("chown {}: {e}", dest.display()))?;
+    set_mode(dest, mode)
+        .await
+        .map_err(|e| format!("chmod {}: {e}", dest.display()))
+}
+
 /// Reserve an imported device node for the agent that leased it.
 ///
 /// The lease is exclusive over the bench, so for as long as it lasts nothing
@@ -737,6 +1000,8 @@ struct NodeFacts {
     uid: u32,
     gid: u32,
     mode: u32,
+    kind: rustix::fs::FileType,
+    rdev: rustix::fs::Dev,
 }
 
 async fn node_facts(path: &Path) -> Option<NodeFacts> {
@@ -752,6 +1017,8 @@ async fn node_facts(path: &Path) -> Option<NodeFacts> {
         uid: meta.uid(),
         gid: meta.gid(),
         mode: meta.mode() & 0o7777,
+        kind: rustix::fs::FileType::from_raw_mode(meta.mode()),
+        rdev: meta.rdev(),
     })
 }
 
@@ -1102,6 +1369,29 @@ mod tests {
     #[test]
     fn an_empty_name_still_yields_a_directory() {
         assert_eq!(owner_dir(SessionId(7), "!!!"), "s7");
+    }
+
+    #[test]
+    fn a_sandbox_device_keeps_the_kernels_name_below_its_owner() {
+        let root = Path::new("/dev/benchd");
+        assert_eq!(
+            mirror_path(root, "agent-1", Path::new("/dev/ttyACM0")).unwrap(),
+            Path::new("/dev/benchd/agent-1/ttyACM0")
+        );
+        assert_eq!(
+            mirror_path(root, "agent-1", Path::new("/dev/bus/usb/003/017")).unwrap(),
+            Path::new("/dev/benchd/agent-1/bus/usb/003/017")
+        );
+    }
+
+    #[test]
+    fn a_sandbox_device_can_only_come_from_dev() {
+        assert!(mirror_path(
+            Path::new("/dev/benchd"),
+            "agent-1",
+            Path::new("/etc/shadow")
+        )
+        .is_err());
     }
 
     #[test]
