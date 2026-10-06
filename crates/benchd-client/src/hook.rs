@@ -114,11 +114,7 @@ fn lease_dir(args: &HookArgs) -> Option<PathBuf> {
 /// Codex's `PermissionRequest`, which fires for any approval it is about to ask
 /// for — a shell escalation, a blocked network call, a write outside the
 /// workspace. Only the first is ours, and only when it names a leased path.
-fn codex(
-    event: &serde_json::Value,
-    leases: &Path,
-    exists: impl Fn(&Path) -> bool,
-) -> Decision {
+fn codex(event: &serde_json::Value, leases: &Path, exists: impl Fn(&Path) -> bool) -> Decision {
     if event.get("hook_event_name").and_then(|v| v.as_str()) != Some("PermissionRequest") {
         return Decision::Abstain;
     }
@@ -289,7 +285,9 @@ mod tests {
     #[test]
     fn a_path_that_climbs_back_out_is_refused_rather_than_resolved() {
         assert_eq!(
-            decide_for(&format!("esptool --port {LEASES}/../agent-4/c0-l1/dut/console flash-id")),
+            decide_for(&format!(
+                "esptool --port {LEASES}/../agent-4/c0-l1/dut/console flash-id"
+            )),
             Decision::Abstain
         );
     }
