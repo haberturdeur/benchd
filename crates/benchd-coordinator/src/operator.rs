@@ -160,9 +160,12 @@ fn now() -> u64 {
 
 fn filter_benches(inventories: &mut [CoordinatorInventory], filters: &[String]) {
     for inventory in inventories {
-        inventory
-            .benches
-            .retain(|bench| filters.iter().all(|tag| bench.tags.contains(tag)));
+        inventory.benches.retain(|bench| {
+            filters.iter().all(|tag| match tag.strip_prefix("name=") {
+                Some(name) => bench.id == name,
+                None => bench.tags.contains(tag),
+            })
+        });
     }
 }
 
@@ -283,6 +286,38 @@ mod tests {
             Cli::try_parse_from(["benchd", "benches", "--host", "lab-a", "soc=esp32s3"]).is_ok()
         );
         assert!(Cli::try_parse_from(["benchd", "benches", "host=lab-a"]).is_ok());
+    }
+
+    #[test]
+    fn name_filters_match_the_id_and_combine_with_host_filters() {
+        use benchd_core::wire::BenchView;
+        let inventory = CoordinatorInventory {
+            name: "lab".into(),
+            local: false,
+            benches: ["board", "board-extra"]
+                .into_iter()
+                .map(|id| BenchView {
+                    id: id.into(),
+                    description: String::new(),
+                    has_docs: false,
+                    tags: vec!["host=lab-a".into()],
+                    resources: vec![],
+                })
+                .collect(),
+            leases: vec![],
+        };
+        let mut inventories = vec![inventory];
+        filter_benches(
+            &mut inventories,
+            &["name=board".into(), "host=lab-a".into()],
+        );
+        assert_eq!(inventories[0].benches.len(), 1);
+        assert_eq!(inventories[0].benches[0].id, "board");
+        filter_benches(
+            &mut inventories,
+            &["name=board".into(), "host=lab-b".into()],
+        );
+        assert!(inventories[0].benches.is_empty());
     }
 
     #[test]

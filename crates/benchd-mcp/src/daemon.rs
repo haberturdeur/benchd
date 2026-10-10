@@ -32,6 +32,9 @@ pub struct Daemon {
     name: String,
     tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
     incompatible: Mutex<Option<String>>,
+    /// Keep retrying transient failures, but retain their cause for callers
+    /// whose deadline expires before the daemon recovers.
+    last_link_error: Mutex<Option<String>>,
     up: Notify,
     pending: Arc<Mutex<BTreeMap<u64, oneshot::Sender<Value>>>>,
     /// Paths arrive *after* a grant, once the device nodes actually exist, so a
@@ -47,6 +50,7 @@ impl Daemon {
             name: name.to_string(),
             tx: Mutex::new(None),
             incompatible: Mutex::new(None),
+            last_link_error: Mutex::new(None),
             up: Notify::new(),
             pending: Arc::new(Mutex::new(BTreeMap::new())),
             paths: Arc::new(Mutex::new(BTreeMap::new())),
@@ -75,8 +79,17 @@ impl Daemon {
                 return Err(anyhow!(error.clone()));
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return Err(anyhow!("the benchd client daemon did not come up in time"));
+                return Err(self
+                    .connection_error("the benchd client daemon did not come up in time")
+                    .await);
             }
+        }
+    }
+
+    async fn connection_error(&self, fallback: &str) -> anyhow::Error {
+        match self.last_link_error.lock().await.as_ref() {
+            Some(error) => anyhow!("{fallback}: {error}"),
+            None => anyhow!("{fallback}"),
         }
     }
 
@@ -89,6 +102,7 @@ impl Daemon {
                     tokio::time::sleep(RETRY_MIN).await;
                 }
                 Err(err) => {
+                    *self.last_link_error.lock().await = Some(format!("{err:#}"));
                     if err
                         .downcast_ref::<std::io::Error>()
                         .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
@@ -150,6 +164,7 @@ impl Daemon {
         )
         .await?;
         *self.incompatible.lock().await = None;
+        *self.last_link_error.lock().await = None;
         *self.tx.lock().await = Some(tx);
         self.up.notify_waiters();
         tracing::info!(socket = %self.socket, "connected to the client daemon");
@@ -200,7 +215,9 @@ impl Daemon {
                     return Err(anyhow!(error.clone()));
                 }
                 if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                    return Err(anyhow!("the benchd client daemon is not reachable"));
+                    return Err(self
+                        .connection_error("the benchd client daemon is not reachable")
+                        .await);
                 }
             };
             match self.call_on(&tx, msg.clone()).await {
@@ -359,6 +376,7 @@ mod tests {
             name: "test".into(),
             tx: Mutex::new(None),
             incompatible: Mutex::new(Some("benchd protocol mismatch: peer old-build".into())),
+            last_link_error: Mutex::new(None),
             up: Notify::new(),
             pending: Arc::new(Mutex::new(BTreeMap::new())),
             paths: Arc::new(Mutex::new(BTreeMap::new())),
@@ -444,6 +462,99 @@ mod tests {
     async fn listen(path: &std::path::Path) -> UnixListener {
         let _ = std::fs::remove_file(path);
         UnixListener::bind(path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn legacy_handshake_details_reach_waiters_and_calls_and_recovery_clears_them() {
+        let path = socket_path();
+        let listener = listen(&path).await;
+        let server = tokio::spawn(async move {
+            // Old daemons ignore unknown messages, including the new hello.
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut lines = FramedRead::new(stream, LinesCodec::new());
+                while let Some(Ok(_)) = lines.next().await {}
+            }
+        });
+        let daemon = Arc::new(Daemon {
+            socket: path.to_str().unwrap().into(),
+            name: "legacy-test".into(),
+            tx: Mutex::new(None),
+            incompatible: Mutex::new(None),
+            last_link_error: Mutex::new(None),
+            up: Notify::new(),
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            paths: Arc::new(Mutex::new(BTreeMap::new())),
+            next: AtomicU64::new(1),
+        });
+        let pump = {
+            let daemon = Arc::clone(&daemon);
+            tokio::spawn(async move { daemon.pump().await })
+        };
+        let (startup, call) = tokio::join!(
+            daemon.wait_until_up(Duration::from_secs(6)),
+            daemon.simple(ClientMsg::TagList {
+                request: RequestId(0)
+            }),
+        );
+        server.abort();
+        let _ = server.await;
+
+        // An upgraded daemon must still be reachable after a timed-out hello.
+        let listener = listen(&path).await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            speak(stream).await;
+        });
+        let recovered = daemon.wait_until_up(Duration::from_secs(8)).await;
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_file(&path).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while daemon.tx.lock().await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let after_recovery = daemon.wait_until_up(Duration::from_millis(100)).await;
+        pump.abort();
+        let _ = pump.await;
+
+        for error in [startup.unwrap_err(), call.unwrap_err()] {
+            let error = error.to_string();
+            assert!(error.contains("protocol handshake timed out"), "{error}");
+            assert!(error.contains("compatible benchd"), "{error}");
+        }
+        recovered.unwrap();
+        assert!(!after_recovery
+            .unwrap_err()
+            .to_string()
+            .contains("protocol handshake"));
+    }
+
+    #[tokio::test]
+    async fn a_transient_handshake_timeout_does_not_prevent_connecting() {
+        let path = socket_path();
+        let listener = listen(&path).await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = FramedRead::new(stream, LinesCodec::new());
+            while let Some(Ok(_)) = lines.next().await {}
+            let (stream, _) = listener.accept().await.unwrap();
+            speak(stream).await;
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            Daemon::connect(path.to_str().unwrap(), "transient-timeout"),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_file(&path).unwrap();
+        assert!(result
+            .expect("connection should recover before its deadline")
+            .is_ok());
     }
 
     #[tokio::test]
