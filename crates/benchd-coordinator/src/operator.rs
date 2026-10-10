@@ -24,6 +24,12 @@ use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 pub enum Command {
     /// Show every bench, its tags, and who holds it.
     Benches {
+        /// Show only benches carrying every given tag, e.g. host=lab-a soc=esp32s3.
+        #[arg(value_name = "TAG")]
+        tags: Vec<String>,
+        /// Show benches on this host (shorthand for host=NAME).
+        #[arg(long, value_name = "NAME")]
+        host: Option<String>,
         /// The local client daemon whose connected coordinators should be shown.
         #[arg(long, default_value = "/run/benchd/agent.sock", env = "BENCHD_SOCKET")]
         socket: String,
@@ -45,16 +51,26 @@ pub enum Command {
 }
 
 pub async fn run(coordinator: Option<&str>, command: Command) -> Result<()> {
-    if let (None, Command::Benches { socket }) = (coordinator, &command) {
-        return run_all(socket).await;
+    let filters = match &command {
+        Command::Benches { tags, host, .. } => tags
+            .iter()
+            .cloned()
+            .chain(host.iter().map(|host| format!("host={host}")))
+            .map(|tag| benchd_core::tags::Tag::parse(&tag).map(|tag| tag.to_string()))
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => Vec::new(),
+    };
+    if let (None, Command::Benches { socket, .. }) = (coordinator, &command) {
+        return run_all(socket, &filters).await;
     }
 
     let default = format!("127.0.0.1:{DEFAULT_PORT}");
     let coordinator = coordinator.unwrap_or(&default);
-    let socket = tokio::net::TcpStream::connect(coordinator)
+    let mut socket = tokio::net::TcpStream::connect(coordinator)
         .await
         .with_context(|| format!("failed to reach the coordinator at {coordinator}"))?;
     socket.set_nodelay(true).ok();
+    benchd_core::protocol::connect(&mut socket).await?;
     let (read, write) = socket.into_split();
     let mut lines = FramedRead::new(read, LinesCodec::new());
     let mut sink = FramedWrite::new(write, LinesCodec::new());
@@ -76,14 +92,15 @@ pub async fn run(coordinator: Option<&str>, command: Command) -> Result<()> {
         .with_context(|| format!("could not understand the coordinator's reply: {line}"))?;
 
     match (&command, reply) {
-        (Command::Benches { .. }, ToOperator::State { benches, leases }) => {
-            print_benches(&[CoordinatorInventory {
+        (Command::Benches { .. }, ToOperator::State { benches, leases }) => print_benches(
+            vec![CoordinatorInventory {
                 name: coordinator.into(),
                 local: false,
                 benches,
                 leases,
-            }])
-        }
+            }],
+            &filters,
+        ),
         (Command::Leases, ToOperator::State { leases, .. }) => print_leases(&leases),
         (Command::Release { bench, .. }, ToOperator::Released { count }) => {
             if count == 0 {
@@ -105,12 +122,13 @@ pub async fn run(coordinator: Option<&str>, command: Command) -> Result<()> {
 /// agents. It is the source of truth for which coordinators are configured and
 /// currently connected; duplicating that list in an operator command is how
 /// `benchd benches` used to silently show only the local authority.
-async fn run_all(socket: &str) -> Result<()> {
-    let socket = tokio::net::UnixStream::connect(socket)
+async fn run_all(socket: &str, filters: &[String]) -> Result<()> {
+    let mut socket = tokio::net::UnixStream::connect(socket)
         .await
         .with_context(|| {
             format!("could not reach the client daemon at {socket} — is `benchd client` running?")
         })?;
+    benchd_core::protocol::connect(&mut socket).await?;
     let (read, write) = socket.into_split();
     let mut lines = FramedRead::new(read, LinesCodec::new());
     let mut sink = FramedWrite::new(write, LinesCodec::new());
@@ -126,7 +144,7 @@ async fn run_all(socket: &str) -> Result<()> {
     let reply: ToClient = serde_json::from_str(&line)
         .with_context(|| format!("could not understand the client daemon's reply: {line}"))?;
     match reply {
-        ToClient::Inventory { coordinators, .. } => print_benches(&coordinators),
+        ToClient::Inventory { coordinators, .. } => print_benches(coordinators, filters),
         ToClient::Error { error, .. } => return Err(anyhow!(error)),
         other => return Err(anyhow!("unexpected reply: {other:?}")),
     }
@@ -140,12 +158,25 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-fn print_benches(inventories: &[CoordinatorInventory]) {
+fn filter_benches(inventories: &mut [CoordinatorInventory], filters: &[String]) {
+    for inventory in inventories {
+        inventory
+            .benches
+            .retain(|bench| filters.iter().all(|tag| bench.tags.contains(tag)));
+    }
+}
+
+fn print_benches(mut inventories: Vec<CoordinatorInventory>, filters: &[String]) {
+    filter_benches(&mut inventories, filters);
     if inventories
         .iter()
         .all(|inventory| inventory.benches.is_empty())
     {
-        println!("no benches registered (is any `benchd host` running?)");
+        if filters.is_empty() {
+            println!("no benches registered (is any `benchd host` running?)");
+        } else {
+            println!("no benches match {}", filters.join(" "));
+        }
         return;
     }
 
@@ -232,5 +263,63 @@ fn print_leases(leases: &[benchd_core::wire::LeaseView]) {
         if !lease.reason.is_empty() {
             println!("      {}", lease.reason);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: Command,
+    }
+
+    #[test]
+    fn benches_accepts_host_and_capability_filters() {
+        assert!(
+            Cli::try_parse_from(["benchd", "benches", "--host", "lab-a", "soc=esp32s3"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["benchd", "benches", "host=lab-a"]).is_ok());
+    }
+
+    #[test]
+    fn filters_require_every_tag_and_apply_across_coordinators() {
+        use benchd_core::wire::BenchView;
+        let inventory = |name: &str| CoordinatorInventory {
+            name: name.into(),
+            local: false,
+            benches: [
+                ("match", vec!["host=lab-a", "soc=esp32s3"]),
+                ("other-host", vec!["host=lab-ab", "soc=esp32s3"]),
+                ("other-chip", vec!["host=lab-a", "soc=esp32c3"]),
+                ("legacy", vec!["soc=esp32s3"]),
+            ]
+            .into_iter()
+            .map(|(id, tags)| BenchView {
+                id: id.into(),
+                description: String::new(),
+                has_docs: false,
+                tags: tags.into_iter().map(String::from).collect(),
+                resources: vec![],
+            })
+            .collect(),
+            leases: vec![],
+        };
+        let mut inventories = vec![inventory("local"), inventory("remote")];
+        filter_benches(&mut inventories, &[]);
+        assert!(inventories.iter().all(|i| i.benches.len() == 4));
+        filter_benches(
+            &mut inventories,
+            &["host=lab-a".into(), "soc=esp32s3".into()],
+        );
+        for inventory in &inventories {
+            assert_eq!(inventory.benches.len(), 1);
+            assert_eq!(inventory.benches[0].id, "match");
+        }
+        filter_benches(&mut inventories, &["host=missing".into()]);
+        assert!(inventories.iter().all(|i| i.benches.is_empty()));
     }
 }

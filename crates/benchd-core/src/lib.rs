@@ -18,6 +18,7 @@ pub mod lease;
 pub mod limits;
 pub mod matcher;
 pub mod model;
+pub mod protocol;
 #[cfg(feature = "usbip")]
 pub mod sysfs;
 pub mod tags;

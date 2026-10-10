@@ -1212,10 +1212,11 @@ pub async fn serve(shared: Arc<Shared>, path: &str) -> Result<()> {
     }
 }
 
-async fn serve_agent(shared: Arc<Shared>, socket: tokio::net::UnixStream) -> Result<()> {
+async fn serve_agent(shared: Arc<Shared>, mut socket: tokio::net::UnixStream) -> Result<()> {
     // Ask the kernel who is on the other end rather than trusting anything the
     // peer says: this decides who gets to open a device node.
     let uid = socket.peer_cred().map(|c| c.uid()).unwrap_or(0);
+    benchd_core::protocol::accept(&mut socket).await?;
     let (read, write) = socket.into_split();
     let mut lines = FramedRead::new(read, LinesCodec::new());
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -1302,7 +1303,7 @@ async fn inspect_connected(shared: &Shared) -> Result<Vec<CoordinatorInventory>,
 async fn inspect_coordinator(
     coordinator: &crate::Coordinator,
 ) -> Result<CoordinatorInventory, String> {
-    let socket = tokio::net::TcpStream::connect(&coordinator.address)
+    let mut socket = tokio::net::TcpStream::connect(&coordinator.address)
         .await
         .map_err(|err| {
             format!(
@@ -1311,6 +1312,9 @@ async fn inspect_coordinator(
             )
         })?;
     socket.set_nodelay(true).ok();
+    benchd_core::protocol::connect(&mut socket)
+        .await
+        .map_err(|err| format!("coordinator {}: {err}", coordinator.name))?;
     let (read, write) = socket.into_split();
     let mut lines = FramedRead::new(read, LinesCodec::new());
     let mut sink = FramedWrite::new(write, LinesCodec::new());

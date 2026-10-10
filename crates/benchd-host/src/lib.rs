@@ -126,12 +126,23 @@ impl BenchConfig {
     /// bench is strictly better than one that fails at claim time, after an
     /// agent has already been told it has hardware.
     fn to_spec(&self) -> Result<BenchSpec> {
-        let tags = self
+        let mut tags = self
             .tags
             .iter()
             .map(|t| benchd_core::tags::Tag::parse(t))
             .collect::<Result<Vec<_>, _>>()
             .context("invalid tag in bench config")?;
+        if !tags.iter().any(|tag| tag.key == "host") {
+            let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .context("cannot read hostname; declare host=<name> in bench tags")?;
+            tags.push(
+                benchd_core::tags::Tag::parse(&format!(
+                    "host={}",
+                    hostname.trim().to_ascii_lowercase()
+                ))
+                .context("hostname is not a valid tag value; declare host=<name> in bench tags")?,
+            );
+        }
 
         let mut resources = BTreeMap::new();
         // Which USB device each serial resource resolved to. The coordinator
@@ -608,10 +619,17 @@ async fn session(
     busids: &BTreeMap<String, String>,
     exports: &mut Exports,
 ) -> Result<SessionEnd> {
-    let socket = tokio::net::TcpStream::connect(&args.coordinator)
+    let mut socket = tokio::net::TcpStream::connect(&args.coordinator)
         .await
         .with_context(|| format!("failed to dial {}", args.coordinator))?;
     socket.set_nodelay(true).ok();
+    if let Err(error) = benchd_core::protocol::connect(&mut socket).await {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            tracing::error!(%error, "coordinator protocol is incompatible");
+            return Ok(SessionEnd::Refused);
+        }
+        return Err(error.into());
+    }
     let (read, write) = socket.into_split();
     let mut lines = FramedRead::new(read, LinesCodec::new());
     let mut sink = FramedWrite::new(write, LinesCodec::new());
@@ -702,5 +720,31 @@ async fn session(
 fn reply(tx: &tokio::sync::mpsc::UnboundedSender<String>, request: RequestId, result: Outcome) {
     if let Ok(line) = serde_json::to_string(&HostMsg::Done { request, result }) {
         let _ = tx.send(line);
+    }
+}
+
+#[cfg(test)]
+mod host_tag_tests {
+    use super::*;
+
+    #[test]
+    fn registration_defaults_to_the_machine_hostname() {
+        let config: BenchConfig = toml::from_str("id = 'test'\ntags = []\n[resources]\n").unwrap();
+        let spec = config.to_spec().unwrap();
+        let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        assert!(spec.tags.contains(&benchd_core::tags::Tag::new(
+            "host",
+            hostname.trim().to_ascii_lowercase()
+        )));
+    }
+
+    #[test]
+    fn an_explicit_host_tag_overrides_the_hostname() {
+        let config: BenchConfig =
+            toml::from_str("id = 'test'\ntags = ['host=hardware-room']\n[resources]\n").unwrap();
+        let spec = config.to_spec().unwrap();
+        let hosts: Vec<_> = spec.tags.iter().filter(|t| t.key == "host").collect();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].value, "hardware-room");
     }
 }

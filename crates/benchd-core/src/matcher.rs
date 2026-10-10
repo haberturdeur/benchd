@@ -266,9 +266,9 @@ pub fn fit_cost(
     bench
         .tags
         .difference(&requirement.tags)
-        // Every bench has exactly one name tag; it carries no capability
-        // meaning and would otherwise dominate the score.
-        .filter(|tag| tag.key != "name")
+        // Bench and host identities carry no capability meaning and would
+        // otherwise make rare names dominate the score.
+        .filter(|tag| tag.key != "name" && tag.key != "host")
         // One chip, one charge. A bench declaring `peripheral=accel[mpu6050]`
         // carries the bare `peripheral=accel` too, so scoring both would make a
         // board look twice as capable purely because someone recorded its part

@@ -272,11 +272,20 @@ address, not TLS identity). Using Caddy for auth would mean speaking HTTP/WebSoc
 putting a proxy in the hot path, to solve a problem better solved one layer down.
 
 *Rejected — gRPC/protobuf:* its advantages were schema codegen and cross-version
-compatibility, and multi-version operation is an explicit non-goal. All binaries build
+compatibility. We do not translate between protocol versions. All binaries build
 from one workspace, so sharing Rust types directly is stronger sync than generating
 them, at no cost in `build.rs`, `prost` or a second language. What we hand-roll instead
 is small and dull: newline framing (`LinesCodec`), a `request_id` for correlation, a
 heartbeat for liveness, a reconnect loop.
+
+Every connection now starts with a bounded JSON `hello` carrying the protocol
+number, package version and build identifier. Equal protocol numbers are required
+before any registration, claim, operator request or relay join. Build differences
+are diagnostic and may coexist under the same protocol. This also covers the
+local client socket, where a running MCP process can otherwise outlive an upgrade
+of its daemon. Unversioned peers are rejected; introducing this check requires a
+coordinated deployment. The hello reader consumes exactly one line so no following
+control message or USB/IP byte is discarded.
 
 *Bonus, and it matters for a PoC:* the wire is human-readable. `socat` is a debugger.
 

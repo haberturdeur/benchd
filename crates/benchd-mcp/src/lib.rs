@@ -77,7 +77,9 @@ struct ClaimArgs {
     /// What each slot needs, as `key=value` capability tags. One slot is the
     /// common case: `{"dut": ["soc=esp32s3"]}`. Ask for two when you need two
     /// boards that can talk to each other, e.g. `{"dut": [...], "peer": [...]}`
-    /// — they are granted together or not at all.
+    /// — they are granted together or not at all within one coordinator.
+    /// Add `host=<name>` to a slot to select a physical host; use the same host
+    /// tag on every slot to require distinct benches on one machine.
     slots: BTreeMap<String, Vec<String>>,
     /// How long you need the hardware, in seconds. Required: there is no
     /// default. Ask for what the work needs; you can always `renew`.
@@ -129,7 +131,9 @@ impl Benchd {
 
     #[tool(
         name = "claim",
-        description = "Claim hardware by capability for a bounded time. Returns a \
+        description = "Claim hardware by capability for a bounded time. All slots \
+                       are reserved together or not at all within one coordinator, \
+                       including across hosts. Use host=<name> tags to select hosts. Returns a \
                        lease id and a real device path per resource — use it with \
                        your normal tools (esptool, idf.py monitor, minicom). \
                        Never touch /dev/tty* directly: without a lease it is not \

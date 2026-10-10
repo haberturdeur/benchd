@@ -340,12 +340,13 @@ pub async fn run(args: ClientArgs) -> Result<()> {
 
 /// One connection to one coordinator, from dial until it drops.
 async fn link(args: &ClientArgs, shared: Arc<Shared>, coordinator: &Coordinator) -> Result<()> {
-    let socket = tokio::net::TcpStream::connect(&coordinator.address)
+    let mut socket = tokio::net::TcpStream::connect(&coordinator.address)
         .await
         .with_context(|| format!("failed to dial {}", coordinator.address))?;
     socket.set_nodelay(true).ok();
+    let version = benchd_core::protocol::connect(&mut socket).await?;
     tracing::info!(
-        coordinator = %coordinator.name, address = %coordinator.address, "connected"
+        coordinator = %coordinator.name, address = %coordinator.address, %version, "connected"
     );
 
     let (read, write) = socket.into_split();

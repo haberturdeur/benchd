@@ -20,13 +20,14 @@ workspace = true
 optional = true
 
 [features]
+transport = ["dep:tokio"]
 # The USB/IP protocol needs async I/O; the rest of core is pure and stays so.
 usbip = ["dep:tokio", "dep:tracing", "tokio/fs", "tokio/net", "tokio/io-util", "tokio/time"]
 
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt", "io-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "io-util", "test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

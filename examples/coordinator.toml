@@ -16,7 +16,9 @@
 #   WIRING      how this bench reaches its host. Declared per bench, never
 #               implied - no chip identity can know how a board was cabled.
 
-open_keys = ["name"]
+# host is always accepted as an open key, including with older configs that
+# list only name here. Hostnames do not need central vocabulary entries.
+open_keys = ["name", "host"]
 
 [limits]
 max_ttl        = 900     # longest single grant, seconds

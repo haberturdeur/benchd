@@ -21,7 +21,7 @@
 //! not one. They bind an ephemeral port, so it is contention rather than a port
 //! clash, but the effect is the same. CI passes the flag.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 
@@ -151,9 +151,35 @@ impl Harness {
         panic!("coordinator never reported a listening address");
     }
 
+    fn connect(&self) -> TcpStream {
+        let mut stream = self.connect_raw();
+        let hello = benchd_core::protocol::Hello::current();
+        writeln!(stream, "{}", serde_json::to_string(&hello).unwrap()).unwrap();
+        let mut line = Vec::new();
+        loop {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).expect("read protocol hello");
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+        }
+        let peer = serde_json::from_slice(&line).expect("protocol hello");
+        hello.check(&peer).expect("compatible protocol");
+        stream
+    }
+
+    fn connect_raw(&self) -> TcpStream {
+        let stream = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        stream
+    }
+
     /// Send one line and read one line back.
     fn exchange(&self, line: &str) -> String {
-        let stream = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
+        let stream = self.connect();
         stream
             // Generous: CI machines are shared and a coordinator that has just
             // been spawned may be waiting on CPU. A real hang still fails, just
@@ -199,7 +225,7 @@ enum Incoming {
 
 impl Peer {
     fn connect(h: &Harness) -> Peer {
-        let stream = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
+        let stream = h.connect();
         stream.set_nodelay(true).ok();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(30)))
@@ -284,6 +310,118 @@ fn registration(id: &str) -> String {
     format!(
         r#"{{"msg":"register","bench":{{"id":"{id}","description":"","tags":["soc=esp32s3"],"resources":{{"console":{{"kind":"serial","path":"/dev/null"}}}}}}}}"#
     )
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn mismatched_and_unversioned_hosts_cannot_register() {
+    let h = Harness::start("protocol-mismatch");
+    let mut stream = h.connect_raw();
+    let mut hello = benchd_core::protocol::Hello::current();
+    hello.protocol += 1;
+    hello.build = "incompatible-test-build".into();
+    // Pipeline a valid registration behind the incompatible hello. None of
+    // the application bytes may be dispatched after a failed handshake.
+    writeln!(
+        stream,
+        "{}\n{}",
+        serde_json::to_string(&hello).unwrap(),
+        registration("mismatch")
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let peer: benchd_core::protocol::Hello = serde_json::from_str(&line).unwrap();
+    assert!(hello.check(&peer).is_err());
+    line.clear();
+    assert!(!matches!(reader.read_line(&mut line), Ok(n) if n > 0));
+
+    let mut legacy = h.connect_raw();
+    writeln!(legacy, "{}", registration("legacy")).unwrap();
+    let mut line = String::new();
+    BufReader::new(legacy).read_line(&mut line).unwrap();
+    assert!(line.contains("rejected"), "{line}");
+    assert!(line.contains("handshake required"), "{line}");
+    let state = h.exchange(r#"{"msg":"inspect"}"#);
+    assert!(state.contains("\"benches\":[]"), "{state}");
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn host_filters_select_benches_and_multi_host_claims_are_atomic() {
+    let h = Harness::start("host-claims");
+    let mut first = Peer::connect(&h);
+    let mut second = Peer::connect(&h);
+    for (peer, id, host) in [
+        (&mut first, "board-a", "lab-a"),
+        (&mut second, "board-b", "lab-b"),
+    ] {
+        peer.send(&registration(id).replace(
+            "\"soc=esp32s3\"",
+            &format!("\"soc=esp32s3\",\"host={host}\""),
+        ));
+        assert!(peer.recv().contains("registered"));
+    }
+
+    for filters in [vec!["--host", "lab-a"], vec!["host=lab-a", "soc=esp32s3"]] {
+        let output = Command::new(binary())
+            .args(["--coordinator", &format!("127.0.0.1:{}", h.port), "benches"])
+            .args(filters)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("board-a"), "{stdout}");
+        assert!(!stdout.contains("board-b"), "{stdout}");
+    }
+
+    let mut agent = Peer::connect(&h);
+    let token = agent.open_session("multi-host");
+    // Missing and repeated-host requests must leave board-a available.
+    for host in ["missing", "lab-a"] {
+        agent.send(&format!(r#"{{"msg":"claim","request":2,"session":"{token}","claim":{{"slots":{{"dut":["host=lab-a"],"peer":["host={host}"]}},"ttl":60}}}}"#));
+        let reply = agent.recv();
+        assert!(reply.contains("\"msg\":\"error\""), "{reply}");
+        assert!(reply.contains("\"retryable\":false"), "{reply}");
+        let mut operator = Peer::connect(&h);
+        operator.send(r#"{"msg":"inspect"}"#);
+        let state = operator.recv();
+        assert!(state.contains("\"leases\":[]"), "{state}");
+    }
+
+    agent.send(&format!(r#"{{"msg":"claim","request":3,"session":"{token}","claim":{{"slots":{{"dut":["host=lab-a"],"peer":["host=lab-b"]}},"ttl":60}}}}"#));
+    let granted = agent.recv();
+    assert!(granted.contains("granted"), "{granted}");
+    assert!(granted.contains("\"dut\":\"board-a\""), "{granted}");
+    assert!(granted.contains("\"peer\":\"board-b\""), "{granted}");
+    assert!(agent.recv().contains("materialize"));
+    let export_a = first.recv();
+    let export_b = second.recv();
+    assert!(export_a.contains("export"), "{export_a}");
+    assert!(export_b.contains("export"), "{export_b}");
+
+    // Failure setting up either bench tears down the entire lease.
+    second.send(&done_failed(request_of(&export_b)));
+    let mut ended = false;
+    let mut failed = false;
+    let mut unmaterialize = false;
+    for _ in 0..3 {
+        let message = agent.recv();
+        ended |= message.contains("\"msg\":\"ended\"");
+        failed |= message.contains("\"msg\":\"failed\"");
+        unmaterialize |= message.contains("\"msg\":\"unmaterialize\"");
+    }
+    assert!(ended && failed && unmaterialize);
+    assert!(first.recv().contains("unexport"));
+    assert!(second.recv().contains("unexport"));
+    let mut operator = Peer::connect(&h);
+    operator.send(r#"{"msg":"inspect"}"#);
+    assert!(operator.recv().contains("\"leases\":[]"));
 }
 
 #[test]
@@ -503,7 +641,7 @@ fn a_failed_registration_does_not_destroy_the_bench_already_there() {
     let h = Harness::start("evict");
 
     // A good host, held open so its registration stays live.
-    let good = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
+    let good = h.connect();
     let mut w = good.try_clone().expect("clone");
     writeln!(
         w,
@@ -556,7 +694,7 @@ fn two_resources_on_one_device_share_a_single_channel() {
     // the host was never asked to make.
     let h = Harness::start("shared-busid");
 
-    let host = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
+    let host = h.connect();
     host.set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();
     let mut hw = host.try_clone().expect("clone");
@@ -571,7 +709,7 @@ fn two_resources_on_one_device_share_a_single_channel() {
     hr.read_line(&mut reply).expect("read");
     assert!(reply.contains("registered"), "{reply}");
 
-    let stream = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
+    let stream = h.connect();
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();
@@ -634,7 +772,7 @@ fn a_grant_carries_the_benchs_wiring_notes() {
     // delivered.
     let h = Harness::start("docs");
 
-    let host = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
+    let host = h.connect();
     let mut hw = host.try_clone().expect("clone");
     writeln!(
         hw,
@@ -648,7 +786,7 @@ fn a_grant_carries_the_benchs_wiring_notes() {
         .expect("read");
     assert!(reply.contains("registered"), "{reply}");
 
-    let stream = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
+    let stream = h.connect();
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();
@@ -701,7 +839,7 @@ fn an_agent_cannot_claim_a_bench_by_name() {
         .to_string();
 
     // Same connection, so the session is still known.
-    let stream = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
+    let stream = h.connect();
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();
@@ -744,7 +882,7 @@ fn a_claim_with_a_hostile_slot_name_is_refused() {
     // Slot names are arbitrary JSON keys from an agent and become directory
     // components in a root daemon.
     let h = Harness::start("slot");
-    let stream = TcpStream::connect(("127.0.0.1", h.port)).expect("connect");
+    let stream = h.connect();
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .unwrap();

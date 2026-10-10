@@ -1,9 +1,8 @@
 //! The wire protocol: newline-delimited JSON over plain TCP (D5).
 //!
-//! All three binaries build from this one module, so there is no schema
-//! language and no generated code — the types *are* the protocol. Multi-version
-//! operation is an explicit non-goal, so nothing here carries a version number
-//! or tolerates unknown fields.
+//! All components build from this module. Before these messages, every
+//! connection exchanges a [`crate::protocol::Hello`]. Peers must agree on the
+//! protocol version; package/build versions are included for diagnostics.
 //!
 //! Two conversations, both **dialled by the executor** because the coordinator
 //! may not be able to reach it (D5):

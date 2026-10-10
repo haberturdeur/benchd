@@ -49,8 +49,8 @@ command -v bwrap >/dev/null || {
   echo "benchd-sandbox: bubblewrap (bwrap) is not installed" >&2
   exit 1
 }
-command -v socat >/dev/null || {
-  echo "benchd-sandbox: socat is not installed" >&2
+command -v benchd >/dev/null || {
+  echo "benchd-sandbox: benchd is not installed" >&2
   exit 1
 }
 
@@ -200,8 +200,7 @@ esac
 # create the next lease, and root follows it.
 SOCK="$ROOT/agent.sock"
 [ -S "$SOCK" ] || { echo "$SOCK missing; is the benchd client daemon running?" >&2; exit 1; }
-READY=$(printf '{"msg":"prepare_owner","request":1,"name":"%s"}\n' "$IDENTITY" \
-  | timeout 5 socat - "UNIX-CONNECT:$SOCK" 2>/dev/null | head -1)
+READY=$(benchd prepare-owner --socket "$SOCK" --name "$IDENTITY")
 OWNER=$(printf '%s\n' "$READY" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
 DEV=$(printf '%s\n' "$READY" | sed -n 's/.*"device_path":"\([^"]*\)".*/\1/p')
 if [ -z "$OWNER" ]; then

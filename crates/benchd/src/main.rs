@@ -21,7 +21,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "benchd",
-    version,
+    version = benchd_core::protocol::version_string(),
     about = "Lease-based hardware bench broker",
     subcommand_required = true,
     arg_required_else_help = true
@@ -55,6 +55,10 @@ enum Command {
 
     /// Hold a bench by hand.
     Lease(benchd_client::lease::LeaseArgs),
+
+    /// Prepare the sandbox's lease and device directories.
+    #[command(hide = true)]
+    PrepareOwner(benchd_client::lease::PrepareOwnerArgs),
 
     /// Enable hosts for configured hardware that is connected; disable the rest.
     UpdateBenches(benchd_host::update::UpdateArgs),
@@ -102,6 +106,7 @@ async fn main() -> ExitCode {
         Command::Client(_) => logging("benchd_client=info,benchd_core=info"),
         Command::Mcp(_) => logging("benchd_mcp=info"),
         Command::Lease(_)
+        | Command::PrepareOwner(_)
         | Command::UpdateBenches(_)
         | Command::Operator(_)
         // A hook's stdout is a decision the harness parses, and its stderr is
@@ -116,6 +121,7 @@ async fn main() -> ExitCode {
         Command::Mcp(args) => benchd_mcp::run(args).await,
         Command::UpdateBenches(args) => benchd_host::update::run(args).await,
         Command::Hook(args) => benchd_client::hook::run(args).await,
+        Command::PrepareOwner(args) => benchd_client::lease::prepare_owner(args).await,
         Command::Operator(command) => {
             benchd_coordinator::operator::run(args.coordinator.as_deref(), command).await
         }

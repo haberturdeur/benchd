@@ -226,7 +226,9 @@ impl Default for Vocabulary {
     fn default() -> Self {
         Vocabulary {
             defs: BTreeMap::new(),
-            open_keys: ["name".to_string()].into_iter().collect(),
+            open_keys: ["name".to_string(), "host".to_string()]
+                .into_iter()
+                .collect(),
             key_weights: BTreeMap::new(),
             key_descriptions: BTreeMap::new(),
             qualified_keys: BTreeSet::new(),
@@ -237,11 +239,15 @@ impl Default for Vocabulary {
 impl Vocabulary {
     pub fn new(
         defs: BTreeMap<Tag, TagDef>,
-        open_keys: BTreeSet<String>,
+        mut open_keys: BTreeSet<String>,
         key_weights: BTreeMap<String, f64>,
         key_descriptions: BTreeMap<String, String>,
         qualified_keys: BTreeSet<String>,
     ) -> Result<Self, TagError> {
+        // Host labels are deployment metadata, so adding a machine never
+        // requires editing the coordinator's capability vocabulary. Include
+        // this even for older configs that explicitly set open_keys = ["name"].
+        open_keys.insert("host".into());
         let vocab = Vocabulary {
             defs,
             open_keys,

@@ -211,8 +211,9 @@ impl Exports {
         key: &ChannelKey,
         device: UsbDevice,
     ) -> Result<(), std::io::Error> {
-        let stream = tokio::net::TcpStream::connect(&self.coordinator).await?;
+        let mut stream = tokio::net::TcpStream::connect(&self.coordinator).await?;
         stream.set_nodelay(true).ok();
+        benchd_core::protocol::connect(&mut stream).await?;
         let (read, write) = stream.into_split();
 
         // One line of JSON to identify the channel, then the socket is opaque

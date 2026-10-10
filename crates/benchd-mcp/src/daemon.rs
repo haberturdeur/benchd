@@ -31,6 +31,7 @@ pub struct Daemon {
     socket: String,
     name: String,
     tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
+    incompatible: Mutex<Option<String>>,
     up: Notify,
     pending: Arc<Mutex<BTreeMap<u64, oneshot::Sender<Value>>>>,
     /// Paths arrive *after* a grant, once the device nodes actually exist, so a
@@ -45,6 +46,7 @@ impl Daemon {
             socket: socket.to_string(),
             name: name.to_string(),
             tx: Mutex::new(None),
+            incompatible: Mutex::new(None),
             up: Notify::new(),
             pending: Arc::new(Mutex::new(BTreeMap::new())),
             paths: Arc::new(Mutex::new(BTreeMap::new())),
@@ -63,13 +65,16 @@ impl Daemon {
     async fn wait_until_up(&self, budget: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + budget;
         loop {
+            let notified = self.up.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.tx.lock().await.is_some() {
                 return Ok(());
             }
-            if tokio::time::timeout_at(deadline, self.up.notified())
-                .await
-                .is_err()
-            {
+            if let Some(error) = self.incompatible.lock().await.as_ref() {
+                return Err(anyhow!(error.clone()));
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 return Err(anyhow!("the benchd client daemon did not come up in time"));
             }
         }
@@ -84,6 +89,13 @@ impl Daemon {
                     tokio::time::sleep(RETRY_MIN).await;
                 }
                 Err(err) => {
+                    if err
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
+                    {
+                        *self.incompatible.lock().await = Some(format!("{err:#}"));
+                        self.up.notify_waiters();
+                    }
                     tracing::warn!(
                         socket = %self.socket,
                         error = format!("{err:#}"),
@@ -99,7 +111,8 @@ impl Daemon {
     /// Drive one socket until it dies. `Ok` means it was up and then closed;
     /// `Err` means it never registered.
     async fn try_link(&self) -> Result<()> {
-        let stream = tokio::net::UnixStream::connect(&self.socket).await?;
+        let mut stream = tokio::net::UnixStream::connect(&self.socket).await?;
+        benchd_core::protocol::connect(&mut stream).await?;
         let (read, write) = stream.into_split();
         let mut sink = FramedWrite::new(write, LinesCodec::new());
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -136,6 +149,7 @@ impl Daemon {
             },
         )
         .await?;
+        *self.incompatible.lock().await = None;
         *self.tx.lock().await = Some(tx);
         self.up.notify_waiters();
         tracing::info!(socket = %self.socket, "connected to the client daemon");
@@ -176,13 +190,16 @@ impl Daemon {
         let deadline = tokio::time::Instant::now() + CALL_WAIT;
         loop {
             let tx = loop {
+                let notified = self.up.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if let Some(tx) = self.tx.lock().await.clone() {
                     break tx;
                 }
-                if tokio::time::timeout_at(deadline, self.up.notified())
-                    .await
-                    .is_err()
-                {
+                if let Some(error) = self.incompatible.lock().await.as_ref() {
+                    return Err(anyhow!(error.clone()));
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
                     return Err(anyhow!("the benchd client daemon is not reachable"));
                 }
             };
@@ -335,6 +352,35 @@ mod tests {
     use benchd_core::wire::{SessionToken, TagInfo, ToClient};
     use tokio::net::UnixListener;
 
+    #[tokio::test]
+    async fn protocol_mismatch_reaches_callers_instead_of_a_generic_timeout() {
+        let daemon = Daemon {
+            socket: String::new(),
+            name: "test".into(),
+            tx: Mutex::new(None),
+            incompatible: Mutex::new(Some("benchd protocol mismatch: peer old-build".into())),
+            up: Notify::new(),
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            paths: Arc::new(Mutex::new(BTreeMap::new())),
+            next: AtomicU64::new(1),
+        };
+        let error = tokio::time::timeout(Duration::from_secs(1), daemon.wait_until_up(FIRST_WAIT))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("peer old-build"));
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            daemon.simple(ClientMsg::TagList {
+                request: RequestId(0),
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("peer old-build"));
+    }
+
     fn socket_path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "benchd-mcp-{}-{}",
@@ -346,7 +392,8 @@ mod tests {
         ))
     }
 
-    async fn speak(stream: tokio::net::UnixStream) {
+    async fn speak(mut stream: tokio::net::UnixStream) {
+        benchd_core::protocol::accept(&mut stream).await.unwrap();
         let (read, write) = stream.into_split();
         let mut lines = FramedRead::new(read, LinesCodec::new());
         let mut sink = FramedWrite::new(write, LinesCodec::new());

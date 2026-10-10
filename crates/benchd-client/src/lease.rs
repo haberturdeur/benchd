@@ -80,6 +80,33 @@ pub struct LeaseArgs {
     command: Vec<String>,
 }
 
+/// Used by benchd-sandbox so it shares the binary's protocol handshake.
+#[derive(Parser)]
+pub struct PrepareOwnerArgs {
+    #[arg(long)]
+    name: String,
+    #[arg(long, default_value = "/run/benchd/agent.sock", env = "BENCHD_SOCKET")]
+    socket: String,
+}
+
+pub async fn prepare_owner(args: PrepareOwnerArgs) -> Result<()> {
+    let mut link = Link::connect(&args.socket).await?;
+    let request = link
+        .send(|request| ClientMsg::PrepareOwner {
+            request,
+            name: args.name,
+        })
+        .await?;
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), link.reply_to(request))
+        .await
+        .context("client daemon did not prepare the sandbox within 5s")??;
+    if reply.get("msg").and_then(Value::as_str) != Some("owner_ready") {
+        bail!("unexpected sandbox preparation reply: {reply}");
+    }
+    println!("{reply}");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Argument shapes
 // ---------------------------------------------------------------------------
@@ -207,11 +234,12 @@ struct Link {
 
 impl Link {
     async fn connect(path: &str) -> Result<Self> {
-        let stream = tokio::net::UnixStream::connect(path)
+        let mut stream = tokio::net::UnixStream::connect(path)
             .await
             .with_context(|| {
                 format!("could not reach the client daemon at {path} — is `benchd client` running?")
             })?;
+        benchd_core::protocol::connect(&mut stream).await?;
         let (read, write) = stream.into_split();
         Ok(Link {
             lines: FramedRead::new(read, LinesCodec::new()),

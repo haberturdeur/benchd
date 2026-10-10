@@ -252,9 +252,10 @@ fn require_root() -> Result<()> {
 }
 
 async fn inspect(coordinator: &str) -> Result<Vec<benchd_core::wire::BenchView>> {
-    let socket = tokio::net::TcpStream::connect(coordinator)
+    let mut socket = tokio::net::TcpStream::connect(coordinator)
         .await
         .with_context(|| format!("failed to reach the coordinator at {coordinator}"))?;
+    benchd_core::protocol::connect(&mut socket).await?;
     let (read, write) = socket.into_split();
     let mut lines = FramedRead::new(read, LinesCodec::new());
     let mut sink = FramedWrite::new(write, LinesCodec::new());

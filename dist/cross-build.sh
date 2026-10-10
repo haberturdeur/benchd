@@ -94,9 +94,8 @@ fi
 echo "path:   $BIN"
 echo "sha256: $(sha256sum "$BIN" | cut -d' ' -f1)"
 echo
-# Spelled out because the version string cannot tell two builds apart -- every
-# one of them says 0.1.0 -- so the sha above is the only way to confirm that
-# what ends up running is what was just built. Check it on the far side.
+# --version reports protocol and Git/build identity, but the checksum confirms
+# the exact artifact (including different builds of a dirty checkout).
 cat <<EOF
 To install it on the target machine:
 

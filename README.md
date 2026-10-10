@@ -127,6 +127,16 @@ This shows registered benches and whether they are currently free.
 
 `benchd benches` asks the local client, so it covers every lab that client is connected to.
 
+Filter by the machine hosting the hardware, or combine host and capability tags:
+
+```sh
+benchd benches --host lab-a
+benchd benches host=lab-a soc=esp32s3
+```
+
+Every filter must match. Host names are exact tag values, not substrings. The same
+filters work with `benchd --coordinator ADDRESS benches`.
+
 ## Lease by capability
 
 Normally you do not need to know which physical board you want.
@@ -205,6 +215,23 @@ benchd lease soc=esp32s3 --slot peer:soc=esp32c3 -- ./run-mesh-test.sh
 ```
 
 All slots are granted together or not at all, and each gets its own environment variables (`$LAB_DUT_CONSOLE`, `$LAB_PEER_CONSOLE`).
+
+You can select a host for each slot:
+
+```sh
+benchd lease soc=esp32s3 host=lab-a \
+  --slot peer:soc=esp32c3,host=lab-b -- ./run-mesh-test.sh
+```
+
+Use the same `host=...` tag on both slots to require two distinct benches on one
+host. A host tag in the bare arguments applies only to `dut`; each additional slot
+has its own tags.
+
+One coordinator must satisfy the whole request, even if the benches are on
+different physical hosts. If a slot is busy, missing, or would exceed the lab's
+lease limit, no benches are reserved for that request. If device setup fails, the
+whole lease is torn down. Releasing or losing the lease releases every slot.
+Requests are not split across coordinators.
 
 ## Inspect active leases
 
@@ -367,7 +394,7 @@ Requirements:
 
 ```text
 bubblewrap
-socat
+benchd
 ```
 
 If agents already run as separate Unix users, this extra isolation may not be necessary.
@@ -492,6 +519,27 @@ tags = ["soc=esp32s3", "jtag=builtin"]
 requires the coordinator to know the `soc` and `jtag` tag keys, and those values.
 
 A coordinator rejects a bench containing unknown tags.
+
+### Host labels
+
+`host` is a built-in open tag key: its values need no coordinator vocabulary
+entry. Each `benchd host` automatically advertises `host=<hostname>`, using the
+machine's kernel hostname converted to lowercase. To use a stable label instead,
+include it in the bench's existing tags:
+
+```toml
+tags = ["soc=esp32s3", "jtag=builtin", "host=lab-a"]
+```
+
+An explicit host tag replaces the automatic hostname tag. Values follow the
+usual tag syntax (lowercase letters, digits, dots, underscores, and dashes).
+Use the same label in every bench config on a machine if they should be selected
+together. Host labels appear in `benchd benches` and MCP `tag_list`, and can be
+used in CLI or MCP claim slots.
+
+When upgrading, update the coordinator before restarting updated hosts. Existing
+hosts without a host tag still support capability selection; they gain the
+automatic tag after upgrading and restarting.
 
 ---
 
@@ -738,6 +786,32 @@ Multiple tunnels can be used if the same client needs access to several remote l
 
 # Troubleshooting
 
+## Incompatible deployments
+
+Every connection between benchd components starts with a protocol compatibility
+handshake, including CLI/MCP connections to the local client daemon and USB/IP
+relay connections. Peers exchange a protocol number, package version and build
+identifier. Different builds can communicate when their protocol numbers match;
+different protocol numbers are refused before registration, sessions or claims.
+
+Use `benchd --version` on each machine to see all three values. A mismatch error
+reports both peers' details. Hosts and client daemons also log the error in their
+service journals. The build identifier defaults to the Git revision, with
+`-dirty` for tracked working-tree changes; builds from source archives report
+`unknown` unless built with `BENCHD_BUILD_ID=<release-or-ci-build-id>`.
+
+The first version introducing this handshake cannot communicate with older,
+unversioned binaries. Upgrade the coordinator, hosts, client daemons, CLI/MCP
+processes and `benchd-sandbox` together, then restart them. Existing leases are
+lost when their coordinator or client daemon restarts. Older peers are rejected
+with an upgrade message where their protocol supports it; peers that do not
+answer the hello hit a five-second handshake deadline.
+
+For maintainers: increment `PROTOCOL_VERSION` in `benchd-core/src/protocol.rs`
+whenever a wire-format or behavioral change makes peers incompatible. A build
+identifier helps diagnose a deployment; it is not proof of compatibility or
+peer authentication.
+
 ## No benches appear
 
 Run:
@@ -864,4 +938,3 @@ dist/deploy.sh           # thereafter: rebuild, install, verify checksums
 dist/cross-build.sh      # for a machine that has no Rust toolchain of its own
 cargo test
 ```
-

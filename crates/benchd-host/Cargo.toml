@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-benchd-core = { workspace = true, features = ["usbip"] }
+benchd-core = { workspace = true, features = ["usbip", "transport"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

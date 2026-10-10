@@ -1,8 +1,7 @@
 //! Per-connection request handling.
 //!
-//! A connection announces itself with its first message: a `register` makes it
-//! a host, anything else makes it a client. That avoids a handshake round trip
-//! and keeps the protocol readable — the first line says what you are.
+//! Connections first pass the shared protocol compatibility handshake. The
+//! first application message then selects the host, client, operator or relay.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,8 +22,15 @@ use crate::conn::{spawn_writer, Outbox};
 use crate::state::{ClientConn, Replier, State};
 use crate::{now, Shared};
 
-pub async fn serve(shared: Arc<Shared>, socket: TcpStream, peer: SocketAddr) -> Result<()> {
+pub async fn serve(shared: Arc<Shared>, mut socket: TcpStream, peer: SocketAddr) -> Result<()> {
     socket.set_nodelay(true).ok();
+    let version = benchd_core::protocol::accept(&mut socket)
+        .await
+        .map_err(|err| {
+            tracing::warn!(%peer, %err, "protocol handshake rejected");
+            err
+        })?;
+    tracing::debug!(%peer, %version, "protocol handshake accepted");
     let (read, write) = socket.into_split();
     // The writer half is kept separate until we know what this connection is: a
     // data channel needs the raw socket back, not a line-framed sink.

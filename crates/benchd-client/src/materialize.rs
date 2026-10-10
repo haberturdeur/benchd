@@ -182,10 +182,13 @@ impl Materializer {
             .find(|c| c.id == coordinator)
             .map(|c| c.address.clone())
             .ok_or_else(|| format!("no address for coordinator {coordinator}"))?;
-        let stream = tokio::net::TcpStream::connect(&address)
+        let mut stream = tokio::net::TcpStream::connect(&address)
             .await
             .map_err(|e| format!("dialling the coordinator for a data channel: {e}"))?;
         stream.set_nodelay(true).ok();
+        benchd_core::protocol::connect(&mut stream)
+            .await
+            .map_err(|err| err.to_string())?;
         let (read, write) = stream.into_split();
 
         let mut sink = FramedWrite::new(write, LinesCodec::new());

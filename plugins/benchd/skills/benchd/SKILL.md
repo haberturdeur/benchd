@@ -88,6 +88,14 @@ claim {
 }
 ```
 
+To select a physical host, add a `host=<name>` tag from `tag_list` to each slot
+that needs it. For example, `"dut": ["soc=esp32s3", "host=lab-a"]` and
+`"peer": ["family=esp32", "host=lab-b"]` reserve benches on two hosts in one
+atomic claim. Use the same host tag in both slots to keep them on one machine.
+Slots always receive distinct benches. One coordinator must satisfy all slots;
+claims cannot combine benches from different coordinators. If any slot cannot
+be filled, none are reserved. A setup failure or release ends the whole lease.
+
 ### 3. Use it with normal tools
 
 The reply gives you an environment-variable name and a path per resource:
