@@ -49,6 +49,8 @@ pub const DEFAULT_PORT: u16 = 4711;
 /// is refused if any is unknown.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BenchSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub id: String,
     #[serde(default)]
     pub description: String,
@@ -187,6 +189,8 @@ pub enum ClientMsg {
 /// the coordinator's vocabulary rather than a parse failure at the edge.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClaimSpec {
+    #[serde(default, skip_serializing_if = "crate::model::Grouping::is_none")]
+    pub grouping: crate::model::Grouping,
     /// slot name -> required tags, e.g. `{"dut": ["soc=esp32s3"]}`
     pub slots: BTreeMap<String, Vec<String>>,
     /// Mandatory. There is no default (D15).
@@ -237,6 +241,10 @@ pub enum ToClient {
     /// truth for the one thing D2 says must never be ambiguous. The client
     /// learns the paths when it executes the `Materialize` that follows.
     Granted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+        #[serde(default, skip_serializing_if = "crate::model::Grouping::is_none")]
+        grouping: crate::model::Grouping,
         request: RequestId,
         lease: LeaseId,
         /// slot -> bench id
@@ -427,6 +435,12 @@ pub enum ToOperator {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BenchView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Set for exclusive reservation or teardown, including unselected members.
+    // A matching LeaseView slot identifies a direct lease instead.
+    pub blocked_by_group: Option<String>,
     pub id: String,
     pub description: String,
     /// Whether the bench carries grant-time documentation, not the text itself:
@@ -442,6 +456,10 @@ pub struct BenchView {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LeaseView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "crate::model::Grouping::is_none")]
+    pub grouping: crate::model::Grouping,
     pub id: u64,
     /// The holder's declared name. Diagnostic only (D19).
     pub owner: String,
@@ -483,6 +501,10 @@ pub enum Outcome {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LeaseStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "crate::model::Grouping::is_none")]
+    pub grouping: crate::model::Grouping,
     pub lease: LeaseId,
     pub slots: BTreeMap<String, String>,
     pub expires_at: Secs,
@@ -553,6 +575,7 @@ mod tests {
             request: RequestId(7),
             session: SessionToken("2f8a".into()),
             claim: ClaimSpec {
+                grouping: crate::model::Grouping::None,
                 slots: [("dut".to_string(), vec!["soc=esp32s3".to_string()])]
                     .into_iter()
                     .collect(),

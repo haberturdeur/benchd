@@ -221,9 +221,16 @@ fn print_benches(mut inventories: Vec<CoordinatorInventory>, filters: &[String])
                     },
                     lease.expires_at.saturating_sub(now())
                 ),
-                None => "free".into(),
+                None => bench
+                    .blocked_by_group
+                    .as_ref()
+                    .map(|g| format!("blocked by group {g}"))
+                    .unwrap_or_else(|| "free".into()),
             };
             println!("{label:<width$}  {status}");
+            if let Some(group) = &bench.group {
+                println!("{:<width$}  group: {group}", "");
+            }
             // Tags second, indented: when you are looking for a free board the
             // status is what you are scanning for.
             println!("{:<width$}  {}", "", bench.tags.join(" "), width = width);
@@ -297,6 +304,8 @@ mod tests {
             benches: ["board", "board-extra"]
                 .into_iter()
                 .map(|id| BenchView {
+                    group: None,
+                    blocked_by_group: None,
                     id: id.into(),
                     description: String::new(),
                     has_docs: false,
@@ -334,6 +343,8 @@ mod tests {
             ]
             .into_iter()
             .map(|(id, tags)| BenchView {
+                group: None,
+                blocked_by_group: None,
                 id: id.into(),
                 description: String::new(),
                 has_docs: false,

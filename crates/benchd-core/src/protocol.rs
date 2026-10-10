@@ -6,7 +6,7 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const BUILD_ID: &str = env!("BENCHD_BUILD_ID");
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

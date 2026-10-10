@@ -31,6 +31,7 @@ fn inventory() -> Inventory {
 
 fn claim(slots: &[(&str, &[&str])], distinct: Distinct) -> ClaimRequest {
     ClaimRequest {
+        grouping: benchd_core::model::Grouping::None,
         slots: slots
             .iter()
             .map(|(name, tags)| {
@@ -935,6 +936,7 @@ fn a_search_that_ran_out_of_budget_is_not_reported_as_impossible() {
         .collect();
     slots.push(("gps".to_string(), vec!["peripheral=gps"]));
     let req = ClaimRequest {
+        grouping: benchd_core::model::Grouping::None,
         slots: slots
             .iter()
             .map(|(name, tags)| {
@@ -1031,6 +1033,7 @@ mod properties {
         let mut tags = expand(declared);
         tags.insert(Tag::new("name", id));
         Bench {
+            group: None,
             id: id.to_string(),
             tags,
             resources: Default::default(),
@@ -1266,6 +1269,7 @@ mod properties {
                 .collect();
 
             let request = ClaimRequest {
+                grouping: benchd_core::model::Grouping::None,
                 slots,
                 distinct,
                 ttl_seconds: 60,
@@ -1311,17 +1315,11 @@ mod properties {
                         !err.search_exhausted,
                         "a handful of benches cannot exhaust the node budget"
                     );
-                    // Which failure it is, not merely that it failed: an agent
-                    // acts on this. Every slot having a free candidate means
-                    // the slots conflict with each other, which waiting will
-                    // never fix.
+                    // Waiting helps only if the whole request has a structural
+                    // assignment, including benches currently held by others.
                     let per_slot_candidates = request.slots.iter().all(|(_, requirement)| {
-                        refs.iter().any(|b| {
-                            b.enabled
-                                && !busy.contains_key(&b.id)
-                                && satisfies(b, &requirement.tags)
-                        })
-                    });
+                        refs.iter().any(|b| b.enabled && satisfies(b, &requirement.tags))
+                    }) && cheapest(&request, &refs, &BTreeMap::new(), &weights).is_none();
                     prop_assert_eq!(
                         err.conflict_only,
                         per_slot_candidates,

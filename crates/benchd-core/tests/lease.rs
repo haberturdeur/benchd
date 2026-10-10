@@ -23,6 +23,7 @@ fn manager(limits: Limits) -> LeaseManager {
 
 fn claim(tags: &[&str], ttl: u64) -> ClaimRequest {
     ClaimRequest {
+        grouping: benchd_core::model::Grouping::None,
         slots: [(
             "dut".to_string(),
             Requirement::parse(tags.iter().copied()).unwrap(),
@@ -37,6 +38,7 @@ fn claim(tags: &[&str], ttl: u64) -> ClaimRequest {
 
 fn two_slot_claim(ttl: u64) -> ClaimRequest {
     ClaimRequest {
+        grouping: benchd_core::model::Grouping::None,
         slots: [
             (
                 "dut".to_string(),

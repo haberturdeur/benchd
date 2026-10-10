@@ -233,6 +233,86 @@ lease limit, no benches are reserved for that request. If device setup fails, th
 whole lease is torn down. Releasing or losing the lease releases every slot.
 Requests are not split across coordinators.
 
+## Claim benches from one physical group
+
+A **bench** is one indivisible ownership unit. Keep a board and its wired logic
+analyzer in one bench; two boards that can electrically affect each other also
+belong in one bench. A **group** connects independently usable benches into a
+physical setup. Group members can live on different hosts under one coordinator.
+
+Give each member the same optional `group` in its host config, before any tables:
+
+```toml
+id = "esp32s3-a"
+group = "radio-setup-a"
+tags = ["soc=esp32s3"]
+# Existing resource tables follow.
+```
+
+Each bench belongs to at most one group. Group names are case-sensitive plain
+components (up to 64 ASCII letters, digits, underscores, dots or dashes; neither
+`.` nor `..`). Membership is configuration, separate from capability tags and
+host names. There are no overlapping or nested groups.
+
+Ask for two independently claimable ESP32 benches in one group:
+
+```sh
+benchd lease family=esp32 --slot peer:family=esp32 --grouping same \
+  -- ./run-radio-test.sh
+```
+
+| Grouping mode | Selection and reservation |
+| --- | --- |
+| `none` (default) | Select independently across groups or ungrouped benches. |
+| `same` | Every slot must be in one nonempty group; reserve selected benches only. |
+| `exclusive` | Select from one group and block every member, including unselected members. |
+
+The coordinator chooses a suitable group by capability and best fit; callers do
+not need to pick a group by name. Slots use distinct benches by default, so two
+slots asking for `family=esp32` require two benches, not two boards wired into one
+bench. Existing claims and configurations keep their default behavior.
+
+MCP `claim` accepts the same `grouping` values. A four-role request can express
+this composition:
+
+```json
+{
+  "slots": {
+    "dut": ["family=esp32"],
+    "peer": ["family=esp32"],
+    "wifi": ["device=wifi-adapter"],
+    "bluetooth": ["device=bt-adapter"]
+  },
+  "grouping": "same",
+  "ttl_seconds": 600,
+  "reason": "radio interoperability test"
+}
+```
+
+This adapter example describes the claim model. `device` capabilities must be
+added to the lab vocabulary; Wi-Fi/Bluetooth adapter resources and native network
+tool access are a separate increment. This version implements grouping for the
+existing serial and storage resources.
+
+An exclusive claim requires every member to be free, including members already
+leased by the requesting session or still releasing. It does not upgrade or merge
+existing leases. Only selected devices are exported, and only selected benches
+count toward `max_benches`. The whole reservation shares one TTL and lifecycle.
+Normal claims can use disjoint members of a group concurrently.
+
+`benchd benches` shows membership and distinguishes a directly held bench from
+one blocked by an exclusive group. Grants and lease status include the selected
+group and mode. Exclusive reservations cover newly registered members and remain
+in force through teardown until acknowledgement or the existing teardown deadline.
+Membership changes are refused while the bench is held/releasing or its old or
+new group is exclusively reserved. Keep group definitions stable during tests.
+A group describes registered hardware; it does not guarantee that every device
+normally present in that setup is online, or provide RF isolation from other setups.
+
+No suitable common group is an unsatisfiable request; a suitable group that is
+busy is retryable. All slots and the group reservation are admitted atomically
+inside one coordinator, never split across deployments.
+
 ## Inspect active leases
 
 ```sh
@@ -537,9 +617,8 @@ Use the same label in every bench config on a machine if they should be selected
 together. Host labels appear in `benchd benches` and MCP `tag_list`, and can be
 used in CLI or MCP claim slots.
 
-When upgrading, update the coordinator before restarting updated hosts. Existing
-hosts without a host tag still support capability selection; they gain the
-automatic tag after upgrading and restarting.
+Upgrade all components together when the protocol number changes (see protocol
+compatibility below). Hosts advertise their automatic tag after restarting.
 
 ---
 
@@ -793,6 +872,10 @@ handshake, including CLI/MCP connections to the local client daemon and USB/IP
 relay connections. Peers exchange a protocol number, package version and build
 identifier. Different builds can communicate when their protocol numbers match;
 different protocol numbers are refused before registration, sessions or claims.
+
+Grouping uses protocol **2**. Protocol 1 components are rejected, preventing an
+older coordinator from silently ignoring a group constraint. Upgrade and restart
+the coordinator, hosts, client daemons and CLI/MCP processes together.
 
 Use `benchd --version` on each machine to see all three values. A mismatch error
 reports both peers' details. Hosts and client daemons also log the error in their

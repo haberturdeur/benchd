@@ -32,7 +32,9 @@ pub use lease::{
 };
 pub use limits::{GrantedTtl, LimitError, Limits, Secs};
 pub use matcher::{allocate, fit_cost, Allocation, BusyInfo, Failure, NoMatch, SlotDiagnosis};
-pub use model::{Bench, ClaimRequest, Distinct, Inventory, InventoryError, Requirement, Resource};
+pub use model::{
+    Bench, ClaimRequest, Distinct, Grouping, Inventory, InventoryError, Requirement, Resource,
+};
 pub use tags::{format_tags, parse_tags, Tag, TagError, TagSet, Vocabulary};
 
 /// Convenience wrapper: allocate against a whole inventory, wiring up the
@@ -42,6 +44,6 @@ pub fn allocate_in(
     request: &ClaimRequest,
     busy: &std::collections::BTreeMap<String, BusyInfo>,
 ) -> Result<Allocation, NoMatch> {
-    let benches = inventory.enabled_benches();
+    let benches = inventory.benches.values().collect::<Vec<_>>();
     allocate(request, &benches, busy, inventory.vocabulary.key_weights())
 }

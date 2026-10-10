@@ -17,6 +17,7 @@ tags = ["soc=esp32s3", "host=lab-b"]
 
 fn request(hosts: &[&str]) -> ClaimRequest {
     ClaimRequest {
+        grouping: benchd_core::model::Grouping::None,
         slots: hosts
             .iter()
             .enumerate()

@@ -148,6 +148,8 @@ impl Resource {
 /// A named, atomically-claimable set of resources.
 #[derive(Clone, Debug)]
 pub struct Bench {
+    /// Optional physical setup of independently claimable benches.
+    pub group: Option<String>,
     pub id: String,
     /// Fully expanded through the implication graph, plus an injected
     /// `name=<id>` tag so human/debug selection rides the same matching path as
@@ -301,6 +303,44 @@ pub fn valid_device_path(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Relationship required between independently claimable benches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Grouping {
+    /// Independent selection, including ungrouped benches.
+    #[default]
+    None,
+    /// One nonempty group, reserving selected benches only.
+    Same,
+    /// One nonempty group, reserving every member.
+    Exclusive,
+}
+
+impl Grouping {
+    pub fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Same => "same",
+            Self::Exclusive => "exclusive",
+        }
+    }
+}
+
+impl std::str::FromStr for Grouping {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::None),
+            "same" => Ok(Self::Same),
+            "exclusive" => Ok(Self::Exclusive),
+            _ => Err("grouping must be none, same, or exclusive".into()),
+        }
+    }
+}
+
 /// Which slots must land on *different* benches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Distinct {
@@ -326,6 +366,7 @@ impl Distinct {
 /// reports why it cannot.
 #[derive(Clone, Debug)]
 pub struct ClaimRequest {
+    pub grouping: Grouping,
     pub slots: BTreeMap<String, Requirement>,
     pub distinct: Distinct,
     /// Mandatory. There is no default: making the agent name a duration forces
@@ -456,6 +497,7 @@ struct RawTagValue {
 
 #[derive(Debug, Deserialize)]
 struct RawBench {
+    group: Option<String>,
     #[serde(default)]
     description: String,
     #[serde(default)]
@@ -555,6 +597,14 @@ impl RawInventory {
                 })?;
             tags.insert(name_tag);
 
+            if let Some(group) = &body.group {
+                if !valid_component(group) {
+                    return Err(InventoryError::Bench {
+                        bench: id.clone(),
+                        reason: "invalid group identifier".into(),
+                    });
+                }
+            }
             let mut resources = BTreeMap::new();
             for (res_name, res) in body.resources {
                 let resource = match res.kind.as_str() {
@@ -621,6 +671,7 @@ impl RawInventory {
             benches.insert(
                 id.clone(),
                 Bench {
+                    group: body.group.clone(),
                     id,
                     tags,
                     resources,

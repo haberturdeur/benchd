@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use crate::limits::{GrantedTtl, LimitError, Limits, Secs};
 use crate::matcher::{allocate, BusyInfo, NoMatch};
-use crate::model::{ClaimRequest, Inventory};
+use crate::model::{ClaimRequest, Grouping, Inventory};
 
 macro_rules! id_type {
     ($name:ident, $prefix:literal) => {
@@ -75,6 +75,8 @@ pub enum LeaseState {
 
 #[derive(Clone, Debug)]
 pub struct Lease {
+    pub group: Option<String>,
+    pub grouping: Grouping,
     pub id: LeaseId,
     pub session: SessionId,
     /// slot name -> bench id
@@ -134,6 +136,7 @@ pub enum Effect {
     /// client then fences out as stale, and the mount survives the lease. The
     /// epoch has to travel with the effect.
     Unmaterialize {
+        exclusive_group: Option<String>,
         lease: LeaseId,
         session: SessionId,
         epoch: Epoch,
@@ -200,6 +203,8 @@ pub enum LeaseError {
 /// A successful claim.
 #[derive(Clone, Debug)]
 pub struct Granted {
+    pub group: Option<String>,
+    pub grouping: Grouping,
     pub lease: LeaseId,
     /// slot -> bench
     pub assignment: BTreeMap<String, String>,
@@ -221,6 +226,11 @@ pub struct LeaseManager {
     sessions: BTreeMap<SessionId, Session>,
     leases: BTreeMap<LeaseId, Lease>,
     bench_epoch: BTreeMap<String, u64>,
+    /// Coordinator-maintained holds after leases leave this state machine.
+    /// Exclusive drains block ordinary claims; any member drain blocks a new
+    /// exclusive claim, even if that member has left the online inventory.
+    pub group_drains: BTreeMap<String, BusyInfo>,
+    pub draining_groups: BTreeSet<String>,
     next_session: u64,
     next_lease: u64,
 }
@@ -233,6 +243,8 @@ impl LeaseManager {
             sessions: BTreeMap::new(),
             leases: BTreeMap::new(),
             bench_epoch: BTreeMap::new(),
+            group_drains: BTreeMap::new(),
+            draining_groups: BTreeSet::new(),
             next_session: 1,
             next_lease: 1,
         }
@@ -295,7 +307,13 @@ impl LeaseManager {
                 LeaseState::Revoking { teardown_at, .. } => teardown_at.saturating_sub(now),
                 LeaseState::Held => lease.remaining(now),
             };
-            for bench in lease.benches() {
+            let members = self
+                .inventory
+                .benches
+                .values()
+                .filter(|b| lease.grouping == Grouping::Exclusive && b.group == lease.group)
+                .map(|b| &b.id);
+            for bench in lease.benches().chain(members) {
                 busy.insert(
                     bench.clone(),
                     BusyInfo {
@@ -306,7 +324,19 @@ impl LeaseManager {
                 );
             }
         }
+        for bench in self.inventory.benches.values() {
+            if let Some(info) = bench.group.as_ref().and_then(|g| self.group_drains.get(g)) {
+                busy.insert(bench.id.clone(), info.clone());
+            }
+        }
         busy
+    }
+
+    pub fn group_reserved(&self, group: &str) -> bool {
+        self.group_drains.contains_key(group)
+            || self.leases.values().any(|lease| {
+                lease.grouping == Grouping::Exclusive && lease.group.as_deref() == Some(group)
+            })
     }
 
     // -- sessions --------------------------------------------------------
@@ -381,16 +411,44 @@ impl LeaseManager {
             .limits
             .grant(request.ttl_seconds, least_benches, held)?;
 
-        let benches = self.inventory.enabled_benches();
+        let benches = self.inventory.benches.values().collect::<Vec<_>>();
+        let mut busy = self.busy(now);
+        if request.grouping == Grouping::Exclusive {
+            for bench in &benches {
+                if bench
+                    .group
+                    .as_ref()
+                    .is_some_and(|g| self.draining_groups.contains(g))
+                {
+                    busy.insert(
+                        bench.id.clone(),
+                        BusyInfo {
+                            owner: "teardown".into(),
+                            expires_in: None,
+                            reason: "a member of this group is still releasing".into(),
+                        },
+                    );
+                }
+            }
+        }
         let allocation = allocate(
             request,
             &benches,
-            &self.busy(now),
+            &busy,
             self.inventory.vocabulary.key_weights(),
         )?;
         let unique: BTreeSet<&String> = allocation.assignment.values().collect();
         self.limits.check_benches(held, unique.len())?;
 
+        let group = if request.grouping == Grouping::None {
+            None
+        } else {
+            allocation
+                .assignment
+                .values()
+                .next()
+                .and_then(|id| self.inventory.benches[id].group.clone())
+        };
         let id = LeaseId(self.next_lease);
         self.next_lease += 1;
 
@@ -434,6 +492,8 @@ impl LeaseManager {
         self.leases.insert(
             id,
             Lease {
+                group: group.clone(),
+                grouping: request.grouping,
                 id,
                 session,
                 slots: allocation.assignment.clone(),
@@ -451,6 +511,8 @@ impl LeaseManager {
             .insert(id);
 
         Ok(Granted {
+            group,
+            grouping: request.grouping,
             lease: id,
             assignment: allocation.assignment,
             expires_at,
@@ -634,6 +696,11 @@ fn teardown_effects(lease: &Lease) -> Vec<Effect> {
     // is what the client fences on.
     let epoch = lease.epochs.values().copied().max().unwrap_or(Epoch(0));
     let mut effects = vec![Effect::Unmaterialize {
+        exclusive_group: if lease.grouping == Grouping::Exclusive {
+            lease.group.clone()
+        } else {
+            None
+        },
         lease: lease.id,
         session: lease.session,
         epoch,

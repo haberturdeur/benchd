@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::model::{Bench, ClaimRequest, Requirement};
+use crate::model::{Bench, ClaimRequest, Grouping, Requirement};
 use crate::tags::{format_tags, Tag, TagSet};
 
 /// Hard cap on the assignment search. Slots are single digits and benches are
@@ -149,8 +149,8 @@ impl fmt::Display for SlotDiagnosis {
 #[derive(Clone, Debug)]
 pub struct NoMatch {
     pub slots: Vec<SlotDiagnosis>,
-    /// True when every slot is individually available, but no assignment
-    /// satisfies them all at once under the distinctness rule.
+    /// Every slot has a matching bench, but no assignment satisfies the
+    /// distinctness/grouping constraints even when busy benches become free.
     pub conflict_only: bool,
     /// True when the assignment search hit its node limit before reaching any
     /// complete assignment, so nothing is known about whether one exists.
@@ -201,10 +201,8 @@ impl fmt::Display for NoMatch {
         if self.conflict_only {
             writeln!(
                 f,
-                "no assignment satisfies all slots at once: these slots must land on \
-                 different benches, and there are not enough distinct benches that match. \
-                 Waiting will not help - relax a slot's tags, or set distinct=false if \
-                 sharing one bench is acceptable."
+                "no assignment satisfies all slots at once under the grouping constraints and requirements for different benches. \
+                 Waiting will not help - change the slot requirements or grouping/distinctness."
             )?;
         }
         if self.search_exhausted {
@@ -309,89 +307,90 @@ pub fn allocate(
     busy: &BTreeMap<String, BusyInfo>,
     weights: &BTreeMap<String, f64>,
 ) -> Result<Allocation, NoMatch> {
-    let enabled: Vec<&Bench> = benches.iter().copied().filter(|b| b.enabled).collect();
+    let enabled: Vec<&Bench> = benches
+        .iter()
+        .copied()
+        .filter(|b| b.enabled && (request.grouping == Grouping::None || b.group.is_some()))
+        .collect();
     let by_id: BTreeMap<&str, &Bench> = enabled.iter().map(|b| (b.id.as_str(), *b)).collect();
-
-    let mut tag_counts: BTreeMap<Tag, usize> = BTreeMap::new();
-    for bench in enabled.iter().filter(|b| !busy.contains_key(&b.id)) {
+    let mut unavailable = busy.clone();
+    if request.grouping == Grouping::Exclusive {
+        for member in benches {
+            if member.enabled && !busy.contains_key(&member.id) {
+                continue;
+            }
+            let Some(group) = &member.group else {
+                continue;
+            };
+            let info = busy.get(&member.id).cloned().unwrap_or(BusyInfo {
+                owner: "teardown".into(),
+                expires_in: None,
+                reason: format!("group {group} has an unavailable member"),
+            });
+            for bench in benches.iter().filter(|b| b.group.as_ref() == Some(group)) {
+                unavailable.insert(bench.id.clone(), info.clone());
+            }
+        }
+    }
+    let mut tag_counts = BTreeMap::new();
+    for bench in enabled.iter().filter(|b| !unavailable.contains_key(&b.id)) {
         for tag in &bench.tags {
             *tag_counts.entry(tag.clone()).or_insert(0) += 1;
         }
     }
-
-    // Per-slot candidate sets.
-    let mut matching: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    let mut free: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for (slot, requirement) in &request.slots {
-        let hits: Vec<String> = enabled
-            .iter()
-            .filter(|b| requirement.matches(b))
-            .map(|b| b.id.clone())
-            .collect();
-        let available = hits
-            .iter()
-            .filter(|id| !busy.contains_key(*id))
-            .cloned()
-            .collect();
-        matching.insert(slot.as_str(), hits);
-        free.insert(slot.as_str(), available);
-    }
-
-    // Any slot with no free candidate fails the whole claim. Diagnose all of
-    // them at once so the agent can fix everything in one turn.
-    let failing: Vec<&str> = request
+    let matching: BTreeMap<&str, Vec<String>> = request
         .slots
-        .keys()
-        .map(String::as_str)
-        .filter(|slot| free[slot].is_empty())
-        .collect();
-    if !failing.is_empty() {
-        return Err(NoMatch {
-            slots: failing
-                .into_iter()
-                .map(|slot| {
-                    diagnose(
-                        slot,
-                        &request.slots[slot],
-                        &enabled,
-                        &matching[slot],
-                        &free[slot],
-                        busy,
-                    )
-                })
-                .collect(),
-            conflict_only: false,
-            search_exhausted: false,
-        });
-    }
-
-    let searched = best_assignment(request, &free, &by_id, &tag_counts, weights);
-    match searched.best {
-        Some(allocation) => Ok(allocation),
-        None => {
-            // Every slot had a free candidate, so unless the search gave up
-            // early this is purely a distinctness conflict: e.g. two slots that
-            // both only match the same bench.
-            Err(NoMatch {
-                slots: request
-                    .slots
-                    .keys()
-                    .map(|slot| {
-                        diagnose(
-                            slot,
-                            &request.slots[slot],
-                            &enabled,
-                            &matching[slot.as_str()],
-                            &free[slot.as_str()],
-                            busy,
-                        )
-                    })
+        .iter()
+        .map(|(slot, req)| {
+            (
+                slot.as_str(),
+                enabled
+                    .iter()
+                    .filter(|b| req.matches(b))
+                    .map(|b| b.id.clone())
                     .collect(),
-                conflict_only: !searched.exhausted,
-                search_exhausted: searched.exhausted,
-            })
-        }
+            )
+        })
+        .collect();
+    let free: BTreeMap<&str, Vec<String>> = matching
+        .iter()
+        .map(|(slot, ids)| {
+            (
+                *slot,
+                ids.iter()
+                    .filter(|id| !unavailable.contains_key(*id))
+                    .cloned()
+                    .collect(),
+            )
+        })
+        .collect();
+    let available = best_assignment(request, &free, &by_id, &tag_counts, weights);
+    if let Some(allocation) = available.best {
+        return Ok(allocation);
     }
+    // Prove topology independently of availability: distinctness or group
+    // conflicts among free candidates may disappear when another lease ends.
+    let possible = best_assignment(request, &matching, &by_id, &tag_counts, weights);
+    Err(NoMatch {
+        slots: request
+            .slots
+            .iter()
+            .map(|(slot, req)| {
+                diagnose(
+                    slot,
+                    req,
+                    &enabled,
+                    &matching[slot.as_str()],
+                    &free[slot.as_str()],
+                    &unavailable,
+                )
+            })
+            .collect(),
+        conflict_only: matching.values().all(|ids| !ids.is_empty())
+            && possible.best.is_none()
+            && !possible.exhausted,
+        search_exhausted: possible.exhausted || available.exhausted,
+    })
 }
 
 /// What one assignment search came back with.
@@ -452,6 +451,8 @@ fn best_assignment(
         candidates: BTreeMap<&'a str, Vec<&'a str>>,
         cost: BTreeMap<(&'a str, &'a str), f64>,
         distinct: &'a crate::model::Distinct,
+        grouped: bool,
+        benches: &'a BTreeMap<&'a str, &'a Bench>,
         best: Option<Allocation>,
         nodes: u64,
         exhausted: bool,
@@ -486,6 +487,16 @@ fn best_assignment(
         let slot = s.order[index];
         let must_be_distinct = s.distinct.applies_to(slot);
         for bench_id in s.candidates[slot].clone() {
+            if s.exhausted {
+                break;
+            }
+            if s.grouped
+                && acc.values().next().is_some_and(|first| {
+                    s.benches[first.as_str()].group != s.benches[bench_id].group
+                })
+            {
+                continue;
+            }
             if must_be_distinct && used.contains(bench_id) {
                 continue;
             }
@@ -506,6 +517,8 @@ fn best_assignment(
         candidates,
         cost,
         distinct: &request.distinct,
+        grouped: request.grouping != Grouping::None,
+        benches: by_id,
         best: None,
         nodes: 0,
         exhausted: false,

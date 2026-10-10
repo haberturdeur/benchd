@@ -1263,3 +1263,345 @@ fn a_holder_that_never_answers_does_not_strand_the_bench() {
     }
     panic!("the bench was still waiting for an acknowledgement that will never come");
 }
+
+// Groups describe physical setups independently of which host serves a bench.
+fn grouped_registration(id: &str, group: &str) -> String {
+    registration(id)
+        .replace(
+            "\"description\":\"\"",
+            &format!("\"group\":\"{group}\",\"description\":\"\""),
+        )
+        .replace("\"soc=esp32s3\"", &format!("\"soc=esp32s3\",\"host={id}\""))
+}
+
+fn group_claim(peer: &mut Peer, token: &str, mode: &str, hosts: &[&str]) -> String {
+    let slots: serde_json::Map<String, serde_json::Value> = hosts
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (format!("slot{i}"), serde_json::json!([format!("host={h}")])))
+        .collect();
+    peer.send(
+        &serde_json::json!({"msg":"claim","request":20,"session":token,
+        "claim":{"slots":slots,"grouping":mode,"ttl":60}})
+        .to_string(),
+    );
+    peer.recv()
+}
+
+fn assert_busy(reply: &str) {
+    assert!(reply.contains("\"msg\":\"error\""), "{reply}");
+    assert!(reply.contains("\"retryable\":true"), "{reply}");
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn grouped_claims_cross_hosts_but_never_groups_and_report_inventory() {
+    let h = Harness::start("group-matching");
+    let mut hosts = Vec::new();
+    for (id, group) in [("one", "setup"), ("two", "setup"), ("three", "other")] {
+        let mut host = Peer::connect(&h);
+        host.send(&grouped_registration(id, group));
+        assert!(host.recv().contains("registered"));
+        hosts.push(host);
+    }
+    let mut client = Peer::connect(&h);
+    let token = client.open_session("group-holder");
+    let impossible = group_claim(&mut client, &token, "same", &["one", "three"]);
+    assert!(impossible.contains("\"retryable\":false"), "{impossible}");
+    let grant = group_claim(&mut client, &token, "same", &["one", "two"]);
+    assert!(grant.contains("\"group\":\"setup\""), "{grant}");
+    assert!(grant.contains("\"grouping\":\"same\""), "{grant}");
+    assert!(client.recv().contains("materialize"));
+    for host in hosts.iter_mut().take(2) {
+        assert!(host.recv().contains("export"));
+    }
+    client.send(&serde_json::json!({"msg":"status","request":21,"session":token}).to_string());
+    let status = client.recv();
+    assert!(status.contains("\"grouping\":\"same\""), "{status}");
+    let mut operator = Peer::connect(&h);
+    operator.send(r#"{"msg":"inspect"}"#);
+    let inventory = operator.recv();
+    assert!(inventory.contains("\"group\":\"setup\""), "{inventory}");
+    assert!(!inventory.contains("blocked_by_group"), "{inventory}");
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn exclusive_group_survives_teardown_and_rejects_membership_escape() {
+    let h = Harness::start("group-drain");
+    let mut first = Peer::connect(&h);
+    let mut second = Peer::connect(&h);
+    first.send(&grouped_registration("one", "setup"));
+    assert!(first.recv().contains("registered"));
+    second.send(&grouped_registration("two", "setup"));
+    assert!(second.recv().contains("registered"));
+    let mut client = Peer::connect(&h);
+    let token = client.open_session("exclusive");
+    let grant = group_claim(&mut client, &token, "exclusive", &["one"]);
+    assert!(grant.contains("\"grouping\":\"exclusive\""), "{grant}");
+    let materialize = client.recv();
+    let export = first.recv();
+    client.send(&done_ok(request_of(&materialize)));
+    first.send(&done_ok(request_of(&export)));
+    client.barrier(&token);
+    let mut other = Peer::connect(&h);
+    let other_token = other.open_session("other");
+    for mode in ["none", "same", "exclusive"] {
+        assert_busy(&group_claim(&mut other, &other_token, mode, &["two"]));
+    }
+    // Same-connection registration cannot move an unused reserved member out.
+    second.send(&grouped_registration("two", "escape"));
+    assert!(second.recv().contains("cannot change group"));
+    let mut operator = Peer::connect(&h);
+    operator.send(r#"{"msg":"inspect"}"#);
+    let inventory = operator.recv();
+    assert!(
+        inventory.contains("\"blocked_by_group\":\"setup\""),
+        "{inventory}"
+    );
+    let output = Command::new(binary())
+        .args(["--coordinator", &format!("127.0.0.1:{}", h.port), "benches"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("blocked by group setup"));
+    let lease = lease_of(&grant);
+    client.send(
+        &serde_json::json!({"msg":"release","request":22,"session":token,"lease":lease})
+            .to_string(),
+    );
+    assert!(client.recv().contains("\"msg\":\"ok\""));
+    let teardown = client.recv();
+    assert!(teardown.contains("unmaterialize"));
+    assert!(first.recv().contains("unexport"));
+    assert_busy(&group_claim(&mut other, &other_token, "none", &["two"]));
+    // Reconnect selected member and register a brand-new member during drain.
+    let mut replacement = Peer::connect(&h);
+    replacement.send(&grouped_registration("one", "escape"));
+    assert!(replacement.recv().contains("cannot change group"));
+    let mut replacement = Peer::connect(&h);
+    replacement.send(&grouped_registration("one", "setup"));
+    assert!(replacement.recv().contains("registered"));
+    let mut new = Peer::connect(&h);
+    new.send(&grouped_registration("new", "setup"));
+    assert!(new.recv().contains("registered"));
+    assert_busy(&group_claim(&mut other, &other_token, "none", &["new"]));
+    client.send(&done_ok(request_of(&teardown)));
+    client.barrier(&token);
+    let grant = group_claim(&mut other, &other_token, "same", &["two", "new"]);
+    assert!(grant.contains("\"msg\":\"granted\""), "{grant}");
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn exclusive_group_waits_for_an_unselected_members_teardown_even_after_disconnect() {
+    let h = Harness::start("group-member-drain");
+    let mut first = Peer::connect(&h);
+    let mut second = Peer::connect(&h);
+    first.send(&grouped_registration("one", "setup"));
+    assert!(first.recv().contains("registered"));
+    second.send(&grouped_registration("two", "setup"));
+    assert!(second.recv().contains("registered"));
+    let mut client = Peer::connect(&h);
+    let token = client.open_session("normal");
+    let grant = group_claim(&mut client, &token, "none", &["one"]);
+    assert!(grant.contains("granted"));
+    client.recv();
+    first.recv();
+    let mut other = Peer::connect(&h);
+    let other_token = other.open_session("exclusive");
+    assert_busy(&group_claim(
+        &mut other,
+        &other_token,
+        "exclusive",
+        &["two"],
+    ));
+    client.send(
+        &serde_json::json!({"msg":"release","request":22,"session":token,"lease":lease_of(&grant)})
+            .to_string(),
+    );
+    assert!(client.recv().contains("\"msg\":\"ok\""));
+    let teardown = client.recv();
+    assert!(teardown.contains("unmaterialize"));
+    first.recv();
+    drop(first);
+    // The group still has a draining member even if registration disappears.
+    assert_busy(&group_claim(
+        &mut other,
+        &other_token,
+        "exclusive",
+        &["two"],
+    ));
+    client.send(&done_ok(request_of(&teardown)));
+    client.barrier(&token);
+    let grant = group_claim(&mut other, &other_token, "exclusive", &["two"]);
+    assert!(grant.contains("granted"), "{grant}");
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn a_draining_slot_does_not_make_a_cross_group_request_retryable() {
+    let h = Harness::start("group-drain-diagnosis");
+    let mut first = Peer::connect(&h);
+    let mut second = Peer::connect(&h);
+    first.send(&grouped_registration("one", "setup"));
+    assert!(first.recv().contains("registered"));
+    second.send(&grouped_registration("two", "other"));
+    assert!(second.recv().contains("registered"));
+    let mut client = Peer::connect(&h);
+    let token = client.open_session("holder");
+    let grant = group_claim(&mut client, &token, "none", &["one"]);
+    assert!(grant.contains("granted"));
+    client.recv();
+    first.recv();
+    client.send(
+        &serde_json::json!({"msg":"release","request":22,"session":token,"lease":lease_of(&grant)})
+            .to_string(),
+    );
+    assert!(client.recv().contains("\"msg\":\"ok\""));
+    assert!(client.recv().contains("unmaterialize"));
+    first.recv();
+    client.barrier(&token);
+    let reply = group_claim(&mut client, &token, "same", &["one", "two"]);
+    assert!(reply.contains("\"retryable\":false"), "{reply}");
+    assert_busy(&group_claim(&mut client, &token, "same", &["one"]));
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn force_release_of_an_unused_group_member_revokes_its_exclusive_owner() {
+    for immediate in [false, true] {
+        let h = Harness::start("group-force-release");
+        let mut first = Peer::connect(&h);
+        let mut second = Peer::connect(&h);
+        first.send(&grouped_registration("one", "setup"));
+        assert!(first.recv().contains("registered"));
+        second.send(&grouped_registration("two", "setup"));
+        assert!(second.recv().contains("registered"));
+        let mut client = Peer::connect(&h);
+        let token = client.open_session("holder");
+        let grant = group_claim(&mut client, &token, "exclusive", &["one"]);
+        assert!(grant.contains("granted"));
+        client.recv();
+        first.recv();
+        let mut operator = Peer::connect(&h);
+        operator.send(
+            &serde_json::json!({"msg":"force_release","bench":"two","immediate":immediate})
+                .to_string(),
+        );
+        let response = operator.recv();
+        assert!(response.contains("\"count\":1"), "{response}");
+        let event = client.recv();
+        assert!(
+            event.contains(if immediate {
+                "unmaterialize"
+            } else {
+                "revoking"
+            }),
+            "{event}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn concurrent_exclusive_claims_on_disjoint_members_have_only_one_winner() {
+    let h = Harness::start("group-race");
+    let mut first = Peer::connect(&h);
+    let mut second = Peer::connect(&h);
+    first.send(&grouped_registration("one", "setup"));
+    assert!(first.recv().contains("registered"));
+    second.send(&grouped_registration("two", "setup"));
+    assert!(second.recv().contains("registered"));
+    let mut clients = Vec::new();
+    for host in ["one", "two"] {
+        let mut client = Peer::connect(&h);
+        let token = client.open_session(host);
+        clients.push((client, token, host));
+    }
+    // Send both before reading either reply: the handlers run on independent
+    // connections, but admission must remain one coordinator transaction.
+    for (client, token, host) in &mut clients {
+        client.send(
+            &serde_json::json!({"msg":"claim","request":20,"session":token,
+            "claim":{"slots":{"dut":[format!("host={host}")]},"grouping":"exclusive","ttl":60}})
+            .to_string(),
+        );
+    }
+    let replies: Vec<_> = clients.iter_mut().map(|(c, _, _)| c.recv()).collect();
+    assert_eq!(
+        replies
+            .iter()
+            .filter(|r| r.contains("\"msg\":\"granted\""))
+            .count(),
+        1,
+        "{replies:?}"
+    );
+    assert_eq!(
+        replies
+            .iter()
+            .filter(|r| r.contains("\"retryable\":true"))
+            .count(),
+        1,
+        "{replies:?}"
+    );
+    let mut operator = Peer::connect(&h);
+    operator.send(r#"{"msg":"inspect"}"#);
+    let value: serde_json::Value = serde_json::from_str(&operator.recv()).unwrap();
+    assert_eq!(value["leases"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+#[ignore = "spawns daemons"]
+fn incompatible_standbys_do_not_strand_an_older_compatible_host() {
+    let h = Harness::start("group-standby-fallback");
+    let mut oldest = Peer::connect(&h);
+    oldest.send(&grouped_registration("shared", "setup"));
+    assert!(oldest.recv().contains("registered"));
+    let mut incompatible = Vec::new();
+    for group in ["elsewhere", "another"] {
+        let mut host = Peer::connect(&h);
+        host.send(&grouped_registration("shared", group));
+        assert!(host.recv().contains("registered"));
+        incompatible.push(host);
+    }
+    let mut current = Peer::connect(&h);
+    current.send(&grouped_registration("shared", "setup"));
+    assert!(current.recv().contains("registered"));
+    let mut other = Peer::connect(&h);
+    other.send(&grouped_registration("other", "setup"));
+    assert!(other.recv().contains("registered"));
+    let mut client = Peer::connect(&h);
+    let token = client.open_session("holder");
+    let grant = group_claim(&mut client, &token, "exclusive", &["other"]);
+    assert!(grant.contains("granted"), "{grant}");
+    let materialize = client.recv();
+    let export = other.recv();
+    client.send(&done_ok(request_of(&materialize)));
+    other.send(&done_ok(request_of(&export)));
+    client.barrier(&token);
+
+    drop(current);
+    // EOF proves withdrawal has run, without relying on a sleep or scheduling
+    // order across sockets. The newest standby cannot join the reserved group.
+    assert!(matches!(
+        incompatible.last_mut().unwrap().next(),
+        Incoming::Closed
+    ));
+    oldest.send(r#"{"msg":"heartbeat"}"#);
+    let inventory: serde_json::Value =
+        serde_json::from_str(&h.exchange(r#"{"msg":"inspect"}"#)).unwrap();
+    let shared = inventory["benches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["id"] == "shared")
+        .expect("the compatible oldest host must restore shared to inventory");
+    assert_eq!(shared["group"], "setup");
+    assert_eq!(shared["blocked_by_group"], "setup");
+    assert_eq!(inventory["leases"].as_array().unwrap().len(), 1);
+    assert!(matches!(
+        incompatible.first_mut().unwrap().next(),
+        Incoming::Closed
+    ));
+}

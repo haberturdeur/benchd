@@ -291,18 +291,25 @@ pub(crate) fn withdraw_host(state: &mut State, conn_id: u64) -> Vec<crate::state
     state.hosts.remove(&conn_id);
     state.bench_host.remove(&bench_id);
 
-    if let Some(standby) = state.standby_host(&bench_id) {
-        tracing::info!(
-            bench = %bench_id, conn_id = standby,
-            "handing the bench back to a host that is still registered for it"
-        );
-        let bench = state.hosts[&standby].bench.clone();
-        state.bench_host.insert(bench_id, standby);
-        state
-            .leases
-            .inventory_mut()
-            .benches
-            .insert(bench.id.clone(), bench);
+    while let Some(standby) = state.standby_host(&bench_id) {
+        let host = &state.hosts[&standby];
+        let bench = host.bench.clone();
+        let out = host.out.clone();
+        let hangup = Arc::clone(&host.hangup);
+        let last_seen = host.last_seen;
+        if state.membership_allowed(&bench.id, &bench.group).is_ok() {
+            tracing::info!(
+                bench = %bench_id, conn_id = standby,
+                "handing the bench back to a host that is still registered for it"
+            );
+            state.register_host(standby, bench, out, hangup, last_seen);
+            break;
+        }
+        // A stale membership must not hide an older compatible registration.
+        // Remove this candidate before checking the next one; its later socket
+        // cleanup then cannot withdraw the host we restore here.
+        state.hosts.remove(&standby);
+        hangup.notify_one();
     }
     outgoing
 }
@@ -339,6 +346,13 @@ async fn serve_operator(shared: Arc<Shared>, out: Outbox, msg: OperatorMsg) -> R
                 .benches
                 .values()
                 .map(|b| BenchView {
+                    group: b.group.clone(),
+                    blocked_by_group: b
+                        .group
+                        .as_ref()
+                        .filter(|g| state.leases.group_reserved(g))
+                        .cloned(),
+
                     id: b.id.clone(),
                     description: b.description.clone(),
                     has_docs: !b.docs.is_empty(),
@@ -368,7 +382,11 @@ async fn serve_operator(shared: Arc<Shared>, out: Outbox, msg: OperatorMsg) -> R
             let doomed: Vec<_> = state
                 .leases
                 .leases()
-                .filter(|l| l.benches().any(|b| b == &bench))
+                .filter(|l| {
+                    l.benches().any(|b| b == &bench)
+                        || (l.grouping == benchd_core::model::Grouping::Exclusive
+                            && l.group == state.leases.inventory().benches[&bench].group)
+                })
                 .map(|l| l.id)
                 .collect();
             let count = doomed.len();
@@ -402,6 +420,8 @@ fn lease_view(
     _now: u64,
 ) -> LeaseView {
     LeaseView {
+        group: lease.group.clone(),
+        grouping: lease.grouping,
         id: lease.id.0,
         owner: state
             .leases
@@ -600,6 +620,8 @@ async fn handle_client(
                     // dispatch: the client correlates them by lease id and
                     // answers the agent once the nodes actually exist.
                     out.send(&ToClient::Granted {
+                        group: granted.group,
+                        grouping: granted.grouping,
                         request,
                         lease: granted.lease,
                         slots: granted.assignment.clone(),
@@ -628,7 +650,7 @@ async fn handle_client(
                             .filter(|bench| req.slots.values().any(|want| want.matches(bench)))
                             .map(|bench| bench.id.as_str())
                             .collect();
-                        if !held.is_empty() {
+                        if !held.is_empty() && state.possible_after_teardown(&req) {
                             error.push_str(&format!(
                                 "\n  {} is still being released by its previous holder; \
                                  retry in a moment",
@@ -709,6 +731,8 @@ async fn handle_client(
                 .leases()
                 .filter(|l| l.session == id)
                 .map(|l| LeaseStatus {
+                    group: l.group.clone(),
+                    grouping: l.grouping,
                     lease: l.id,
                     slots: l.slots.clone(),
                     expires_at: l.expires_at,
@@ -894,6 +918,7 @@ fn to_claim_request(
         slots.insert(name.clone(), requirement);
     }
     let request = ClaimRequest {
+        grouping: spec.grouping,
         slots,
         distinct: if spec.distinct {
             Distinct::All

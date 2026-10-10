@@ -109,6 +109,8 @@ impl std::fmt::Display for Replier {
 /// disease: a bench waiting for a `Done` that will never come is a worse bug
 /// than the stale mount it prevents.
 struct Drain {
+    exclusive_group: Option<String>,
+    groups: Vec<String>,
     benches: Vec<String>,
     deadline: u64,
 }
@@ -150,6 +152,7 @@ pub struct State {
     /// Teardowns whose holder has not answered yet, keyed by the instruction
     /// we are waiting on. See [`Drain`].
     drains: BTreeMap<RequestId, Drain>,
+    membership: BTreeMap<String, Option<String>>,
     /// How long a bench waits for its holder to acknowledge a teardown.
     teardown_ack: u64,
     /// Rendezvous keys in flight, so the host's `Export` and the client's
@@ -183,6 +186,7 @@ impl State {
             session_conn: BTreeMap::new(),
             pending: BTreeMap::new(),
             drains: BTreeMap::new(),
+            membership: BTreeMap::new(),
             teardown_ack,
             channels: BTreeMap::new(),
             next_request: 1,
@@ -217,6 +221,8 @@ impl State {
         // is still outstanding. That holder's mount does not go away because
         // the host reconnected, so neither does the hold.
         bench.enabled = !self.held_by_a_teardown(&bench.id);
+        self.membership
+            .insert(bench.id.clone(), bench.group.clone());
         self.bench_host.insert(bench.id.clone(), conn_id);
         self.leases
             .inventory_mut()
@@ -269,14 +275,33 @@ impl State {
     /// `enabled` is the flag the inventory already has for "in the inventory
     /// but not matchable", and nothing else in the coordinator writes it: a
     /// bench arrives by registration and arrives enabled.
-    fn hold(&mut self, request: RequestId, benches: Vec<String>, now: u64) {
+    fn hold(
+        &mut self,
+        request: RequestId,
+        benches: Vec<String>,
+        exclusive_group: Option<String>,
+        now: u64,
+    ) {
         for id in &benches {
             if let Some(bench) = self.leases.inventory_mut().benches.get_mut(id) {
                 bench.enabled = false;
             }
         }
         let deadline = now + self.teardown_ack;
-        self.drains.insert(request, Drain { benches, deadline });
+        let groups = benches
+            .iter()
+            .filter_map(|id| self.membership.get(id).cloned().flatten())
+            .collect();
+        self.drains.insert(
+            request,
+            Drain {
+                benches,
+                deadline,
+                exclusive_group,
+                groups,
+            },
+        );
+        self.sync_group_drains();
     }
 
     /// The holder has answered: its benches can be allocated again.
@@ -311,7 +336,78 @@ impl State {
         }
     }
 
+    fn sync_group_drains(&mut self) {
+        self.leases.draining_groups = self
+            .drains
+            .values()
+            .flat_map(|d| d.groups.iter().cloned())
+            .collect();
+        self.leases.group_drains = self
+            .drains
+            .values()
+            .filter_map(|d| {
+                d.exclusive_group.as_ref().map(|g| {
+                    (
+                        g.clone(),
+                        benchd_core::matcher::BusyInfo {
+                            owner: "teardown".into(),
+                            expires_in: None,
+                            reason: format!("exclusive group {g} is still releasing"),
+                        },
+                    )
+                })
+            })
+            .collect();
+    }
+
+    /// Diagnose the whole topology, including temporarily disabled members.
+    /// A draining match for one slot does not make a cross-group or distinctness
+    /// conflict satisfiable. Exhaustion remains retryable because it proves nothing.
+    pub fn possible_after_teardown(&self, request: &benchd_core::model::ClaimRequest) -> bool {
+        let benches: Vec<_> = self
+            .leases
+            .inventory()
+            .benches
+            .values()
+            .cloned()
+            .map(|mut bench| {
+                if self.held_by_a_teardown(&bench.id) {
+                    bench.enabled = true;
+                }
+                bench
+            })
+            .collect();
+        match benchd_core::matcher::allocate(
+            request,
+            &benches.iter().collect::<Vec<_>>(),
+            &BTreeMap::new(),
+            self.leases.inventory().vocabulary.key_weights(),
+        ) {
+            Ok(_) => true,
+            Err(error) => !error.unsatisfiable(),
+        }
+    }
+
+    pub fn membership_allowed(&self, id: &str, group: &Option<String>) -> Result<(), String> {
+        if let Some(old) = self.membership.get(id) {
+            if old != group
+                && (self.held_by_a_teardown(id)
+                    || self.leases.leases().any(|l| l.benches().any(|b| b == id))
+                    || old
+                        .iter()
+                        .chain(group.iter())
+                        .any(|g| self.leases.group_reserved(g)))
+            {
+                return Err(format!(
+                    "cannot change group for {id}: bench or group is held or releasing"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn reenable(&mut self, benches: &[String]) {
+        self.sync_group_drains();
         for id in benches {
             // Not while another teardown still holds it. A bench can be
             // withdrawn and re-registered while a drain on it is outstanding,
@@ -370,6 +466,14 @@ impl State {
     /// vocabulary, so unknown tags are refused here rather than silently
     /// producing a bench that matches nothing (D9).
     pub fn register_bench(&mut self, spec: &BenchSpec) -> Result<Bench, String> {
+        if spec
+            .group
+            .as_ref()
+            .is_some_and(|g| !benchd_core::model::valid_component(g))
+        {
+            return Err("invalid group: must be a plain path component".into());
+        }
+        self.membership_allowed(&spec.id, &spec.group)?;
         // A bench already registered is *replaced*, not refused.
         //
         // A host that has just connected and registered is demonstrably alive;
@@ -433,6 +537,7 @@ impl State {
         tags.insert(name_tag);
 
         Ok(Bench {
+            group: spec.group.clone(),
             id: spec.id.clone(),
             tags,
             resources: spec.resources.clone(),
@@ -574,6 +679,7 @@ impl State {
                     });
                 }
                 Effect::Unmaterialize {
+                    exclusive_group,
                     lease,
                     session,
                     epoch,
@@ -600,7 +706,7 @@ impl State {
                     // and the host told to export it again while the previous
                     // holder is still inside a USB/IP detach.
                     if let Some(benches) = torn_down.remove(&lease) {
-                        self.hold(request, benches, now);
+                        self.hold(request, benches, exclusive_group, now);
                     }
                     out.push(Outgoing::Client {
                         out: conn,
@@ -781,4 +887,120 @@ fn notify_to_wire(event: benchd_core::lease::LeaseEvent) -> Option<ToClient> {
             .into(),
         },
     })
+}
+
+#[cfg(test)]
+mod grouping_tests {
+    use super::*;
+    use benchd_core::model::{ClaimRequest, Distinct, Grouping, Requirement};
+
+    fn setup() -> (State, SessionId) {
+        let inventory = Inventory::from_toml_str(
+            r#"
+            open_keys = ["name"]
+            [benches.one]
+            group = "setup"
+            tags = []
+            [benches.two]
+            group = "setup"
+            tags = []
+            [benches.other]
+            group = "other"
+            tags = []
+        "#,
+        )
+        .unwrap();
+        let mut state = State::new(Limits::default(), inventory.vocabulary.clone(), 10);
+        for bench in inventory.benches.values() {
+            state
+                .membership
+                .insert(bench.id.clone(), bench.group.clone());
+        }
+        state.leases = LeaseManager::new(inventory, Limits::default());
+        let session = state.leases.register("test");
+        (state, session)
+    }
+
+    fn claim(
+        state: &mut State,
+        session: SessionId,
+        bench: &str,
+        mode: Grouping,
+    ) -> Result<benchd_core::Granted, benchd_core::ClaimError> {
+        state.leases.claim(
+            session,
+            &ClaimRequest {
+                slots: [(
+                    "dut".into(),
+                    Requirement::parse([format!("name={bench}")].iter().map(String::as_str))
+                        .unwrap(),
+                )]
+                .into(),
+                grouping: mode,
+                distinct: Distinct::All,
+                ttl_seconds: 60,
+                reason: String::new(),
+            },
+            0,
+        )
+    }
+
+    #[test]
+    fn exclusive_drain_blocks_new_members_until_ack_or_deadline() {
+        for acknowledge in [true, false] {
+            let (mut state, session) = setup();
+            state.hold(RequestId(1), vec!["one".into()], Some("setup".into()), 0);
+            state.leases.inventory_mut().benches.remove("one");
+            let mut added = state.leases.inventory().benches["two"].clone();
+            added.id = "new".into();
+            state
+                .leases
+                .inventory_mut()
+                .benches
+                .insert("new".into(), added);
+            assert!(state.leases.busy(0).contains_key("new"));
+            assert!(claim(&mut state, session, "two", Grouping::None).is_err());
+            assert!(state.membership_allowed("one", &None).is_err());
+            state.expire_holds(9);
+            assert!(state.leases.group_reserved("setup"));
+            if acknowledge {
+                state.release_hold(RequestId(1));
+            } else {
+                state.expire_holds(10);
+            }
+            assert!(!state.leases.group_reserved("setup"));
+            assert!(state.membership_allowed("one", &None).is_ok());
+            assert!(claim(&mut state, session, "two", Grouping::Exclusive).is_ok());
+        }
+    }
+
+    #[test]
+    fn ordinary_drain_blocks_exclusive_admission_but_not_disjoint_normal_claims() {
+        let (mut state, session) = setup();
+        state.hold(RequestId(1), vec!["one".into()], None, 0);
+        state.leases.inventory_mut().benches.remove("one");
+        assert!(claim(&mut state, session, "two", Grouping::Exclusive).is_err());
+        assert!(claim(&mut state, session, "two", Grouping::Same).is_ok());
+    }
+
+    #[test]
+    fn membership_cannot_move_a_held_bench_or_enter_or_leave_a_reserved_group() {
+        let (mut state, session) = setup();
+        let grant = claim(&mut state, session, "one", Grouping::Same).unwrap();
+        assert!(state.membership_allowed("one", &None).is_err());
+        assert!(state.membership_allowed("two", &None).is_ok());
+        state.leases.release(session, grant.lease, 0).unwrap();
+        claim(&mut state, session, "one", Grouping::Exclusive).unwrap();
+        assert!(state.membership_allowed("two", &None).is_err());
+        assert!(state
+            .membership_allowed("other", &Some("setup".into()))
+            .is_err());
+        assert!(state
+            .membership_allowed("two", &Some("setup".into()))
+            .is_ok());
+        // A genuinely new member may join; busy() then blocks it automatically.
+        assert!(state
+            .membership_allowed("new", &Some("setup".into()))
+            .is_ok());
+    }
 }

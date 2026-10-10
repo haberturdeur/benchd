@@ -72,8 +72,31 @@ struct Benchd {
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ClaimGrouping {
+    #[default]
+    None,
+    Same,
+    Exclusive,
+}
+
+impl From<ClaimGrouping> for benchd_core::model::Grouping {
+    fn from(value: ClaimGrouping) -> Self {
+        match value {
+            ClaimGrouping::None => Self::None,
+            ClaimGrouping::Same => Self::Same,
+            ClaimGrouping::Exclusive => Self::Exclusive,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ClaimArgs {
+    /// none (default): independent benches; same: all slots in one group;
+    /// exclusive: one group, blocking even its unselected benches until release.
+    #[serde(default)]
+    grouping: ClaimGrouping,
     /// What each slot needs, as `key=value` capability tags. One slot is the
     /// common case: `{"dut": ["soc=esp32s3"]}`. Ask for two when you need two
     /// boards that can talk to each other, e.g. `{"dut": [...], "peer": [...]}`
@@ -145,6 +168,7 @@ impl Benchd {
         Parameters(args): Parameters<ClaimArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let spec = ClaimSpec {
+            grouping: args.grouping.into(),
             slots: args.slots,
             ttl: args.ttl_seconds,
             reason: args.reason,
@@ -164,6 +188,15 @@ impl Benchd {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
         ));
+        if let Some(group) = value.get("group").and_then(|v| v.as_str()) {
+            lines.push(format!(
+                "group {group} ({})",
+                value
+                    .get("grouping")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("none")
+            ));
+        }
         if let Some(note) = value.get("note").and_then(|v| v.as_str()) {
             lines.push(format!("note: {note}"));
         }
@@ -296,4 +329,29 @@ pub async fn run(args: McpArgs) -> anyhow::Result<()> {
     .await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod grouping_tests {
+    use super::*;
+
+    #[test]
+    fn claim_schema_and_arguments_expose_grouping_modes() {
+        let schema = serde_json::to_string(&schemars::schema_for!(ClaimArgs)).unwrap();
+        for mode in ["none", "same", "exclusive"] {
+            assert!(schema.contains(mode));
+        }
+        for (mode, expected) in [
+            ("none", benchd_core::model::Grouping::None),
+            ("same", benchd_core::model::Grouping::Same),
+            ("exclusive", benchd_core::model::Grouping::Exclusive),
+        ] {
+            let args: ClaimArgs = serde_json::from_value(serde_json::json!({"slots":{"dut":["soc=esp32s3"]},"ttl_seconds":60,"grouping":mode})).unwrap();
+            assert_eq!(benchd_core::model::Grouping::from(args.grouping), expected);
+        }
+        assert!(serde_json::from_value::<ClaimArgs>(
+            serde_json::json!({"slots":{},"ttl_seconds":60,"grouping":"typo"})
+        )
+        .is_err());
+    }
 }

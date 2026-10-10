@@ -474,6 +474,7 @@ mod tests {
 
     fn spec(resources: BTreeMap<String, Resource>) -> BenchSpec {
         BenchSpec {
+            group: None,
             id: "esp32s3-sdmux".into(),
             description: String::new(),
             docs: String::new(),

@@ -38,6 +38,9 @@ Examples:
 Exit status is 0 when you end the hold yourself, 1 when the lease is lost while
 you still wanted it. With a command, it is the command's own status.")]
 pub struct LeaseArgs {
+    /// none: independent benches; same: one group; exclusive: reserve its whole group.
+    #[arg(long, default_value = "none")]
+    grouping: benchd_core::model::Grouping,
     /// Capability tags the bench must have, e.g. `soc=esp32s3 net=wifi`.
     ///
     /// These describe the `dut` slot. Run `benchd benches` to see what exists.
@@ -203,6 +206,10 @@ fn now() -> u64 {
 /// The daemon's replies, as much of them as this program needs.
 #[derive(Debug, Deserialize)]
 struct Grant {
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    grouping: benchd_core::model::Grouping,
     lease: u64,
     /// slot -> bench id
     slots: BTreeMap<String, String>,
@@ -357,6 +364,9 @@ fn environment(paths: &Materialized) -> BTreeMap<String, String> {
 fn report(grant: &Grant, paths: &Materialized, held: bool) {
     let left = grant.expires_at.saturating_sub(now());
     println!("lease {} — expires in {}", grant.lease, human(left));
+    if let Some(group) = &grant.group {
+        println!("group {group} ({})", grant.grouping.as_str());
+    }
     if let Some(note) = &grant.note {
         println!("note: {note}");
     }
@@ -385,6 +395,8 @@ fn report(grant: &Grant, paths: &Materialized, held: bool) {
 fn report_json(grant: &Grant, paths: &Materialized) {
     let body = serde_json::json!({
         "lease": grant.lease,
+        "group": grant.group,
+        "grouping": grant.grouping,
         "expires_at": grant.expires_at,
         "benches": grant.slots,
         "paths": paths.slots,
@@ -524,6 +536,7 @@ async fn hold_bench(args: LeaseArgs) -> Result<ExitCode> {
             // handles one cannot present somebody else's.
             session: SessionToken(String::new()),
             claim: ClaimSpec {
+                grouping: args.grouping,
                 slots,
                 ttl: args.ttl,
                 reason: args.reason.clone(),
@@ -600,6 +613,27 @@ async fn hold_bench(args: LeaseArgs) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grouping_is_explicit_and_validated_by_the_cli() {
+        use super::*;
+        let args = LeaseArgs::try_parse_from([
+            "lease",
+            "soc=esp32s3",
+            "--grouping",
+            "exclusive",
+            "--slot",
+            "peer:soc=esp32s3",
+        ])
+        .unwrap();
+        assert_eq!(args.grouping, benchd_core::model::Grouping::Exclusive);
+        assert_eq!(collect_slots(&args.tags, &args.slot).unwrap().len(), 2);
+        assert!(LeaseArgs::try_parse_from(["lease", "--grouping", "typo"]).is_err());
+        assert_eq!(
+            LeaseArgs::try_parse_from(["lease"]).unwrap().grouping,
+            benchd_core::model::Grouping::None
+        );
+    }
+
     use super::*;
 
     #[test]

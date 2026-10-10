@@ -742,6 +742,8 @@ impl Agents {
         // and never learns which coordinator granted it.
         let msg = match msg {
             ToClient::Granted {
+                group,
+                grouping,
                 request,
                 lease,
                 slots,
@@ -749,6 +751,8 @@ impl Agents {
                 expires_at,
                 note,
             } => ToClient::Granted {
+                group,
+                grouping,
                 request,
                 lease: benchd_core::lease::LeaseId(LeaseKey::new(from, lease).to_public()),
                 slots,
@@ -1165,6 +1169,8 @@ fn with_request(msg: ToClient, request: RequestId) -> ToClient {
             retryable,
         },
         Granted {
+            group,
+            grouping,
             lease,
             slots,
             docs,
@@ -1172,6 +1178,8 @@ fn with_request(msg: ToClient, request: RequestId) -> ToClient {
             note,
             ..
         } => Granted {
+            group,
+            grouping,
             request,
             lease,
             slots,
@@ -1883,6 +1891,7 @@ mod tests {
 
     fn a_claim() -> benchd_core::wire::ClaimSpec {
         benchd_core::wire::ClaimSpec {
+            grouping: benchd_core::model::Grouping::None,
             slots: [("dut".to_string(), vec!["soc=esp32s3".to_string()])]
                 .into_iter()
                 .collect(),
@@ -1899,6 +1908,8 @@ mod tests {
 
     fn a_lease(id: u64) -> benchd_core::wire::LeaseStatus {
         benchd_core::wire::LeaseStatus {
+            group: None,
+            grouping: benchd_core::model::Grouping::None,
             lease: benchd_core::lease::LeaseId(id),
             slots: [("dut".to_string(), "bench-7".to_string())]
                 .into_iter()
@@ -1906,6 +1917,48 @@ mod tests {
             expires_at: 1000,
             remaining: 600,
             state: "active".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_forwarding_preserves_group_metadata_when_rewriting_ids() {
+        let agents = Agents::default();
+        let (agent, mut out) = connect(&agents).await;
+        let coordinator = CoordinatorId(1);
+        with_session(&agents, agent, coordinator, 4).await;
+        let ours = sent(&agents, agent, RequestId(17), coordinator).await;
+        agents
+            .deliver_reply(
+                coordinator,
+                ToClient::Granted {
+                    request: ours,
+                    lease: benchd_core::LeaseId(3),
+                    group: Some("radio-setup".into()),
+                    grouping: benchd_core::Grouping::Exclusive,
+                    slots: [("dut".into(), "board".into())].into(),
+                    docs: BTreeMap::new(),
+                    expires_at: 1000,
+                    note: None,
+                },
+            )
+            .await;
+        match reply(&mut out) {
+            ToClient::Granted {
+                request,
+                lease,
+                group,
+                grouping,
+                ..
+            } => {
+                assert_eq!(request, RequestId(17));
+                assert_eq!(
+                    lease.0,
+                    LeaseKey::new(coordinator, benchd_core::LeaseId(3)).to_public()
+                );
+                assert_eq!(group.as_deref(), Some("radio-setup"));
+                assert_eq!(grouping, benchd_core::Grouping::Exclusive);
+            }
+            other => panic!("{other:?}"),
         }
     }
 

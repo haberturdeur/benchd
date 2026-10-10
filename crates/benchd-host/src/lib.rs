@@ -79,6 +79,7 @@ pub struct HostArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BenchConfig {
+    group: Option<String>,
     id: String,
     #[serde(default)]
     description: String,
@@ -126,6 +127,13 @@ impl BenchConfig {
     /// bench is strictly better than one that fails at claim time, after an
     /// agent has already been told it has hardware.
     fn to_spec(&self) -> Result<BenchSpec> {
+        if self
+            .group
+            .as_ref()
+            .is_some_and(|group| !benchd_core::model::valid_component(group))
+        {
+            anyhow::bail!("invalid group: must be a plain path component");
+        }
         let mut tags = self
             .tags
             .iter()
@@ -296,6 +304,7 @@ impl BenchConfig {
         }
 
         Ok(BenchSpec {
+            group: self.group.clone(),
             id: self.id.clone(),
             description: self.description.clone(),
             docs: self.docs.clone(),
@@ -339,6 +348,7 @@ pub async fn run(args: HostArgs) -> Result<()> {
     // benches are covered by the record instead.
     {
         let probe = BenchSpec {
+            group: None,
             id: config.id.clone(),
             description: String::new(),
             docs: String::new(),
@@ -725,6 +735,19 @@ fn reply(tx: &tokio::sync::mpsc::UnboundedSender<String>, request: RequestId, re
 
 #[cfg(test)]
 mod host_tag_tests {
+    #[test]
+    fn group_config_is_validated_and_advertised() {
+        let config: super::BenchConfig =
+            toml::from_str("id='test'\ngroup='radio-setup'\ntags=[]\n[resources]").unwrap();
+        assert_eq!(
+            config.to_spec().unwrap().group.as_deref(),
+            Some("radio-setup")
+        );
+        let config: super::BenchConfig =
+            toml::from_str("id='test'\ngroup='../escape'\ntags=[]\n[resources]").unwrap();
+        assert!(config.to_spec().is_err());
+    }
+
     use super::*;
 
     #[test]

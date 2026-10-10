@@ -29,6 +29,7 @@ fn manager(limits: Limits) -> LeaseManager {
 
 fn claim_named(slot: &str, tags: &[&str], ttl: u64) -> ClaimRequest {
     ClaimRequest {
+        grouping: benchd_core::model::Grouping::None,
         slots: [(
             slot.to_string(),
             Requirement::parse(tags.iter().copied()).unwrap(),
@@ -86,6 +87,7 @@ fn ordinary_slot_names_still_work() {
 #[test]
 fn a_claim_must_name_at_least_one_slot() {
     let request = ClaimRequest {
+        grouping: benchd_core::model::Grouping::None,
         slots: BTreeMap::new(),
         distinct: Distinct::All,
         ttl_seconds: 60,
@@ -101,6 +103,7 @@ fn a_claim_cannot_name_unboundedly_many_slots() {
     // `max_benches` says it does — so nothing else stops an agent asking for a
     // thousand slots that all share one board.
     let slots = |n: usize| ClaimRequest {
+        grouping: benchd_core::model::Grouping::None,
         slots: (0..n)
             .map(|i| {
                 (
@@ -340,6 +343,7 @@ fn epochs_are_per_bench_not_per_lease() {
     }
 
     let request = ClaimRequest {
+        grouping: benchd_core::model::Grouping::None,
         slots: [
             (
                 "dut".to_string(),
@@ -441,6 +445,7 @@ fn a_distinctness_conflict_is_never_reported_as_worth_retrying() {
     // retry-spin at full speed - the exact failure D14 exists to prevent.
     let inv = Inventory::from_toml_str(INVENTORY).unwrap();
     let request = ClaimRequest {
+        grouping: benchd_core::model::Grouping::None,
         slots: [
             (
                 "dut".to_string(),
@@ -478,6 +483,7 @@ fn sharing_one_bench_between_slots_grants_one_epoch_and_one_export() {
     let mut m = manager(Limits::default());
     let s = m.register("agent");
     let request = ClaimRequest {
+        grouping: benchd_core::model::Grouping::None,
         slots: [
             (
                 "a".to_string(),
